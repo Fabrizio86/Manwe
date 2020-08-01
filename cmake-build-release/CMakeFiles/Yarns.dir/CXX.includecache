@@ -18,10 +18,6 @@ memory
 itask.hpp
 /Users/fabrizio/projects/Yarns/itask.hpp
 
-/Users/fabrizio/projects/Yarns/queue.cpp
-queue.hpp
-/Users/fabrizio/projects/Yarns/queue.hpp
-
 /Users/fabrizio/projects/Yarns/queue.hpp
 itask.hpp
 /Users/fabrizio/projects/Yarns/itask.hpp
@@ -35,6 +31,8 @@ waitable.hpp
 /Users/fabrizio/projects/Yarns/waitable.hpp
 thread
 -
+utility
+-
 
 /Users/fabrizio/projects/Yarns/waitable.hpp
 iwaitable.hpp
@@ -45,6 +43,8 @@ mutex
 /Users/fabrizio/projects/Yarns/yarns.cpp
 yarns.hpp
 /Users/fabrizio/projects/Yarns/yarns.hpp
+utility
+-
 waitable.hpp
 /Users/fabrizio/projects/Yarns/waitable.hpp
 

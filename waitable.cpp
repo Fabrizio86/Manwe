@@ -1,39 +1,37 @@
 #include "waitable.hpp"
 #include <thread>
+#include <utility>
 
 namespace YarnBall {
 
-Waitable::Waitable(Task task) : done{false}, task{task} { }
+    Waitable::Waitable(Task task) : done{false}, task{std::move(task)} {}
 
-Waitable::~Waitable() { }
+    Waitable::~Waitable() = default;
 
-void Waitable::run() {
-    this->task();
-    this->Done();
-}
-
-void Waitable::Done() {
-    if(this->done != true) {
-        this->done = true;
-        this->cv.notify_all();
+    void Waitable::run() {
+        this->task();
+        this->Done();
     }
-}
 
-void Waitable::exception(std::exception_ptr ex) {
-    this->ex = ex;
-    this->Done();
-}
+    void Waitable::Done() {
+        if (!this->done) {
+            this->done = true;
+            this->cv.notify_all();
+        }
+    }
 
-std::exception_ptr Waitable::getException() {
-    return  ex;
-}
+    void Waitable::exception(std::exception_ptr ex) {
+        this->ex = ex;
+        this->Done();
+    }
 
-void Waitable::wait() {
-    std::this_thread::yield();
-    std::unique_lock<std::mutex> lk(mu);
-    cv.wait(lk, [this]{ return this->done; });
-}
+    std::exception_ptr Waitable::getException() {
+        return ex;
+    }
 
-IWaitable::~IWaitable() { }
-
+    void Waitable::wait() {
+        std::this_thread::yield();
+        std::unique_lock<std::mutex> lk(mu);
+        cv.wait(lk, [this] { return this->done; });
+    }
 }

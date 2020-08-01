@@ -8,41 +8,41 @@
 
 namespace YarnBall {
 
-class Queue final {
-public:
-    // Constructor
-    Queue();
+    class Queue final {
+    public:
+        // Constructor
+        Queue();
 
-    // Destructor
-    ~Queue();
+        // Destructor
+        ~Queue();
 
-    // Disable copy constructor
-    Queue& operator = (Queue&) = delete;
+        // Disable copy constructor
+        Queue &operator=(Queue &) = delete;
 
-    // Add new item to queue
-    void push(sITask value);
+        // Add new item to queue
+        void push(sITask value);
 
-    // Get item from queue
-    sITask get();
+        // Get item from queue
+        sITask get();
 
-    // Clear the queue
-    void clear();
+        // Clear the queue
+        void clear();
 
-    // Check if queue is empty
-    bool empty();
+        // Check if queue is empty
+        bool empty();
 
-    // Get queue size
-    size_t size();
+        // Get queue size
+        size_t size();
 
-    // return if is valid
-    bool isValid();
+        // return if is valid
+        bool isValid();
 
-private:
-    std::mutex mut;
-    std::atomic<bool> valid;
-    std::queue<sITask> queue;
-    std::condition_variable condition;
-};
+    private:
+        std::mutex mut;
+        std::atomic<bool> valid;
+        std::queue<sITask> queue;
+        std::condition_variable condition;
+    };
 
 }
 

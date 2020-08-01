@@ -9,47 +9,50 @@
 
 namespace YarnBall {
 
-using Fibers = std::vector<std::thread>;
+    using Fibers = std::vector<std::thread>;
 
 ///\brief Light weight thread-pool class, for submitting tasks and async operations
-class Yarns final {
-public:
-    ///\brief prevent copy and move semantics
-    Yarns(const Yarns&) = delete;
-    Yarns(Yarns&&) = delete;
-    Yarns& operator=(const Yarns&) = delete;
-    Yarns& operator=(Yarns&&) = delete;
+    class Yarns final {
+    public:
+        ///\brief prevent copy and move semantics
+        Yarns(const Yarns &) = delete;
 
-    ///\brief Default destructor
-    ~Yarns();
+        Yarns(Yarns &&) = delete;
 
-    /// \brief Instance of the Yarns
-    /// \return returns the instance of Yarns
-    static Yarns* instance();
+        Yarns &operator=(const Yarns &) = delete;
 
-    /// \brief add task to the execution queue
-    /// \param task to execute
-    void addTask(sITask task);
+        Yarns &operator=(Yarns &&) = delete;
 
-    ///\brief submit an async task
-    ///\return returns waitable object
-    sIWaitable invoke(Task task);
+        ///\brief Default destructor
+        ~Yarns();
 
-    /// \brief stops the thread pool
-    void stop();
+        /// \brief Instance of the Yarns
+        /// \return returns the instance of Yarns
+        static Yarns *instance();
 
-    /// \brief get max thread count
-    /// \return returns the number of threads
-    unsigned int getMaxThreads() const;
+        /// \brief add task to the execution queue
+        /// \param task to execute
+        void addTask(sITask task);
 
-private:
-    // Constructor
-    Yarns();
+        ///\brief submit an async task
+        ///\return returns waitable object
+        sIWaitable invoke(Task task);
 
-private:
-    Queue queue;
-    Fibers fibers;
-};
+        /// \brief stops the thread pool
+        void stop();
+
+        /// \brief get max thread count
+        /// \return returns the number of threads
+        static unsigned int getMaxThreads() ;
+
+    private:
+        // Constructor
+        Yarns();
+
+    private:
+        Queue queue;
+        Fibers fibers;
+    };
 
 }
 
