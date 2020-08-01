@@ -1,0 +1,7 @@
+.DS_Store
+*.o
+*.user
+.*.stash
+*.pro.*
+Makefile
+lib/*

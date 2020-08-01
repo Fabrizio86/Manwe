@@ -1,0 +1,3 @@
+/Users/fabrizio/projects/Yarns/cmake-build-release/CMakeFiles/rebuild_cache.dir
+/Users/fabrizio/projects/Yarns/cmake-build-release/CMakeFiles/edit_cache.dir
+/Users/fabrizio/projects/Yarns/cmake-build-release/CMakeFiles/Yarns.dir
