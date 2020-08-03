@@ -6,7 +6,6 @@ set(CMAKE_CXX_STANDARD 17)
 add_library(Yarns
         itask.hpp
         iwaitable.hpp
-        queue.cpp
         queue.hpp
         waitable.hpp
         waitable.cpp

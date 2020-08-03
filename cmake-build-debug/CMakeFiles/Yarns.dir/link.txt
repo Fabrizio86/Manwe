@@ -1,2 +1,0 @@
-/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ar qc libYarns.a  CMakeFiles/Yarns.dir/queue.cpp.o CMakeFiles/Yarns.dir/waitable.cpp.o CMakeFiles/Yarns.dir/yarns.cpp.o
-/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/ranlib libYarns.a

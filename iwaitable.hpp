@@ -19,12 +19,11 @@ namespace YarnBall {
         /// \return instance of exception_ptr
         virtual std::exception_ptr getException() = 0;
 
-    protected:
-
-        ///\brief The method called inside the thread
+    private:
+        // change access to the public
         virtual void run() = 0;
 
-        ///\brief Handles exceptions
+        // change access to the public
         virtual void exception(std::exception_ptr exception) = 0;
     };
 
