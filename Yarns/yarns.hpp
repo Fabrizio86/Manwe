@@ -11,7 +11,7 @@ namespace YarnBall {
 
     using Fibers = std::vector<std::thread>;
 
-///\brief Light weight thread-pool class, for submitting tasks and async operations
+    ///\brief Light weight thread-pool class, for submitting tasks and async operations
     class Yarns final {
     public:
         ///\brief prevent copy constructor
@@ -46,7 +46,7 @@ namespace YarnBall {
 
         /// \brief get max thread count
         /// \return returns the number of threads
-        unsigned int getThreadsCount() const ;
+        [[nodiscard]] uint getThreadsCount() const;
 
     private:
         /// \brief Default constructor, internal initialization
@@ -54,16 +54,30 @@ namespace YarnBall {
 
         /// \brief the function used by each threads to pull work from
         static void workCycle();
+
+        /// \brief the work cycle for the async tasks
         static void backgroundWorkCycle();
 
+        /// \brief compute the mac number of items in queue to span new threads
+        /// \param asyncThreads
+        void computeThresholds(uint asyncThreads);
+
+        /// \brief computes the thread count for the async operations
+        static uint computeAsyncThreads();
+
+        /// \brief computes the max size for the queues before new threads are spawned or tasks rearranged
+        /// \return the number of threads to create
+        static uint computeForegroundThreads();
+
     private:
-        unsigned int cpuCores;
-        unsigned int foregroundThreads;
+        uint workQueueThreshold{};
+        uint asyncQueueThreshold{};
+        uint maxThreads{};
+        uint maxAsync{};
 
         Queue<sITask> workQueue;
         Queue<Task> asyncQueue;
         Fibers fibers;
-        Fibers backgroundFibers;
     };
 
 }

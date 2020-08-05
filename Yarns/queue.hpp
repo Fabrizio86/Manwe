@@ -1,13 +1,15 @@
 #ifndef QUEUE_H
 #define QUEUE_H
 
-#include <queue>
+#include <atomic>
+#include <condition_variable>
 #include <mutex>
+#include <queue>
 
 namespace YarnBall {
 
     template <class T>
-    class Queue final {
+    class Queue {
     public:
         // Constructor
         Queue() : valid(true) { }

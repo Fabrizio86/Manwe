@@ -1,13 +1,13 @@
 #ifndef ITASK_H
 #define ITASK_H
 
+#include "Definitions.h"
+
 #include <exception>
 #include <functional>
 #include <memory>
 
 namespace YarnBall {
-
-    using Task = std::function<void()>;
 
 ///\brief Interface for Yarn to call upon
     class ITask {

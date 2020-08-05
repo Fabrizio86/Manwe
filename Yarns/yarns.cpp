@@ -1,27 +1,14 @@
 #include "yarns.hpp"
 #include "waitable.hpp"
-
 #include <utility>
-#include <sys/sysctl.h>
-#include <unistd.h>
+#include <cmath>
 
 namespace YarnBall {
 
 #define CYCLES 100
+#define MIN_THREADS 4u
 
     using namespace std;
-    using uint = unsigned int;
-
-    // TODO: this needs to work on windows as well at some point
-    int coreCount(){
-        int cores;
-        int numCPU;
-        std::size_t len = sizeof(cores);
-        cores = CTL_HW;
-        sysctl(&cores, 1, &numCPU, &len, nullptr, 0);
-
-        return cores;
-    }
 
     void Yarns::workCycle() {
         sITask task = nullptr;
@@ -62,28 +49,29 @@ namespace YarnBall {
                     // run it
                     task();
                 }
-                catch (...) { }
+                catch (...) {}
             }
         }
     }
 
-    Yarns::Yarns() : cpuCores(coreCount()) {
-        uint minThreadCount = 4;
-        uint availableThreads = thread::hardware_concurrency() * 2;
-        this->foregroundThreads = std::max(availableThreads, minThreadCount);
+    Yarns::Yarns() {
+        uint threadNumbers = Yarns::computeForegroundThreads();
 
         // create all the work threads
-        for (uint i = 0; i < this->foregroundThreads; ++i) {
+        for (uint i = 0; i < threadNumbers; ++i) {
             thread trd(Yarns::workCycle);
             this->fibers.push_back(move(trd));
         }
 
+        uint asyncThreads = YarnBall::Yarns::computeAsyncThreads();
+
         // create all the background services tasks
-        for(uint i = 0; i < this->cpuCores; ++i) {
+        for (uint i = 0; i < asyncThreads; ++i) {
             thread trd(Yarns::backgroundWorkCycle);
             trd.detach();
-            this->backgroundFibers.push_back(move(trd));
         }
+
+        this->computeThresholds(asyncThreads);
     }
 
     Yarns *Yarns::instance() {
@@ -92,16 +80,20 @@ namespace YarnBall {
     }
 
     void Yarns::addTask(sITask task) {
-        this->workQueue.push(std::move(task));
+        this->workQueue.push(task);
+
+        // todo: after adding to queue do the threshold check
     }
 
     void Yarns::invoke(Task task) {
         // submit the operation
         this->asyncQueue.push(std::move(task));
+
+        // todo: after adding to queue do the threshold check
     }
 
     unsigned int Yarns::getThreadsCount() const {
-        return this->foregroundThreads;
+        return this->fibers.size();
     }
 
     void Yarns::stop() {
@@ -113,7 +105,8 @@ namespace YarnBall {
         this->workQueue.clear();
         this->asyncQueue.clear();
 
-        uint waitCycle = this->foregroundThreads * CYCLES;
+        // todo: this needs new logic now, or it will wait too long
+        uint waitCycle = this->fibers.size() * CYCLES;
 
         // give enough time to CPU to wake up or do context switching
         this_thread::sleep_for(chrono::milliseconds(waitCycle));
@@ -128,5 +121,29 @@ namespace YarnBall {
 
     Yarns::~Yarns() {
         this->stop();
+    }
+
+    uint Yarns::computeForegroundThreads() {
+        uint logicalThreads = thread::hardware_concurrency();
+        uint availableThreads = logicalThreads * ceil(sqrt(logicalThreads * 2));
+        uint result = std::max(availableThreads, MIN_THREADS);
+        return result;
+    }
+
+    uint Yarns::computeAsyncThreads() {
+        uint nCores = thread::hardware_concurrency();
+        uint cores = floor(nCores * pow(nCores * 2, 1 / 4));
+        uint result = std::max(cores, MIN_THREADS);
+        return result;
+    }
+
+    void Yarns::computeThresholds(uint asyncThreads) {
+        uint maxWorkPerQueue = floor(sqrt(this->fibers.size()));
+        this->workQueueThreshold = this->fibers.size() * maxWorkPerQueue;
+        this->maxAsync = asyncThreads * MIN_THREADS;
+        this->maxThreads = this->fibers.size() * MIN_THREADS;
+
+        // todo: at some point if the system is still locked and bloated we need to start kill blocking threads
+        // todo: so we need a timer/signal way to check life-span of a thread (subclassing from std::thread?)
     }
 }

@@ -1,12 +1,13 @@
 #ifndef WAITABLE_H
 #define WAITABLE_H
 
+#include "Definitions.h"
 #include "iwaitable.hpp"
 #include <mutex>
 
 namespace YarnBall {
 
-    sIWaitable Promise(Task task);
+    sIWaitable Promise(const Task& task);
 
 }
 

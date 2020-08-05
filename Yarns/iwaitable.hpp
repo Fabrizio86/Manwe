@@ -1,12 +1,12 @@
 #ifndef IWAITABLE_H
 #define IWAITABLE_H
 
-#include "itask.hpp"
+#include <memory>
 
 namespace YarnBall {
 
 ///\brief Interface for waitable tasks
-    class IWaitable : public ITask {
+    class IWaitable {
     public:
 
         ///\brief Destructor
@@ -18,13 +18,6 @@ namespace YarnBall {
         ///\brief Returns the exception pointer
         /// \return instance of exception_ptr
         virtual std::exception_ptr getException() = 0;
-
-    private:
-        // change access to the public
-        virtual void run() = 0;
-
-        // change access to the public
-        virtual void exception(std::exception_ptr exception) = 0;
     };
 
 ///\brief Shorthand helper shared pointers

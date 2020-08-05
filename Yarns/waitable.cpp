@@ -6,7 +6,7 @@ namespace YarnBall {
     // Class representing the awaitable object.
     // If you need to wait for an operation to complete,
     // this will implement the wait pattern for the thread pool execution.
-    class Waitable final : public IWaitable {
+    class Waitable final : public IWaitable, public ITask {
     public:
         /// \brief Constructor accepting instance of Task
         /// \param task
@@ -55,8 +55,8 @@ namespace YarnBall {
         std::exception_ptr ex;
     };
 
-    sIWaitable Promise(Task task) {
-        sIWaitable wt = std::make_shared<Waitable>(task);
+    sIWaitable Promise(const Task& task) {
+        auto wt = std::make_shared<Waitable>(task);
         Yarns::instance()->addTask(wt);
         return wt;
     }
