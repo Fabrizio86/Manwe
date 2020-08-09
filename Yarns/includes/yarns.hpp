@@ -53,6 +53,12 @@ namespace YarnBall {
         /// \brief returns the max allowed number of background threads for this system
         [[nodiscard]] uint getMaxAsync() const;
 
+        /// \brief return the current size of threads
+        [[nodiscard]] int size() const;
+
+        /// \brief return the current size of async threads
+        [[nodiscard]] int asyncSize() const;
+
     private:
         /// \brief Default constructor, internal initialization
         Yarns();

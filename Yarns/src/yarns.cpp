@@ -3,8 +3,6 @@
 #include <utility>
 #include <cmath>
 
-#include <iostream>
-
 namespace YarnBall {
 
 #define CYCLES 100
@@ -56,16 +54,11 @@ namespace YarnBall {
     }
 
     void Yarns::tempWorkCycle() {
-        cout << "---> temp is here! <---" << endl;
-        cout << "---> max thread size: " << Yarns::instance()->maxThreads << endl;
-        cout << "---> tempThreads size: " << Yarns::instance()->tempThreads << endl;
         uint lifeSpan = LIFE_SPAN;
 
         // while the workQueue is valid, keep taking work
         while (lifeSpan) {
             Yarns::doWork();
-
-            cout << "---> queue size: " << Yarns::instance()->workQueue.size() << endl;
 
             if(Yarns::instance()->workQueue.size() == 0)
                 break;
@@ -77,7 +70,6 @@ namespace YarnBall {
         }
 
         Yarns::instance()->tempThreads--;
-        cout << "goodbye by thread" << endl;
     }
 
     void Yarns::tempAsyncWorkCycle() {
@@ -248,5 +240,13 @@ namespace YarnBall {
 
     uint Yarns::getMaxAsync() const {
         return this->maxAsync;
+    }
+
+    int Yarns::size() const {
+        return this->fibers.size();
+    }
+
+    int Yarns::asyncSize() const {
+        return this->asyncThreads;
     }
 }
