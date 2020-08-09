@@ -1,6 +1,7 @@
 #ifndef YARNS_H
 #define YARNS_H
 
+#include "Definitions.h"
 #include "itask.hpp"
 #include "queue.hpp"
 

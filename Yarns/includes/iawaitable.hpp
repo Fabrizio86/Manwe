@@ -1,6 +1,7 @@
 #ifndef IAWAITABLE_H
 #define IAWAITABLE_H
 
+#include "Definitions.h"
 #include <memory>
 
 namespace YarnBall {
@@ -19,9 +20,6 @@ namespace YarnBall {
         /// \return instance of exception_ptr
         virtual std::exception_ptr getException() = 0;
     };
-
-    ///\brief Shorthand helper shared pointers
-    using sIWaitable = std::shared_ptr<IAwaitable>;
 
 }
 

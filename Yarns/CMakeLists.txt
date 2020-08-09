@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD 20)
 include_directories(${LIB_PATH}/Yarns/includes)
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2a -pthread")
+    SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2a -pthread -fPIC")
 endif ()
 
 add_library(Yarns

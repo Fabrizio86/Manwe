@@ -1,8 +1,6 @@
 #ifndef ITASK_H
 #define ITASK_H
 
-#include "Definitions.h"
-
 #include <exception>
 #include <functional>
 #include <memory>
@@ -21,10 +19,6 @@ namespace YarnBall {
         ///\brief Handles exceptions
         virtual void exception(std::exception_ptr exception) = 0;
     };
-
-    ///\brief Shorthand helper shared pointers
-    using sITask = std::shared_ptr<ITask>;
-
 }
 
 #endif
