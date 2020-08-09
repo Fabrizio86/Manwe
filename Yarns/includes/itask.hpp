@@ -22,9 +22,9 @@ namespace YarnBall {
         virtual void exception(std::exception_ptr exception) = 0;
     };
 
-///\brief Shorthand helper shared pointers
+    ///\brief Shorthand helper shared pointers
     using sITask = std::shared_ptr<ITask>;
 
 }
 
-#endif // ITASK_H
+#endif

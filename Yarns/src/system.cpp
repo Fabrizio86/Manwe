@@ -1,19 +1,21 @@
-#include "waitable.hpp"
-#include "yarns.hpp"
+#include "../includes/system.hpp"
+
+#include <utility>
+#include "../includes/yarns.hpp"
 
 namespace YarnBall {
 
     // Class representing the awaitable object.
     // If you need to wait for an operation to complete,
     // this will implement the wait pattern for the thread pool execution.
-    class Waitable final : public IWaitable, public ITask {
+    class Awaitable final : public IAwaitable, public ITask {
     public:
         /// \brief Constructor accepting instance of Task
         /// \param task
-        explicit Waitable(Task task) : done{false}, task{std::move(task)} {}
+        explicit Awaitable(Task task) : done{false}, task{std::move(task)} {}
 
         /// \brief Default destructor
-        ~Waitable() override = default;
+        ~Awaitable() override = default;
 
         /// \brief tells the caller to wait for the task to execute
         void wait() override {
@@ -55,9 +57,18 @@ namespace YarnBall {
         std::exception_ptr ex;
     };
 
-    sIWaitable Promise(const Task& task) {
-        auto wt = std::make_shared<Waitable>(task);
-        Yarns::instance()->addTask(wt);
+    sIWaitable Promise(Task task) {
+        auto wt = std::make_shared<Awaitable>(std::move(task));
+        Yarns::instance()->submit(wt);
         return wt;
+    }
+
+    void Submit(ITask *task) {
+        sITask sTask(task);
+        Yarns::instance()->submit(sTask);
+    }
+
+    void Invoke(Task task) {
+        Yarns::instance()->invoke(std::move(task));
     }
 }

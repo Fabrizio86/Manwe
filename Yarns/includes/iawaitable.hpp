@@ -1,16 +1,16 @@
-#ifndef IWAITABLE_H
-#define IWAITABLE_H
+#ifndef IAWAITABLE_H
+#define IAWAITABLE_H
 
 #include <memory>
 
 namespace YarnBall {
 
-///\brief Interface for waitable tasks
-    class IWaitable {
+    ///\brief Interface for an awaitable tasks
+    class IAwaitable {
     public:
 
         ///\brief Destructor
-        virtual ~IWaitable() = default;
+        virtual ~IAwaitable() = default;
 
         ///\brief Wait method
         virtual void wait() = 0;
@@ -20,9 +20,9 @@ namespace YarnBall {
         virtual std::exception_ptr getException() = 0;
     };
 
-///\brief Shorthand helper shared pointers
-    using sIWaitable = std::shared_ptr<IWaitable>;
+    ///\brief Shorthand helper shared pointers
+    using sIWaitable = std::shared_ptr<IAwaitable>;
 
 }
 
-#endif // IWAITABLE_H
+#endif // IAWAITABLE_H
