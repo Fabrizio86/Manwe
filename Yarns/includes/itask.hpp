@@ -4,6 +4,7 @@
 #include <exception>
 #include <functional>
 #include <memory>
+#include <thread>
 
 namespace YarnBall {
 
@@ -18,6 +19,11 @@ namespace YarnBall {
 
         ///\brief Handles exceptions
         virtual void exception(std::exception_ptr exception) = 0;
+
+        std::thread::id id();
+
+    private:
+        std::thread::id createdBy{ std::this_thread::get_id() };
     };
 }
 

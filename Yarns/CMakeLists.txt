@@ -17,4 +17,21 @@ add_library(Yarns
         src/system.cpp
         includes/yarns.hpp
         src/yarns.cpp
-        includes/Definitions.h includes/Worker.h src/Worker.cpp)
+        includes/Definitions.h
+        includes/Fiber.h
+        src/Fiber.cpp
+        includes/FiberState.h
+        includes/RandomScheduler.h
+        src/RandomScheduler.cpp
+        src/BaseThread.cpp
+        includes/BaseThread.h
+        src/AsyncFiber.cpp
+        includes/AsyncFiber.h
+        includes/Awaitable.h
+        src/Awaitable.cpp
+        includes/RandGenerator.h
+        src/RandGenerator.cpp
+        includes/IScheduler.h
+        includes/Limiter.h
+        src/Limiter.cpp includes/IFiber.h
+        src/Limiter.cpp)

@@ -29,7 +29,7 @@ namespace YarnBall {
             std::lock_guard<std::mutex> lk(mut);
 
             // push item in list
-            this->queue.push(std::move(value));
+            this->queue.push(value);
 
             // unlock and notify one thread
             this->condition.notify_one();
@@ -51,7 +51,7 @@ namespace YarnBall {
             }
 
             // take first item from the workQueue
-            T task = std::move(this->queue.front());
+            T task = this->queue.front();
 
             // pop item from the workQueue
             this->queue.pop();
@@ -74,7 +74,6 @@ namespace YarnBall {
 
         // Check if workQueue is empty
         bool empty() {
-            std::lock_guard<std::mutex> lk(this->mut);
             return this->queue.empty();
         }
 

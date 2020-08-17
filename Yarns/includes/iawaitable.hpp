@@ -2,6 +2,7 @@
 #define IAWAITABLE_H
 
 #include "Definitions.h"
+
 #include <memory>
 
 namespace YarnBall {

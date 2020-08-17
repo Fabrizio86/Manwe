@@ -9,5 +9,5 @@ SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2a -pthread -fPIC")
 
 add_executable(UnitTest test.cpp Includes/catch.hpp)
 
-target_link_libraries(UnitTest PUBLIC ${LIB_PATH}/${LIB_DIR}/Yarns/libYarns.a)
+target_link_libraries(UnitTest PUBLIC ${LIB_DIR}/libYarns.a)
 

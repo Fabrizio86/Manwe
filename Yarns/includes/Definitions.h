@@ -7,9 +7,13 @@
 
 #include "iawaitable.hpp"
 #include "itask.hpp"
+#include "queue.hpp"
 
+#include <chrono>
 #include <functional>
 #include <memory>
+#include <thread>
+#include <vector>
 
 namespace YarnBall {
 
@@ -17,8 +21,13 @@ namespace YarnBall {
     using uint = unsigned int;
 #endif
 
+    using Locker = std::unique_lock<std::mutex>;
+
     /// \brief Definition for a task
     using Task = std::function<void()>;
+
+    /// \brief tell the scheduler we are idle wanting for jobs
+    using SignalScheduler = std::function<void(class IFiber*)>;
 
     ///\brief Shorthand helper shared pointers
     using sIWaitable = std::shared_ptr<IAwaitable>;
@@ -26,18 +35,21 @@ namespace YarnBall {
     ///\brief Shorthand helper shared pointers
     using sITask = std::shared_ptr<ITask>;
 
-    /// \brief The thread state
-    enum class State
-    {
-        Idle,
-        Running,
-        Taxed,
-        Exhausted,
-        Waiting,
-        Error,
-        Aborting
-    };
+    using DateTime = std::chrono::system_clock::time_point;
 
+    using sFiber = std::shared_ptr<class Fiber>;
+
+    using sAsyncFiber = std::shared_ptr<class AsyncFiber>;
+
+    using Fibers = std::vector<sFiber>;
+
+    using AsyncFibers = std::vector<sAsyncFiber>;
+
+    using FiberId = std::thread::id;
+
+    using WorkQueue = Queue<sITask>;
+
+    using AsyncQueue = Queue<Task>;
 }
 
 #endif //YARNS_DEFINITIONS_H
