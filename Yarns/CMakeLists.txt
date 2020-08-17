@@ -17,4 +17,4 @@ add_library(Yarns
         src/system.cpp
         includes/yarns.hpp
         src/yarns.cpp
-        includes/Definitions.h)
+        includes/Definitions.h includes/Worker.h src/Worker.cpp)

@@ -13,6 +13,10 @@
 
 namespace YarnBall {
 
+#ifndef uint
+    using uint = unsigned int;
+#endif
+
     /// \brief Definition for a task
     using Task = std::function<void()>;
 
@@ -21,6 +25,18 @@ namespace YarnBall {
 
     ///\brief Shorthand helper shared pointers
     using sITask = std::shared_ptr<ITask>;
+
+    /// \brief The thread state
+    enum class State
+    {
+        Idle,
+        Running,
+        Taxed,
+        Exhausted,
+        Waiting,
+        Error,
+        Aborting
+    };
 
 }
 
