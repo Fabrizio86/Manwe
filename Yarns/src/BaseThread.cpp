@@ -6,8 +6,10 @@
 
 namespace YarnBall {
 
+    using namespace std::chrono_literals;
+
     BaseThread::BaseThread(uint upperLimit) : upperLimit(upperLimit),
-                                              state(State::Idle) {
+                                              state(State::Running) {
         this->thread = std::thread(&BaseThread::work, this);
         this->queueThreshold = this->upperLimit * 0.5;
     }
@@ -57,28 +59,36 @@ namespace YarnBall {
         return this->thread.get_id();
     }
 
-    void BaseThread::setIdleSince(const DateTime &idleSince) {
-        this->idleSince = idleSince;
-    }
-
     size_t BaseThread::queueSize() {
         return 0;
     }
 
     void BaseThread::wait() {
-        if(this->state == State::Aborting) return;
-        this->setIdleSince(std::chrono::system_clock::now());
+        if (this->state == State::Aborting) return;
 
         Locker lk(this->mu);
 
-        this->condition.wait(lk, [this] {
-            auto empty = this->queueSize() != 0;
-            auto aborting = this->getState() == State::Aborting;
-            return aborting || empty;
-        });
+        if (this->temp) {
+            bool expired = !this->condition.wait_for(lk, 2s, [this] { return conditional(); });
+            if(expired){
+                this->setState(State::Aborting);
+            }
+        } else {
+            this->condition.wait(lk, [this] { return conditional(); });
+        }
     }
 
-    void BaseThread::work() { }
+    void BaseThread::work() {}
 
-    void BaseThread::clearQueue() { }
+    void BaseThread::clearQueue() {}
+
+    bool BaseThread::conditional() {
+        auto empty = this->queueSize() != 0;
+        auto aborting = this->getState() == State::Aborting;
+        return aborting || empty;
+    }
+
+    void BaseThread::isTemp() {
+        this->temp = true;
+    }
 }

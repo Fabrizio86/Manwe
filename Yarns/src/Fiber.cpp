@@ -35,18 +35,13 @@ namespace YarnBall {
             this->queue.pop_front();
 
             try {
-                this->setState(State::Running);
                 if(task != nullptr) {
                     task->run();
                 }
             }
             catch (...) {
-                this->setState(State::Error);
                 task->exception(current_exception());
-                this->setState(State::Running);
             }
-
-            this->setState(State::Waiting);
         }
     }
 

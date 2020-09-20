@@ -54,6 +54,7 @@ namespace YarnBall {
         // if we can allocate more threads, do so and steal work from current fiber
         if (this->fibers->size() < this->limits->getMaxThreads()) {
             auto newFiber = this->offloadWork<sFiber, Fiber, sITask>(currentThread, task, this->limits->getWorkQueueThreshold());
+            newFiber->isTemp();
             this->fibers->push_back(newFiber);
         } else {
             // otherwise add it the pending assignment

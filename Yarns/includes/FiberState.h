@@ -9,10 +9,7 @@ namespace YarnBall {
 
     /// \brief The thread state
     enum State {
-        Idle,
         Running,
-        Waiting,
-        Error,
         Aborting
     };
 

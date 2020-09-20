@@ -48,9 +48,7 @@ namespace YarnBall {
                     task();
                 }
             }
-            catch (...) {
-                this->setState(State::Error);
-            }
+            catch (...) { }
         }
     }
 

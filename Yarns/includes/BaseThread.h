@@ -46,6 +46,8 @@ namespace YarnBall {
 
         std::thread::id id();
 
+        void isTemp();
+
     protected:
         std::mutex mu;
 
@@ -59,8 +61,6 @@ namespace YarnBall {
 
         void wait();
 
-        void setIdleSince(const DateTime &idleSince);
-
         virtual size_t queueSize();
 
         virtual void work();
@@ -71,8 +71,10 @@ namespace YarnBall {
         std::atomic<State> state{};
         uint queueThreshold{};
         uint upperLimit{};
-        DateTime idleSince;
         std::thread thread;
+        bool temp{false};
+
+        bool conditional();
     };
 }
 
