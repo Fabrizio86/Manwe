@@ -20,16 +20,14 @@ namespace YarnBall {
         /// \brief Default destructor
         virtual ~IScheduler() = default;
 
-        /// \brief add task to the execution workQueue
-        /// \param task to execute
-        virtual void submit(sITask task) = 0;
+        /// Gets the next available fiber, that is different from the calling parent
+        /// \param id the parent thread id that generated the task
+        /// \return the index of the fiber to call
+        virtual int getNextFiber(FiberId id) = 0;
 
-        /// \brief submit a fire and forget task
-        /// \param task
-        virtual void invoke(Task task) = 0;
-
-        /// \brief Signals the threads to end and clear their queue
-        virtual void stop() = 0;
+        /// \brief generate the next async fiber id
+        /// \return the next async fiber instance
+        virtual int getNextAsyncFiber(FiberId id) = 0;
     };
 
 }

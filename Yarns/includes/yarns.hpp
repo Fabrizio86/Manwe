@@ -25,38 +25,33 @@ namespace YarnBall {
         Yarns &operator=(Yarns &&) = delete;
 
         ///\brief Default destructor
-        ~Yarns();
+        ~Yarns() = default;
 
         /// \brief Instance of the Yarns
         /// \return returns the instance of Yarns
         static Yarns *instance();
 
-        /// \brief add task to the execution workQueue
-        /// \param task to execute
-        void submit(sITask task);
-
-        /// \brief submit a fire and forget task
-        /// \param task
-        void invoke(Task task);
-
         /// Gets the pool limits
         /// \return instance of the limiter
         const Limiter* getLimits() const;
+
+        size_t fiberSize() const;
+
+        size_t aFiberSize() const;
+
+        FiberId getFiberId(int index);
+
+        FiberId getAsyncFiberId(int index);
 
     private:
         /// \brief Default constructor, internal initialization
         Yarns();
 
-        /// \brief stops the thread pool
-        void stop();
-
-    private:
         Limiter limits;
-        WorkQueue workQueue;
-        AsyncQueue asyncQueue;
-        IScheduler* scheduler;
         Fibers fibers;
         AsyncFibers asyncFibers;
+
+        friend class Scheduler;
     };
 
 }

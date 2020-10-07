@@ -35,7 +35,7 @@ namespace YarnBall {
     ///\brief Shorthand helper shared pointers
     using sITask = std::shared_ptr<ITask>;
 
-    using DateTime = std::chrono::system_clock::time_point;
+    using sIScheduler = std::shared_ptr<class IScheduler>;
 
     using sFiber = std::shared_ptr<class Fiber>;
 

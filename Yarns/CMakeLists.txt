@@ -34,4 +34,6 @@ add_library(Yarns
         includes/IScheduler.h
         includes/Limiter.h
         src/Limiter.cpp includes/IFiber.h
-        src/Limiter.cpp)
+        src/Limiter.cpp
+        src/Scheduler.cpp
+        includes/Scheduler.h)

@@ -19,41 +19,22 @@ namespace YarnBall {
 
     class RandomScheduler final : public IScheduler {
     public:
-
-        explicit RandomScheduler(Fibers* fibers, AsyncFibers* asyncFibers, WorkQueue* workQueue, AsyncQueue* asyncQueue, Limiter* limits);
+        RandomScheduler();
 
         ~RandomScheduler() override = default;
 
-        void submit(sITask task) override;
-
-        void invoke(Task task) override;
-
-        void stop() override;
-
-    private:
         /// Gets the next available fiber, that is different from the calling parent
         /// \param id the parent thread id that generated the task
-        /// \return the next random fiber
-        sFiber getNextFiber(FiberId id);
+        /// \return the index of the fiber to call
+        int getNextFiber(FiberId id) override;
 
         /// \brief generate the next async fiber id
+        /// \param id the parent thread id that generated the task
         /// \return the next async fiber instance
-        sAsyncFiber getNextAsyncFiber();
-
-        /// \brief Transfer tasks from overworked fiber to a new one
-        /// \param currentThread the newly created fiber
-        /// \param task the current task
-        /// \param the size of the queue
-        template<class InType, class ConcreteClass, typename TaskType>
-        InType offloadWork(InType currentThread, TaskType task, uint queueSize);
+        int getNextAsyncFiber(FiberId id) override;
 
     private:
-        Limiter* limits;
         RandGenerator generator;
-        Fibers* fibers;
-        AsyncFibers* asyncFibers;
-        WorkQueue* workQueue;
-        AsyncQueue* asyncQueue;
     };
 
 }

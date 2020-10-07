@@ -1,5 +1,5 @@
 #include "system.hpp"
-#include "yarns.hpp"
+#include "Scheduler.h"
 #include "Awaitable.h"
 
 namespace YarnBall {
@@ -7,6 +7,6 @@ namespace YarnBall {
     std::thread::id ITask::id() { return this->createdBy; }
 
     void Invoke(Task task) {
-        Yarns::instance()->invoke(std::move(task));
+        Scheduler::instance()->invoke(std::move(task));
     }
 }

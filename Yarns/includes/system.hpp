@@ -4,7 +4,7 @@
 #include "Definitions.h"
 #include "iawaitable.hpp"
 #include "itask.hpp"
-#include "yarns.hpp"
+#include "Scheduler.h"
 
 namespace YarnBall {
 
@@ -12,7 +12,7 @@ namespace YarnBall {
     template<class T>
     sIWaitable Promise(){
         auto wt = std::make_shared<T>();
-        Yarns::instance()->submit(wt);
+        Scheduler::instance()->submit(wt);
         return wt;
     }
 
@@ -20,7 +20,7 @@ namespace YarnBall {
     template<class T>
     void Submit(){
         auto sTask = std::make_shared<T>();
-        Yarns::instance()->submit(sTask);
+        Scheduler::instance()->submit(sTask);
     }
 
     /// \brief invoke a background system task
