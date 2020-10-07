@@ -26,6 +26,7 @@ namespace YarnBall {
         virtual int getNextFiber(FiberId id) = 0;
 
         /// \brief generate the next async fiber id
+        /// \param id the parent thread id that generated the task
         /// \return the next async fiber instance
         virtual int getNextAsyncFiber(FiberId id) = 0;
     };
