@@ -21,11 +21,11 @@ namespace YarnBall {
 
         explicit Fiber(uint upperLimit);
 
+        ~Fiber();
+
         Workload addWork(sITask work) override;
 
         sITask stealWork();
-
-        void setSignaler(SignalScheduler signal);
 
     protected:
         void work() override;
@@ -35,8 +35,6 @@ namespace YarnBall {
         void clearQueue() override;
 
     private:
-
-        SignalScheduler signal;
 
         std::deque<sITask> queue;
     };

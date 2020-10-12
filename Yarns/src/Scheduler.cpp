@@ -6,6 +6,8 @@
 #include "RandomScheduler.h"
 #include "yarns.hpp"
 
+#include <algorithm>
+
 namespace YarnBall {
 
     Scheduler *Scheduler::instance() {
@@ -28,7 +30,7 @@ namespace YarnBall {
         // if the status is not exhausted the tas was submitted and we can return
         if (workload != Workload::Exhausted) return;
 
-        Limiter* limits = &Yarns::instance()->limits;
+        Limiter *limits = &Yarns::instance()->limits;
 
         // if we can allocate more threads, do so and steal work from current fiber
         if (Yarns::instance()->fiberSize() < limits->getMaxThreads()) {
@@ -50,7 +52,7 @@ namespace YarnBall {
         // if the status is not exhausted the tas was submitted and we can return
         if (workload != Workload::Exhausted) return;
 
-        Limiter* limits = &Yarns::instance()->limits;
+        Limiter *limits = &Yarns::instance()->limits;
 
         if (Yarns::instance()->aFiberSize() < limits->getMaxAsync()) {
             auto newAsyncFiber = this->offloadWork<sAsyncFiber, AsyncFiber, Task>(currentThread, task,
@@ -77,5 +79,35 @@ namespace YarnBall {
         }
 
         return newFiber;
+    }
+
+    void Scheduler::cleanup(Fiber *f) {
+        auto id = f->id();
+        auto instance = Yarns::instance();
+        auto fibers = instance->fibers;
+
+        auto fiberIter = std::find_if(fibers.begin(), fibers.end(), [&id](const sFiber &fiber) {
+            return fiber->id() == id;
+        });
+
+        (*fiberIter)->detach();
+        std::remove(fibers.begin(), fibers.end(), *fiberIter), fibers.end();
+    }
+
+    void Scheduler::cleanup(AsyncFiber *afiber) {
+        auto id = afiber->id();
+        auto instance = Yarns::instance();
+        auto fibers = instance->asyncFibers;
+        auto fiber = std::find_if(fibers.begin(), fibers.end(), [&id](const sAsyncFiber &fiber) {
+            return fiber->id() == id;
+        });
+
+        std::remove(fibers.begin(), fibers.end(), *fiber), fibers.end();
+    }
+
+    void Scheduler::getWork(Fiber *fiber) {
+        if (!this->workQueue.empty()) {
+            fiber->addWork(this->workQueue.get());
+        }
     }
 }

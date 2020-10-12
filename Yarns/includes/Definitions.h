@@ -26,9 +26,6 @@ namespace YarnBall {
     /// \brief Definition for a task
     using Task = std::function<void()>;
 
-    /// \brief tell the scheduler we are idle wanting for jobs
-    using SignalScheduler = std::function<void(class IFiber*)>;
-
     ///\brief Shorthand helper shared pointers
     using sIWaitable = std::shared_ptr<IAwaitable>;
 

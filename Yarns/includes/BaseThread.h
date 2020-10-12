@@ -38,7 +38,7 @@ namespace YarnBall {
 
         virtual ~BaseThread();
 
-        State getState() const;
+        State getState();
 
         Workload getWorkload();
 
@@ -48,16 +48,16 @@ namespace YarnBall {
 
         void isTemp();
 
+        void detach();
+
+        void join();
+
     protected:
         std::mutex mu;
 
         std::condition_variable condition;
 
-        void detach();
-
         void setState(State workState);
-
-        State getState();
 
         void wait();
 

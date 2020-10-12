@@ -18,10 +18,6 @@ namespace YarnBall {
         this->thread.detach();
     }
 
-    State BaseThread::getState() const {
-        return this->state;
-    }
-
     Workload BaseThread::getWorkload() {
         size_t size = this->queueSize();
 
@@ -70,7 +66,7 @@ namespace YarnBall {
 
         if (this->temp) {
             bool expired = !this->condition.wait_for(lk, 2s, [this] { return conditional(); });
-            if(expired){
+            if (expired) {
                 this->setState(State::Aborting);
             }
         } else {
@@ -90,5 +86,10 @@ namespace YarnBall {
 
     void BaseThread::isTemp() {
         this->temp = true;
+    }
+
+    void BaseThread::join() {
+        if (this->thread.joinable())
+            this->thread.join();
     }
 }

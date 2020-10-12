@@ -3,6 +3,7 @@
 //
 
 #include "Fiber.h"
+#include "Scheduler.h"
 
 #include <utility>
 
@@ -22,12 +23,13 @@ namespace YarnBall {
     void Fiber::work() {
         while (this->getState() != State::Aborting) {
             if (this->queue.empty()) {
-                this->signal(this);
+                Scheduler::instance()->getWork(this);
                 this->wait();
             }
 
             // thread could have been stopped after waiting, lets just exit
             if (this->getState() == State::Aborting) {
+                Scheduler::instance()->cleanup(this);
                 return;
             }
 
@@ -35,7 +37,7 @@ namespace YarnBall {
             this->queue.pop_front();
 
             try {
-                if(task != nullptr) {
+                if (task != nullptr || task.get() != nullptr) {
                     task->run();
                 }
             }
@@ -56,19 +58,17 @@ namespace YarnBall {
         return workload;
     }
 
-    void Fiber::setSignaler(SignalScheduler signaler) {
-        this->signal = signaler;
-    }
-
     size_t Fiber::queueSize() {
         return this->queue.size();
     }
 
-    Fiber::Fiber(uint upperLimit) : BaseThread(upperLimit) {
-        this->signal = [](IFiber *) {};
+    void Fiber::clearQueue() {
+        this->queue.clear();
     }
 
-    void Fiber::clearQueue() {
-       this->queue.clear();
+    Fiber::~Fiber() {
+        this->join();
     }
+
+    Fiber::Fiber(uint upperLimit) : BaseThread(upperLimit) { }
 }

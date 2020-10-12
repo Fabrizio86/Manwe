@@ -25,6 +25,15 @@ namespace YarnBall {
         void invoke(Task task);
 
     private:
+
+        /// \brief clean aborted threads
+        void cleanup(Fiber* fiber);
+
+        /// \brief clean aborted threads
+        void cleanup(AsyncFiber* afiber);
+
+        void getWork(Fiber* fiber);
+
         Scheduler();
 
         sIScheduler scheduler;
@@ -38,6 +47,8 @@ namespace YarnBall {
         template<class InType, class ConcreteClass, typename TaskType>
         InType offloadWork(InType currentThread, TaskType task, uint queueSize);
 
+        friend Fiber;
+        friend AsyncFiber;
     };
 
 }

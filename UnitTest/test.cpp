@@ -18,11 +18,9 @@ public:
 
     void run() override {
         int j = 0;
-        for(int i = 0; i < 100000; ++i) {
+        for (int i = 0; i < 100000; ++i) {
             j += i;
         }
-
-        cout << "done" << endl;
     }
 
     void exception(std::exception_ptr exception) override {
@@ -31,22 +29,27 @@ public:
 };
 
 int main() {
-    auto started = std::chrono::high_resolution_clock::now();
+    cout << YarnBall::Yarns::instance()->fiberSize() << endl
+         << YarnBall::Yarns::instance()->aFiberSize() << endl;
 
-    for(int i = 0; i < 500000; ++i) {
-        if(i == 1000 || i == 5000 || i == 10000 || i == 50000)
-         this_thread::sleep_for(chrono::seconds (5));
+    int ii = 0;
+    cin >> ii;
+
+    for (int i = 0; i < 500000; ++i) {
+        if (i == 1000 || i == 5000 || i == 10000 || i == 50000) {
+            cout << endl << YarnBall::Yarns::instance()->fiberSize() << endl
+                 << YarnBall::Yarns::instance()->aFiberSize() << endl;
+
+            this_thread::sleep_for(chrono::seconds(1));
+        }
+
         YarnBall::Submit<TestTask>();
     }
 
-    auto done = std::chrono::high_resolution_clock::now();
-    auto time = std::chrono::duration_cast<std::chrono::milliseconds>(done-started).count();
+    cin >> ii;
 
-    cout << "------> Done in: " << time << "ms" << endl;
+    cout << YarnBall::Yarns::instance()->fiberSize() << endl
+         << YarnBall::Yarns::instance()->aFiberSize() << endl;
 
-    int i = 0;
-    cin >> i;
-
-    ///YarnBall::Yarns::instance()->stop();
     return 0;
 }
