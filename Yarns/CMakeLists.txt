@@ -37,3 +37,5 @@ add_library(Yarns
         src/Limiter.cpp
         src/Scheduler.cpp
         includes/Scheduler.h)
+
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -G MinGW Makefiles")
