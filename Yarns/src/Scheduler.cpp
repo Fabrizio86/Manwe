@@ -5,6 +5,7 @@
 #include "Scheduler.h"
 #include "RandomScheduler.h"
 #include "yarns.hpp"
+#include "AsyncTask.h"
 
 #include <algorithm>
 
@@ -22,7 +23,7 @@ namespace YarnBall {
         this->scheduler = std::make_shared<RandomScheduler>();
     }
 
-    void Scheduler::submit(sITask task) {
+    void Scheduler::submit(ITask *task) {
         int index = this->scheduler->getNextFiber(task->id());
         sFiber currentThread = Yarns::instance()->fibers.at(index);
         Workload workload = currentThread->addWork(task);
@@ -34,20 +35,21 @@ namespace YarnBall {
 
         // if we can allocate more threads, do so and steal work from current fiber
         if (Yarns::instance()->fiberSize() < limits->getMaxThreads()) {
-            auto newFiber = this->offloadWork<sFiber, Fiber, sITask>(currentThread, task,
-                                                                     limits->getWorkQueueThreshold());
-            newFiber->isTemp();
+            auto newFiber = this->offloadWork(currentThread, task, limits->getWorkQueueThreshold());
+            newFiber->markAsTemp();
             Yarns::instance()->fibers.push_back(newFiber);
         } else {
+            std::shared_ptr<ITask> sTsk(task);
             // otherwise add it the pending assignment
-            this->workQueue.push(task);
+            this->workQueue.push(sTsk);
         }
     }
 
     void Scheduler::invoke(Task task) {
         int index = this->scheduler->getNextAsyncFiber(std::this_thread::get_id());
-        sAsyncFiber currentThread = Yarns::instance()->asyncFibers.at(index);
-        Workload workload = currentThread->addWork(task);
+        sFiber currentThread = Yarns::instance()->asyncFibers.at(index);
+        ITask *aTsk = new AsyncTask(task);
+        Workload workload = currentThread->addWork(aTsk);
 
         // if the status is not exhausted the tas was submitted and we can return
         if (workload != Workload::Exhausted) return;
@@ -55,11 +57,14 @@ namespace YarnBall {
         Limiter *limits = &Yarns::instance()->limits;
 
         if (Yarns::instance()->aFiberSize() < limits->getMaxAsync()) {
-            auto newAsyncFiber = this->offloadWork<sAsyncFiber, AsyncFiber, Task>(currentThread, task,
-                                                                                  limits->getAsyncWorkQueueThreshold());
+            auto newAsyncFiber = this->offloadWork(currentThread, aTsk, limits->getAsyncWorkQueueThreshold());
+
+            newAsyncFiber->markAsTemp();
+            newAsyncFiber->MarkAsync();
             Yarns::instance()->asyncFibers.push_back(newAsyncFiber);
         } else {
-            this->asyncQueue.push(task);
+            std::shared_ptr<ITask> sTsk(aTsk);
+            this->asyncQueue.push(sTsk);
         }
     }
 
@@ -68,9 +73,8 @@ namespace YarnBall {
         this->workQueue.clear();
     }
 
-    template<class InType, class ConcreteClass, typename TaskType>
-    InType Scheduler::offloadWork(InType currentThread, TaskType task, uint queueSize) {
-        auto newFiber = std::make_shared<ConcreteClass>(queueSize);
+    sFiber Scheduler::offloadWork(sFiber currentThread, ITask *task, uint queueSize) {
+        auto newFiber = std::make_shared<Fiber>(queueSize);
         newFiber->addWork(task);
 
         // steal work from overburden fiber
@@ -81,33 +85,23 @@ namespace YarnBall {
         return newFiber;
     }
 
-    void Scheduler::cleanup(Fiber *f) {
+    void Scheduler::cleanup(Fiber *f, bool async) {
         auto id = f->id();
         auto instance = Yarns::instance();
-        auto fibers = instance->fibers;
+        auto fibers = async ? instance->asyncFibers : instance->fibers;
 
         auto fiberIter = std::find_if(fibers.begin(), fibers.end(), [&id](const sFiber &fiber) {
             return fiber->id() == id;
         });
 
-        (*fiberIter)->detach();
-        std::remove(fibers.begin(), fibers.end(), *fiberIter), fibers.end();
-    }
-
-    void Scheduler::cleanup(AsyncFiber *afiber) {
-        auto id = afiber->id();
-        auto instance = Yarns::instance();
-        auto fibers = instance->asyncFibers;
-        auto fiber = std::find_if(fibers.begin(), fibers.end(), [&id](const sAsyncFiber &fiber) {
-            return fiber->id() == id;
-        });
-
-        std::remove(fibers.begin(), fibers.end(), *fiber), fibers.end();
+        //(*fiberIter)->detach();
+        //std::remove(fibers.begin(), fibers.end(), *fiberIter), fibers.end();
     }
 
     void Scheduler::getWork(Fiber *fiber) {
         if (!this->workQueue.empty()) {
-            fiber->addWork(this->workQueue.get());
+            fiber->addWork(this->workQueue.get().get());
         }
     }
+
 }

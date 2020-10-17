@@ -49,7 +49,7 @@ namespace YarnBall {
 
         Limiter limits;
         Fibers fibers;
-        AsyncFibers asyncFibers;
+        Fibers asyncFibers;
 
         friend class Scheduler;
     };

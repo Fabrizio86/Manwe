@@ -18,7 +18,7 @@ namespace YarnBall {
 
         /// \brief add task to the execution workQueue
         /// \param task to execute
-        void submit(sITask task);
+        void submit(ITask* task);
 
         /// \brief submit a fire and forget task
         /// \param task
@@ -27,10 +27,7 @@ namespace YarnBall {
     private:
 
         /// \brief clean aborted threads
-        void cleanup(Fiber* fiber);
-
-        /// \brief clean aborted threads
-        void cleanup(AsyncFiber* afiber);
+        void cleanup(Fiber* fiber, bool async);
 
         void getWork(Fiber* fiber);
 
@@ -38,17 +35,15 @@ namespace YarnBall {
 
         sIScheduler scheduler;
         WorkQueue workQueue;
-        AsyncQueue asyncQueue;
+        WorkQueue asyncQueue;
 
         /// \brief Transfer tasks from overworked fiber to a new one
         /// \param currentThread the newly created fiber
         /// \param task the current task
         /// \param the size of the queue
-        template<class InType, class ConcreteClass, typename TaskType>
-        InType offloadWork(InType currentThread, TaskType task, uint queueSize);
+        sFiber offloadWork(sFiber currentThread, ITask* task, uint queueSize);
 
         friend Fiber;
-        friend AsyncFiber;
     };
 
 }

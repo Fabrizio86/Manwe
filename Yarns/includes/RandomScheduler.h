@@ -7,7 +7,6 @@
 
 #include <vector>
 
-#include "AsyncFiber.h"
 #include "Definitions.h"
 #include "Fiber.h"
 #include "IScheduler.h"

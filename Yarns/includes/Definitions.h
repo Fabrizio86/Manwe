@@ -5,7 +5,6 @@
 #ifndef YARNS_DEFINITIONS_H
 #define YARNS_DEFINITIONS_H
 
-#include "iawaitable.hpp"
 #include "itask.hpp"
 #include "queue.hpp"
 
@@ -14,6 +13,7 @@
 #include <memory>
 #include <thread>
 #include <vector>
+#include <mutex>
 
 namespace YarnBall {
 
@@ -27,26 +27,22 @@ namespace YarnBall {
     using Task = std::function<void()>;
 
     ///\brief Shorthand helper shared pointers
-    using sIWaitable = std::shared_ptr<IAwaitable>;
+    using sIWaitable = std::shared_ptr<class IAwaitable>;
 
     ///\brief Shorthand helper shared pointers
     using sITask = std::shared_ptr<ITask>;
 
     using sIScheduler = std::shared_ptr<class IScheduler>;
 
-    using sFiber = std::shared_ptr<class Fiber>;
-
-    using sAsyncFiber = std::shared_ptr<class AsyncFiber>;
+    using sFiber = std::shared_ptr<class IFiber>;
 
     using Fibers = std::vector<sFiber>;
-
-    using AsyncFibers = std::vector<sAsyncFiber>;
 
     using FiberId = std::thread::id;
 
     using WorkQueue = Queue<sITask>;
 
-    using AsyncQueue = Queue<Task>;
+    using ThreadId = std::thread::id;
 }
 
 #endif //YARNS_DEFINITIONS_H

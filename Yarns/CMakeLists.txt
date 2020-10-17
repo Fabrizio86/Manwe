@@ -5,6 +5,8 @@ set(CMAKE_CXX_STANDARD 20)
 
 include_directories(${LIB_PATH}/Yarns/includes)
 
+message(CMAKE_CXX_COMPILER_ID)
+
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2a -pthread -fPIC")
 endif ()
@@ -23,10 +25,6 @@ add_library(Yarns
         includes/FiberState.h
         includes/RandomScheduler.h
         src/RandomScheduler.cpp
-        src/BaseThread.cpp
-        includes/BaseThread.h
-        src/AsyncFiber.cpp
-        includes/AsyncFiber.h
         includes/Awaitable.h
         src/Awaitable.cpp
         includes/RandGenerator.h
@@ -36,6 +34,6 @@ add_library(Yarns
         src/Limiter.cpp includes/IFiber.h
         src/Limiter.cpp
         src/Scheduler.cpp
-        includes/Scheduler.h)
+        includes/Scheduler.h src/AsyncTask.cpp includes/AsyncTask.h)
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -G MinGW Makefiles")

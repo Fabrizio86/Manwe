@@ -7,7 +7,6 @@
 
 #include <vector>
 #include "Fiber.h"
-#include "AsyncFiber.h"
 #include "Definitions.h"
 #include "RandGenerator.h"
 #include "queue.hpp"

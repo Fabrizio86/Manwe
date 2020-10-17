@@ -35,7 +35,7 @@ int main() {
     int ii = 0;
     cin >> ii;
 
-    for (int i = 0; i < 500000; ++i) {
+    for (int i = 0; i < 50000; ++i) {
         if (i == 1000 || i == 5000 || i == 10000 || i == 50000) {
             cout << endl << YarnBall::Yarns::instance()->fiberSize() << endl
                  << YarnBall::Yarns::instance()->aFiberSize() << endl;

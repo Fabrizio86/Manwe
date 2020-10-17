@@ -18,7 +18,8 @@ namespace YarnBall {
 
         // create all the background services tasks
         for (uint i = 0; i < this->limits.getAsyncWorkQueueThreshold(); ++i) {
-            auto newAsyncFiber = std::make_shared<AsyncFiber>(this->limits.getAsyncWorkQueueThreshold());
+            auto newAsyncFiber = std::make_shared<Fiber>(this->limits.getAsyncWorkQueueThreshold());
+            newAsyncFiber->MarkAsync();
             this->asyncFibers.push_back(newAsyncFiber);
         }
     }
