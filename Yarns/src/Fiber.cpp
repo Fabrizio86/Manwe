@@ -79,7 +79,7 @@ namespace YarnBall {
     }
 
     void Fiber::join() {
-        if (this->thread.joinable())
+        if (!this->isAsync && this->thread.joinable())
             this->thread.join();
     }
 

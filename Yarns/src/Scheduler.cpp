@@ -94,8 +94,8 @@ namespace YarnBall {
             return fiber->id() == id;
         });
 
-        //(*fiberIter)->detach();
-        //std::remove(fibers.begin(), fibers.end(), *fiberIter), fibers.end();
+        (*fiberIter)->detach();
+        std::remove(fibers.begin(), fibers.end(), *fiberIter), fibers.end();
     }
 
     void Scheduler::getWork(Fiber *fiber) {
