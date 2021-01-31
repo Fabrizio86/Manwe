@@ -31,7 +31,7 @@ add_library(Yarns
         src/RandGenerator.cpp
         includes/IScheduler.h
         includes/Limiter.h
-        src/Limiter.cpp includes/IFiber.h
+        src/Limiter.cpp
         src/Limiter.cpp
         src/Scheduler.cpp
         includes/Scheduler.h src/AsyncTask.cpp includes/AsyncTask.h)

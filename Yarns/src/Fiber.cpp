@@ -29,11 +29,11 @@ namespace YarnBall {
 
             // thread could have been stopped after waiting, lets just exit
             if (this->getState() == State::Aborting) {
-                Scheduler::instance()->cleanup(this, this->isAsync);
+                Scheduler::instance()->cleanup(this);
                 return;
             }
 
-            sITask task = std::move(this->queue.front());
+            sITask task = this->queue.front();
             this->queue.pop_front();
 
             try {
@@ -47,27 +47,8 @@ namespace YarnBall {
         }
     }
 
-    Workload Fiber::addWork(ITask *work) {
-        auto workload = this->getWorkload();
-
-        if (workload != Workload::Exhausted) {
-            shared_ptr<ITask> sTsk(work);
-            this->queue.push_back(sTsk);
-            this->condition.notify_one();
-        }
-
-        return workload;
-    }
-
-    Workload Fiber::addWork(sITask work) {
-        auto workload = this->getWorkload();
-
-        if (workload != Workload::Exhausted) {
-            this->queue.push_back(work);
-            this->condition.notify_one();
-        }
-
-        return workload;
+    void Fiber::addWork(sITask work) {
+        this->queue.push_back(work);
     }
 
     size_t Fiber::queueSize() {
@@ -79,7 +60,7 @@ namespace YarnBall {
     }
 
     void Fiber::join() {
-        if (!this->isAsync && this->thread.joinable())
+        if (!this->isDetached())
             this->thread.join();
     }
 
@@ -91,8 +72,8 @@ namespace YarnBall {
         // if we have already exited, no need to go further
         if (this->state == State::Aborting) return;
 
-        this->state = State::Aborting;
         this->clearQueue();
+        this->state = State::Aborting;
         this->condition.notify_one();
     }
 
@@ -117,7 +98,7 @@ namespace YarnBall {
 
         Locker lk(this->mu);
 
-        if (this->isTemp) {
+        if (this->temp) {
             bool expired = !this->condition.wait_for(lk, 2s, [this] { return conditional(); });
             if (expired) {
                 this->state = State::Aborting;
@@ -133,21 +114,17 @@ namespace YarnBall {
         return aborting || empty;
     }
 
-    void Fiber::markAsTemp() {
-        this->isTemp = true;
-    }
-
-    void Fiber::MarkAsync() {
-        this->isAsync = true;
-    }
-
     Fiber::~Fiber() {
         this->stop();
         this->join();
     }
 
-    Fiber::Fiber(uint upperLimit) : upperLimit(upperLimit), state(State::Running) {
+    Fiber::Fiber(uint upperLimit, bool temp) : upperLimit(upperLimit), state(State::Running), temp{temp} {
         this->queueThreshold = this->upperLimit * 0.5;
         this->thread = std::thread(&Fiber::work, this);
+    }
+
+    bool Fiber::isDetached() const {
+        return !this->thread.joinable();
     }
 }

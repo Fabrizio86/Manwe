@@ -6,9 +6,7 @@
 #include "yarns.hpp"
 #include "system.hpp"
 
-#include <chrono>
 #include <iostream>
-#include <thread>
 
 using namespace std;
 
@@ -18,7 +16,7 @@ public:
 
     void run() override {
         int j = 0;
-        for (int i = 0; i < 100000; ++i) {
+        for (int i = 0; i < 1000000; ++i) {
             j += i;
         }
     }
@@ -35,17 +33,23 @@ int main() {
     int ii = 0;
     cin >> ii;
 
-    for (int i = 0; i < 50000; ++i) {
-        if (i == 1000 || i == 5000 || i == 10000 || i == 50000) {
+    for (int i = 0; i < 100000; ++i) {
+        if (i == 1000 || i == 10000 || i == 50000 || i == 500000) {
             cout << endl << YarnBall::Yarns::instance()->fiberSize() << endl
                  << YarnBall::Yarns::instance()->aFiberSize() << endl;
 
-            this_thread::sleep_for(chrono::seconds(1));
+            cout << "...resuming?" << endl;
+
+            cin >> ii;
+
+            cout << endl << YarnBall::Yarns::instance()->fiberSize() << endl
+                 << YarnBall::Yarns::instance()->aFiberSize() << endl;
         }
 
         YarnBall::Submit<TestTask>();
     }
 
+    cout << "Ready to continue? ";
     cin >> ii;
 
     cout << YarnBall::Yarns::instance()->fiberSize() << endl

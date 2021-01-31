@@ -5,12 +5,12 @@
 #ifndef YARNS_FIBER_H
 #define YARNS_FIBER_H
 
-#include "IFiber.h"
 #include "Definitions.h"
+#include "FiberState.h"
 
 namespace YarnBall {
 
-    class Fiber final : public IFiber {
+    class Fiber final {
     public:
         ///\brief prevent copy constructor
         Fiber(const Fiber &) = delete;
@@ -18,38 +18,33 @@ namespace YarnBall {
         /// \brief prevent move semantics
         Fiber(Fiber &&) = delete;
 
-        explicit Fiber(uint upperLimit);
+        explicit Fiber(uint upperLimit, bool temp = false);
 
         ~Fiber();
-
-        State getState();
 
         void stop();
 
         ThreadId id();
 
-        void detach() override;
+        void detach();
 
-        void join() override;
+        void join();
 
-        Workload addWork(ITask* work);
-
-        Workload addWork(sITask work) override;
+        void addWork(sITask work);
 
         size_t queueSize();
 
-        void markAsTemp() override;
+        Workload getWorkload();
 
-        Workload getWorkload() override;
+        State getState();
 
         sITask stealWork();
 
-        virtual void MarkAsync() override;
+        bool isDetached() const;
 
     private:
-        bool isTemp{false};
-        bool isAsync{false};
-        std::atomic<State> state{};
+        bool temp{false};
+        State state;
         uint queueThreshold{};
         uint upperLimit{};
         std::thread thread;

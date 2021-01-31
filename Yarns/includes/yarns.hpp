@@ -25,7 +25,7 @@ namespace YarnBall {
         Yarns &operator=(Yarns &&) = delete;
 
         ///\brief Default destructor
-        ~Yarns() = default;
+        ~Yarns();
 
         /// \brief Instance of the Yarns
         /// \return returns the instance of Yarns

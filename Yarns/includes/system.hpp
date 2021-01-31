@@ -19,7 +19,7 @@ namespace YarnBall {
     /// \brief submit a task for execution
     template<class T>
     void Submit(){
-        auto sTask = new T();
+        auto sTask = std::make_shared<T>();
         Scheduler::instance()->submit(sTask);
     }
 

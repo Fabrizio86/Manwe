@@ -12,7 +12,7 @@
 #include <functional>
 #include <memory>
 #include <thread>
-#include <vector>
+#include <list>
 #include <mutex>
 
 namespace YarnBall {
@@ -34,9 +34,9 @@ namespace YarnBall {
 
     using sIScheduler = std::shared_ptr<class IScheduler>;
 
-    using sFiber = std::shared_ptr<class IFiber>;
+    using sFiber = std::shared_ptr<class Fiber>;
 
-    using Fibers = std::vector<sFiber>;
+    using Fibers = std::list<sFiber>;
 
     using FiberId = std::thread::id;
 

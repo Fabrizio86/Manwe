@@ -7,6 +7,8 @@
 
 #include "Definitions.h"
 #include "IScheduler.h"
+#include "Fiber.h"
+
 
 namespace YarnBall {
 
@@ -18,7 +20,7 @@ namespace YarnBall {
 
         /// \brief add task to the execution workQueue
         /// \param task to execute
-        void submit(ITask* task);
+        void submit(sITask task, bool isAsync = false);
 
         /// \brief submit a fire and forget task
         /// \param task
@@ -26,8 +28,10 @@ namespace YarnBall {
 
     private:
 
+        std::mutex mu;
+
         /// \brief clean aborted threads
-        void cleanup(Fiber* fiber, bool async);
+        void cleanup(Fiber* fiber);
 
         void getWork(Fiber* fiber);
 
@@ -36,12 +40,6 @@ namespace YarnBall {
         sIScheduler scheduler;
         WorkQueue workQueue;
         WorkQueue asyncQueue;
-
-        /// \brief Transfer tasks from overworked fiber to a new one
-        /// \param currentThread the newly created fiber
-        /// \param task the current task
-        /// \param the size of the queue
-        sFiber offloadWork(sFiber currentThread, ITask* task, uint queueSize);
 
         friend Fiber;
     };

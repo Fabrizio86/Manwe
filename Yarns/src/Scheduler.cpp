@@ -5,11 +5,20 @@
 #include "Scheduler.h"
 #include "RandomScheduler.h"
 #include "yarns.hpp"
-#include "AsyncTask.h"
 
 #include <algorithm>
 
 namespace YarnBall {
+
+    struct SchedulerTask : public ITask {
+        void run() override {
+            this->task();
+        }
+
+        void exception(std::exception_ptr exception) override {}
+
+        Task task;
+    };
 
     Scheduler *Scheduler::instance() {
         static Scheduler scheduler;
@@ -23,58 +32,54 @@ namespace YarnBall {
         this->scheduler = std::make_shared<RandomScheduler>();
     }
 
-    void Scheduler::submit(ITask *task) {
-        int index = this->scheduler->getNextFiber(task->id());
-        sFiber currentThread = Yarns::instance()->fibers.at(index);
-        Workload workload = currentThread->addWork(task);
+#define MAX_RETRY 3
 
-        // if the status is not exhausted the tas was submitted and we can return
-        if (workload != Workload::Exhausted) return;
+    void Scheduler::submit(sITask task, bool isAsync) {
+        sFiber currentThread;
+        int retry = 0;
 
-        Limiter *limits = &Yarns::instance()->limits;
+        // find a thread that is not exhausted
+        do {
+            int index = !isAsync ? this->scheduler->getNextFiber(task->id()) :
+                        this->scheduler->getNextAsyncFiber(std::this_thread::get_id());
 
-        // if we can allocate more threads, do so and steal work from current fiber
-        if (Yarns::instance()->fiberSize() < limits->getMaxThreads()) {
-            auto newFiber = this->offloadWork(currentThread, task, limits->getWorkQueueThreshold());
-            newFiber->markAsTemp();
-            Yarns::instance()->fibers.push_back(newFiber);
-        } else {
-            std::shared_ptr<ITask> sTsk(task);
-            // otherwise add it the pending assignment
-            this->workQueue.push(sTsk);
+            auto fiber = !isAsync ? Yarns::instance()->fibers :
+                         Yarns::instance()->asyncFibers;
+
+            auto pos = fiber.begin();
+            std::advance(pos, index);
+
+            currentThread = *pos;
+            retry++;
+        } while (currentThread->getWorkload() == Workload::Exhausted && retry <= MAX_RETRY);
+
+        // if is not exhausted, just add work
+        if (currentThread->getWorkload() != Workload::Exhausted) {
+            currentThread->addWork(task);
+            return;
         }
-    }
 
-    void Scheduler::invoke(Task task) {
-        int index = this->scheduler->getNextAsyncFiber(std::this_thread::get_id());
-        sFiber currentThread = Yarns::instance()->asyncFibers.at(index);
-        ITask *aTsk = new AsyncTask(task);
-        Workload workload = currentThread->addWork(aTsk);
-
-        // if the status is not exhausted the tas was submitted and we can return
-        if (workload != Workload::Exhausted) return;
-
+        // otherwise calculate if we are within the bounds
         Limiter *limits = &Yarns::instance()->limits;
+        auto currentSize = !isAsync ? Yarns::instance()->fiberSize() : Yarns::instance()->aFiberSize();
+        auto maxSize = !isAsync ? limits->getMaxThreads() : limits->getMaxAsync();
 
-        if (Yarns::instance()->aFiberSize() < limits->getMaxAsync()) {
-            auto newAsyncFiber = this->offloadWork(currentThread, aTsk, limits->getAsyncWorkQueueThreshold());
-
-            newAsyncFiber->markAsTemp();
-            newAsyncFiber->MarkAsync();
-            Yarns::instance()->asyncFibers.push_back(newAsyncFiber);
-        } else {
-            std::shared_ptr<ITask> sTsk(aTsk);
-            this->asyncQueue.push(sTsk);
+        // if we have exhausted the max number of threads, just add it to the pending queue
+        if (currentSize >= maxSize) {
+            WorkQueue *queue = !isAsync ? &this->workQueue : &this->asyncQueue;
+            queue->push(task);
+            return;
         }
-    }
 
-    Scheduler::~Scheduler() {
-        this->asyncQueue.clear();
-        this->workQueue.clear();
-    }
+        // get current thread, if is exhausted the max retry lapsed, create a new thread
+        auto threshold = !isAsync ? limits->getWorkQueueThreshold() : limits->getAsyncWorkQueueThreshold();
+        auto newFiber = std::make_shared<Fiber>(threshold, true);
 
-    sFiber Scheduler::offloadWork(sFiber currentThread, ITask *task, uint queueSize) {
-        auto newFiber = std::make_shared<Fiber>(queueSize);
+        if (isAsync) {
+            newFiber->detach();
+        }
+
+        // add new task (give priority to new operations) then steal from current thread
         newFiber->addWork(task);
 
         // steal work from overburden fiber
@@ -82,25 +87,47 @@ namespace YarnBall {
             newFiber->addWork(currentThread->stealWork());
         }
 
-        return newFiber;
+        if (isAsync) {
+            Yarns::instance()->asyncFibers.push_back(newFiber);
+        } else {
+            Yarns::instance()->fibers.push_back(newFiber);
+        }
     }
 
-    void Scheduler::cleanup(Fiber *f, bool async) {
-        auto id = f->id();
-        auto instance = Yarns::instance();
-        auto fibers = async ? instance->asyncFibers : instance->fibers;
+    void Scheduler::invoke(Task task) {
+        auto aTask = std::make_shared<SchedulerTask>();
+        aTask->task = task;
+        Scheduler::submit(aTask, true);
+    }
 
-        auto fiberIter = std::find_if(fibers.begin(), fibers.end(), [&id](const sFiber &fiber) {
-            return fiber->id() == id;
+    Scheduler::~Scheduler() {
+        this->asyncQueue.clear();
+        this->workQueue.clear();
+    }
+
+    void Scheduler::cleanup(Fiber *f) {
+        Locker lk(this->mu);
+
+        auto instance = Yarns::instance();
+        auto fibers = f->isDetached() ? &instance->asyncFibers : &instance->fibers;
+
+        auto fiberIter = std::find_if(fibers->begin(), fibers->end(), [&f](const sFiber &fiber) {
+            return fiber->id() == f->id();
         });
 
-        (*fiberIter)->detach();
-        std::remove(fibers.begin(), fibers.end(), *fiberIter), fibers.end();
+        sFiber sf = *fiberIter;
+
+        if (!sf->isDetached())
+            sf->detach();
+
+        if (fiberIter != fibers->end())
+            fibers->remove(sf);
     }
 
     void Scheduler::getWork(Fiber *fiber) {
         if (!this->workQueue.empty()) {
-            fiber->addWork(this->workQueue.get().get());
+            sITask task = fiber->isDetached() ? this->asyncQueue.get() : this->workQueue.get();
+            fiber->addWork(task);
         }
     }
 

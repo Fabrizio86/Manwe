@@ -19,7 +19,7 @@ namespace YarnBall {
         // create all the background services tasks
         for (uint i = 0; i < this->limits.getAsyncWorkQueueThreshold(); ++i) {
             auto newAsyncFiber = std::make_shared<Fiber>(this->limits.getAsyncWorkQueueThreshold());
-            newAsyncFiber->MarkAsync();
+            newAsyncFiber->detach();
             this->asyncFibers.push_back(newAsyncFiber);
         }
     }
@@ -38,11 +38,28 @@ namespace YarnBall {
 
     FiberId Yarns::getFiberId(int index) {
         if(index >= this->fiberSize() || index < 0) return std::this_thread::get_id();
-        return this->fibers.at(index)->id();
+
+        auto pos = this->fibers.begin();
+        std::advance(pos, index);
+
+        return pos->get()->id();
     }
 
     FiberId Yarns::getAsyncFiberId(int index) {
         if(index >= this->aFiberSize() || index < 0) return std::this_thread::get_id();
-        return this->asyncFibers.at(index)->id();
+
+        auto pos = this->asyncFibers.begin();
+        std::advance(pos, index);
+
+        return pos->get()->id();
+    }
+
+    Yarns::~Yarns() {
+        for(auto fiber : this->fibers) {
+            fiber->detach();
+            fiber->stop();
+        }
+
+        this->asyncFibers.clear();
     }
 }

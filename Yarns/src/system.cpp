@@ -7,6 +7,6 @@ namespace YarnBall {
     std::thread::id ITask::id() { return this->createdBy; }
 
     void Invoke(Task task) {
-        Scheduler::instance()->invoke(std::move(task));
+        Scheduler::instance()->invoke(task);
     }
 }
