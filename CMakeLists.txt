@@ -1,0 +1,30 @@
+cmake_minimum_required(VERSION 3.19)
+project(Yarn)
+
+set(LIBS ${CMAKE_CURRENT_SOURCE_DIR}/Lib)
+set(CMAKE_CXX_STANDARD 23)
+
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/bin")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/bin")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/bin")
+
+set(LIB_PATH ${PROJECT_SOURCE_DIR})
+
+if (${CMAKE_BUILD_TYPE} STREQUAL "Release")
+    IF (WIN32)
+        set(LIB_DIR ${PROJECT_SOURCE_DIR}/cmake-build-release-visualstudio/Yarn)
+    else ()
+        set(LIB_DIR ${PROJECT_SOURCE_DIR}/cmake-build-release/Yarn)
+    endif ()
+elseif (${CMAKE_BUILD_TYPE} STREQUAL "MinSizeRel")
+    set(LIB_DIR ${PROJECT_SOURCE_DIR}/Yarn)
+elseif (${CMAKE_BUILD_TYPE} STREQUAL "Debug")
+    IF (WIN32)
+        set(LIB_DIR ${PROJECT_SOURCE_DIR}/cmake-build-debug-visualstudio/Yarn)
+    else ()
+        set(LIB_DIR ${PROJECT_SOURCE_DIR}/cmake-build-debug/Yarn)
+    endif ()
+endif ()
+
+add_subdirectory(YarnTests)
+add_subdirectory(Yarn)
