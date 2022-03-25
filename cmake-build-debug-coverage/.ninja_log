@@ -1,0 +1,9 @@
+# ninja log v5
+1	1330	1644351882235455856	Yarn/CMakeFiles/Yarn.dir/src/RandomScheduler.cpp.o	e1750743dcb0f76d
+1	1387	1644351882292374625	Yarn/CMakeFiles/Yarn.dir/src/Waitable.cpp.o	44539c041ce57a7e
+1	1473	1644351882377173035	Yarn/CMakeFiles/Yarn.dir/src/YarnBall.cpp.o	2e1b53836d662510
+1	2150	1644351885252851982	YarnTests/CMakeFiles/YarnTests.dir/main.cpp.o	84420deaabbc83c3
+0	1958	1644351882864821308	Yarn/CMakeFiles/Yarn.dir/src/Yarn.cpp.o	7496dfbddbdf6d85
+1	1610	1644351882513056676	Yarn/CMakeFiles/Yarn.dir/src/Fiber.cpp.o	e4be2208d44659b7
+1958	2021	1644351882935149000	../bin/libYarn.a	5080e75ca108052
+2150	2234	1644351885339227632	../bin/YarnTests	a9b6bd7f156b19bf

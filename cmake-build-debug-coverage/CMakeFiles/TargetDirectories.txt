@@ -1,0 +1,8 @@
+/Users/fabriziopaino/CLionProjects/Yarn/cmake-build-debug-coverage/CMakeFiles/rebuild_cache.dir
+/Users/fabriziopaino/CLionProjects/Yarn/cmake-build-debug-coverage/CMakeFiles/edit_cache.dir
+/Users/fabriziopaino/CLionProjects/Yarn/cmake-build-debug-coverage/YarnTests/CMakeFiles/rebuild_cache.dir
+/Users/fabriziopaino/CLionProjects/Yarn/cmake-build-debug-coverage/YarnTests/CMakeFiles/edit_cache.dir
+/Users/fabriziopaino/CLionProjects/Yarn/cmake-build-debug-coverage/YarnTests/CMakeFiles/YarnTests.dir
+/Users/fabriziopaino/CLionProjects/Yarn/cmake-build-debug-coverage/Yarn/CMakeFiles/rebuild_cache.dir
+/Users/fabriziopaino/CLionProjects/Yarn/cmake-build-debug-coverage/Yarn/CMakeFiles/edit_cache.dir
+/Users/fabriziopaino/CLionProjects/Yarn/cmake-build-debug-coverage/Yarn/CMakeFiles/Yarn.dir
