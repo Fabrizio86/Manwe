@@ -12,6 +12,18 @@ endif ()
 add_library(Yarn
         includes/Yarn.h
         src/Yarn.cpp
-        includes/ITask.h includes/Fiber.h src/Fiber.cpp includes/IScheduler.h includes/RandomScheduler.h src/RandomScheduler.cpp includes/YarnBall.h src/YarnBall.cpp includes/IWaitable.h src/Waitable.cpp)
+        includes/ITask.h
+        includes/Fiber.h
+        src/Fiber.cpp
+        includes/IScheduler.h
+        includes/RandomScheduler.h
+        src/RandomScheduler.cpp
+        includes/YarnBall.h
+        src/YarnBall.cpp
+        includes/IWaitable.h
+        src/Waitable.cpp
+        includes/StopExecutionException.h
+        src/StopExecutionException.cpp
+        includes/Definitions.h)
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -G MinGW Makefiles")

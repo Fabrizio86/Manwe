@@ -29,6 +29,8 @@ namespace YarnBall {
 
         void exception(std::exception_ptr exception) override;
 
+        void interrupted();
+
         bool done = false;
         bool failed = false;
         YarnBall::Operation operation;
