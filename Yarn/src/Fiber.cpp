@@ -10,11 +10,9 @@
 
 namespace YarnBall {
 
-    using Locket = std::unique_lock<std::mutex>;
-
+    using namespace std;
     static const float OPTIMAL_QUEUE_MULTIPLIER = 1.39;
-    const unsigned int Fiber::maxQueueSize = floor(
-            pow(std::thread::hardware_concurrency(), 2) * OPTIMAL_QUEUE_MULTIPLIER);
+    const unsigned int Fiber::maxQueueSize = floor(pow(thread::hardware_concurrency(), 2) * OPTIMAL_QUEUE_MULTIPLIER);
 
     void Fiber::execute(sITask task) {
         if (!this->running) return;
