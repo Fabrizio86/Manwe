@@ -5,6 +5,7 @@
 #include <cmath>
 #include "Yarn.h"
 #include "RandomScheduler.h"
+#include "StopExecutionException.h"
 
 void raiseSignal(YarnBall::sFiber fiber);
 

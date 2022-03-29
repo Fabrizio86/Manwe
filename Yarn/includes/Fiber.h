@@ -39,9 +39,9 @@ namespace YarnBall {
         void process();
         void wait();
         bool waitCondition();
-        unsigned int maxQueueSize();
+        static const unsigned int maxQueueSize;
 
-        bool running = true;
+        bool running;
         bool temp;
         SignalDone signalDone;
 

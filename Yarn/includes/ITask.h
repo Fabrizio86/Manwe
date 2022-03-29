@@ -1,12 +1,7 @@
 #ifndef ITASK_H
 #define ITASK_H
 
-#include <deque>
-#include <exception>
-#include <functional>
-#include <memory>
-#include <thread>
-#include <unordered_map>
+#include "Definitions.h"
 
 namespace YarnBall {
 
@@ -22,23 +17,13 @@ namespace YarnBall {
         ///\brief Handles exceptions
         virtual void exception(std::exception_ptr exception) = 0;
 
-        std::thread::id id();
+        ///\brief returns the FiberId
+        FiberId id();
 
     private:
-        std::thread::id createdBy{std::this_thread::get_id()};
+        FiberId createdBy{std::this_thread::get_id()};
     };
 
-    using sITask = std::shared_ptr<ITask>;
-    using Operation = std::function<void()>;
-    using FiberId = std::thread::id;
-    using Queue = std::deque<sITask>;
-    using sQueue = std::shared_ptr<Queue>;
-    using sQueues = std::unordered_map<FiberId, sQueue>;
-    using SignalDone = std::function<void(FiberId)>;
-    using OsHandler = std::thread::native_handle_type;
-
-    class StopExecutionException {
-    };
 }
 
 #endif

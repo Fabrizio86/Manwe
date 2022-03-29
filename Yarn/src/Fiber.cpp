@@ -4,10 +4,17 @@
 
 #include "Fiber.h"
 #include "Workload.h"
+#include "ITask.h"
+#include "StopExecutionException.h"
+
 
 namespace YarnBall {
 
     using Locket = std::unique_lock<std::mutex>;
+
+    static const float OPTIMAL_QUEUE_MULTIPLIER = 1.39;
+    const unsigned int Fiber::maxQueueSize = floor(
+            pow(std::thread::hardware_concurrency(), 2) * OPTIMAL_QUEUE_MULTIPLIER);
 
     void Fiber::execute(sITask task) {
         if (!this->running) return;
@@ -38,7 +45,9 @@ namespace YarnBall {
             try {
                 task->run();
             }
-            catch (const YarnBall::StopExecutionException &e) {}
+            catch (const StopExecutionException &e) {
+                task->exception(std::current_exception());
+            }
             catch (...) {
                 task->exception(std::current_exception());
             }
@@ -49,20 +58,6 @@ namespace YarnBall {
         this->running = false;
         this->queue->clear();
         this->condition.notify_all();
-    }
-
-    Fiber::Fiber(sQueue queue) : temp(false), queue(queue) {
-        this->thread = std::thread(&Fiber::process, this);
-    }
-
-    Fiber::~Fiber() {
-        this->stop();
-
-        if(this->temp)
-            this->thread.detach();
-
-        if (this->thread.joinable())
-            this->thread.join();
     }
 
     void Fiber::wait() {
@@ -79,9 +74,9 @@ namespace YarnBall {
 
     Workload Fiber::workload() {
         if (this->queue->size() == 0)
-                return Workload::Idle;
+            return Workload::Idle;
 
-        auto percent = ((float) this->queue->size() / this->maxQueueSize()) * 100;
+        int percent = (this->queue->size() / this->maxQueueSize) * 100;
 
         if (percent <= Workload::Busy) return Workload::Busy;
         if (percent > Workload::Busy && percent < Workload::Burdened) return Workload::Burdened;
@@ -93,10 +88,6 @@ namespace YarnBall {
         return this->thread.get_id();
     }
 
-    unsigned int Fiber::maxQueueSize() {
-        return std::thread::hardware_concurrency() * std::thread::hardware_concurrency();
-    }
-
     void Fiber::markAsTemp(SignalDone signalDone) {
         this->temp = true;
         this->signalDone = signalDone;
@@ -105,4 +96,19 @@ namespace YarnBall {
     OsHandler Fiber::osHandler() {
         return this->thread.native_handle();
     }
+
+    Fiber::Fiber(sQueue queue) : running(true), temp(false), queue(queue) {
+        this->thread = std::thread(&Fiber::process, this);
+    }
+
+    Fiber::~Fiber() {
+        this->stop();
+
+        if (this->temp)
+            this->thread.detach();
+
+        if (this->thread.joinable())
+            this->thread.join();
+    }
+
 }
