@@ -3,12 +3,9 @@
 //
 
 #include "Waitable.h"
-
-#include <utility>
 #include "YarnBall.h"
 
 namespace YarnBall {
-
     Waitable::Waitable(YarnBall::Operation operation) : operation(std::move(operation)) {}
 
     void Waitable::wait() {

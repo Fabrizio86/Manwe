@@ -5,11 +5,11 @@
 #ifndef YARN_DEFINITIONS_H
 #define YARN_DEFINITIONS_H
 
-#include <thread>
 #include <deque>
 #include <exception>
 #include <functional>
 #include <memory>
+#include <thread>
 #include <unordered_map>
 
 namespace YarnBall {
@@ -25,6 +25,8 @@ namespace YarnBall {
     using Queue = std::deque<sITask>;
     using sQueue = std::shared_ptr<Queue>;
     using sQueues = std::unordered_map<FiberId, sQueue>;
+
+    using Locket = std::unique_lock<std::mutex>;
 }
 
 #endif //YARN_DEFINITIONS_H
