@@ -6,13 +6,14 @@
 #define YARN_WAITABLE_H
 
 #include "Yarn.h"
+#include "ITask.h"
 #include "IWaitable.h"
 
 namespace YarnBall {
 
-    class Waitable final : public IWaitable, public ITask {
+    class Waitable : public IWaitable {
     public:
-        Waitable(YarnBall::Operation operation);
+        Waitable() = default;
 
         ~Waitable() = default;
 
@@ -22,10 +23,12 @@ namespace YarnBall {
 
         std::string errorMessage() override;
 
+        virtual void operation();
+
     private:
         void run() override;
 
-        void notifyComplition();
+        void notifyDone();
 
         void exception(std::exception_ptr exception) override;
 
@@ -33,7 +36,6 @@ namespace YarnBall {
 
         bool done = false;
         bool failed = false;
-        YarnBall::Operation operation;
         std::mutex mu;
         std::condition_variable cv;
         std::string error;

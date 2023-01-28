@@ -11,8 +11,10 @@ void raiseSignal(YarnBall::sFiber fiber);
 
 #ifdef _WIN32
 
-void raiseSignal(YarnBall::sFiber fiber){
+#include <Windows.h>
 
+void raiseSignal(YarnBall::sFiber fiber){
+    TerminateThread(fiber->osHandler(), SIGUSR2);
 }
 
 #else
@@ -30,7 +32,10 @@ namespace YarnBall {
 #define MinThreads 4
 #define OptimalMultiplier 3.5
 
-    static const int RETRIES = std::sqrt(std::thread::hardware_concurrency());
+    int Yarn::MinThreadCount = std::thread::hardware_concurrency() <= MinThreads ? MinThreads : static_cast<int>(std::thread::hardware_concurrency());
+    int Yarn::MaxThreadCount = std::max(Yarn::MinThreadCount, (int) std::floor(Yarn::MinThreadCount * OptimalMultiplier));
+
+    static const int RETRIES = static_cast<int>(std::sqrt(std::thread::hardware_concurrency()));
 
     void terminationSignal(int signal) {
         if (signal == SIGUSR2)
@@ -41,10 +46,9 @@ namespace YarnBall {
         // get a thread from the scheduler
         int index;
         int tries = 0;
-        int fibersCount = this->fibers.size();
-        FiberId currentId = std::this_thread::get_id();
         sFiber currentFiber;
         Workload compareLevel = Workload::Burdened;
+        int currentPoolSize = static_cast<int>(count_if(this->fibers.begin(), this->fibers.end(), [](auto f) { return f != nullptr; }));
 
         do {
             if (tries > RETRIES && compareLevel == Workload::Burdened) {
@@ -56,11 +60,10 @@ namespace YarnBall {
                 return;
             }
 
-            index = this->scheduler->ThreadIndex(fibersCount);
-            currentFiber = this->get(index);
-
-            // if this is the same thread, try another
-            if (currentFiber->id() == currentId) continue;
+            do {
+                index = this->scheduler->ThreadIndex(currentPoolSize);
+                currentFiber = this->fibers.at(index);
+            } while (currentFiber == nullptr);
 
             tries++;
 
@@ -70,51 +73,76 @@ namespace YarnBall {
         currentFiber->execute(task);
     }
 
-    void Yarn::shiftWork(sFiber currentFiber, sITask task) {
-        auto queue = this->queues[currentFiber->id()];
-        auto newQueue = std::make_shared<Queue>();
+    void Yarn::initializeNewThread(FiberId id, bool markAsTemp) {
+        auto signalDone = [&](FiberId id) {
+            std::lock_guard<std::mutex> lock(this->cmu);
+            this->fibers[id] = nullptr;
+            this->queues[id]->clear();
+        };
 
-        newQueue->push_front(task);
+        auto getFromPending = [&](FiberId id) {
+            if (this->pending->empty()) return false;
 
-        int amountToShift = queue->size() / 2;
+            auto task = this->pending->front();
+            this->pending->pop_front();
+
+            this->fibers[id]->execute(task);
+            return true;
+        };
+
+        std::lock_guard<std::mutex> lock(this->cmu);
+        auto fiber = std::make_shared<Fiber>(id, this->queues[id], signalDone, getFromPending);
+        this->fibers[id] = fiber;
+
+        if (markAsTemp)
+            fiber->markAsTemp();
+    }
+
+    void Yarn::arrangeQueues(FiberId currentQueueId, FiberId newQueueId) {
+        auto queue = this->queues[currentQueueId];
+        auto newQueue = this->queues.at(newQueueId);
+
+        int amountToShift = static_cast<int>(ceil(queue->size() * 0.25));
 
         for (int i = 0; i < amountToShift; ++i) {
-            sITask task = queue->back();
+            auto transferTask = queue->back();
             queue->pop_back();
-            newQueue->push_front(task);
+            newQueue->push_front(transferTask);
+        }
+    }
+
+    void Yarn::shiftWork(const sFiber& currentFiber, sITask task) {
+        std::lock_guard<std::mutex> lock(this->mu);
+
+        if (this->maxLimitReached()) {
+            this->pending->push_back(task);
+            return;
         }
 
-        auto fiber = std::make_shared<Fiber>(newQueue);
-        this->queues[fiber->id()] = newQueue;
-
-        fiber->markAsTemp([&](FiberId id) {
-            this->queues.erase(id);
-            this->fibers.remove_if([&id](const sFiber &fiber) { return fiber->id() == id; });
-        });
-
-        fibers.push_back(fiber);
+        auto newFiberId = this->firstUnusedId();
+        this->arrangeQueues(currentFiber->id(), newFiberId);
+        this->queues.at(newFiberId)->push_front(task);
+        this->initializeNewThread(newFiberId, true);
     }
 
     Yarn::Yarn() {
-
         signal(SIGUSR2, terminationSignal);
+        this->pending = std::make_shared<Queue>();
 
-        for (int i = 0; i < Yarn::ComputeThreadCount(); ++i) {
-            auto queue = std::make_shared<Queue>();
-            auto fiber = std::make_shared<Fiber>(queue);
-            this->queues[fiber->id()] = queue;
-            this->fibers.push_back(fiber);
+        this->fibers.resize(Yarn::MaxThreadCount);
+
+        for (int i = 0; i < Yarn::MaxThreadCount; ++i)
+            this->queues.push_back(std::make_shared<Queue>());
+
+        for (int i = 0; i < Yarn::MinThreadCount; ++i) {
+            this->initializeNewThread(i);
         }
 
-        this->scheduler = new RandomScheduler();
+        this->scheduler = std::make_shared<RandomScheduler>();
     }
 
     Yarn::~Yarn() {
-        for (const sFiber &fiber: this->fibers)
-            fiber->stop();
-
-        if (this->scheduler != nullptr)
-            delete this->scheduler;
+        this->fibers.clear();
     }
 
     Yarn *Yarn::instance() {
@@ -122,35 +150,23 @@ namespace YarnBall {
         return &instance;
     }
 
-    int Yarn::ComputeThreadCount() {
-        int computedCount = std::floor(std::thread::hardware_concurrency() * OptimalMultiplier);
-        return std::max(MinThreads, computedCount);
-    }
-
-    sFiber Yarn::get(int index) {
-        auto fiber = this->fibers.begin();
-        std::advance(fiber, index);
-        return *fiber;
-    }
-
-    void Yarn::SwitchScheduler(IScheduler *scheduler) {
+    void Yarn::SwitchScheduler(sIScheduler scheduler) {
         if (scheduler == nullptr) return;
         auto currentScheduler = this->scheduler;
         this->scheduler = scheduler;
-        delete currentScheduler;
     }
 
     void Yarn::terminateFiber(FiberId id) {
-        raiseSignal(this->find(id));
+        raiseSignal(this->fibers.at(static_cast<FiberId>(id)));
     }
 
-    sFiber Yarn::find(FiberId id) {
-        for (auto i = this->fibers.begin(); i != this->fibers.end(); i++) {
-            auto currentFiber = *i;
-            if (currentFiber->id() == id)
-                return currentFiber;
-        }
-
-        return nullptr;
+    bool Yarn::maxLimitReached() {
+        return !std::any_of(this->fibers.begin() + Yarn::MinThreadCount, this->fibers.end(), [](auto f) { return f == nullptr; });
     }
+
+    FiberId Yarn::firstUnusedId() {
+        auto result = std::find_if(this->fibers.begin(), this->fibers.end(), [](auto f) { return f == nullptr; });
+        return static_cast<FiberId>(std::distance(this->fibers.begin(), result));
+    }
+
 }

@@ -11,20 +11,23 @@
 #include <memory>
 #include <thread>
 #include <unordered_map>
+#include "IScheduler.h"
 
 namespace YarnBall {
 
     class ITask;
 
-    using FiberId = std::thread::id;
+    using sITask = std::shared_ptr<ITask>;
+    using FiberId = unsigned int;
     using Operation = std::function<void()>;
     using SignalDone = std::function<void(FiberId)>;
+    using GetFromPending = std::function<bool(FiberId)>;
     using OsHandler = std::thread::native_handle_type;
 
-    using sITask = std::shared_ptr<ITask>;
     using Queue = std::deque<sITask>;
     using sQueue = std::shared_ptr<Queue>;
-    using sQueues = std::unordered_map<FiberId, sQueue>;
+    using sQueues = std::vector<sQueue>;
+    using sIScheduler = std::shared_ptr<IScheduler>;
 
     using Locket = std::unique_lock<std::mutex>;
 }

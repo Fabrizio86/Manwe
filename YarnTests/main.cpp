@@ -1,16 +1,35 @@
 #include <iostream>
+#include <sstream>
 #include <utility>
 #include "../Yarn/includes/ITask.h"
 #include "../Yarn/includes/YarnBall.h"
 #include "../Yarn/includes/Yarn.h"
+#include "../Yarn/includes/Waitable.h"
 
 using namespace std;
+
+#define ONE_THOUSAND 1000
+#define HUNDRED_THOUSANDS (ONE_THOUSAND * 100)
+#define FIVE_HUNDRED_THOUSANDS (HUNDRED_THOUSANDS * 5)
+#define ONE_MILLION (FIVE_HUNDRED_THOUSANDS * 2)
 
 class Task : public YarnBall::ITask {
 public:
     Task() {
         this->operation = [] {
-            this_thread::sleep_for(chrono::milliseconds (300));
+            srand(time(NULL));
+            int randCnt = rand() % 200 + 5;
+            stringstream ss;
+
+            for (int i = 0; i < randCnt; i++) {
+                srand(time(NULL));
+                int randDly = rand() % 50 + 5;
+                this_thread::sleep_for(chrono::milliseconds(randDly));
+
+                ss << i << ", ";
+            }
+
+            cout  << ss.str() << endl;
         };
     }
 
@@ -24,7 +43,7 @@ public:
     }
 
     void exception(std::exception_ptr exception) override {
-
+        cout << "exception triggered" << endl;
     }
 
 private:
@@ -32,32 +51,47 @@ private:
 
 };
 
-int main() {
-    YarnBall::Run(new Task());
-    YarnBall::Run(new Task([] { cout << "Hi there" << endl; }));
+class WaitableTask : public YarnBall::Waitable {
+public:
+    void operation() override {
+        srand(time(NULL));
+        int randDly = rand() % 10 + 1;
+        this_thread::sleep_for(chrono::seconds(randDly));
 
-    auto wt = YarnBall::Post([] {
-        for (int i = 0; i < 100000; i++) {
-            cout << i << endl;
-        }
-    });
-
-    string txt = "hi there some random text";
-    auto wt2 = YarnBall::Post([&txt] {
-        cout << txt << endl;
+        cout << "before editing: " << txt << endl;
         txt += " edited in thread";
-    });
+        cout << "after editing: " << txt << endl;
+    }
+
+    std::string txt;
+};
+
+int main() {
+    YarnBall::Run(std::make_shared<Task>());
+    YarnBall::Run(std::make_shared<Task>([] { cout << "Hi there" << endl; }));
+
+    this_thread::sleep_for(chrono::seconds(3));
+
+    cout << "starting the waitable" << endl;
+
+    auto wt = std::make_shared<WaitableTask>();
+    wt->txt = "hi there some random text";
+    YarnBall::Post(wt);
 
     wt->wait();
-    wt2->wait();
 
-    for (int i = 0; i < 10000; ++i) {
-        YarnBall::Run(new Task());
+    cout << wt->txt << endl;
+
+    cout << "done waiting, press any key to continue: ";
+
+    char c;
+    cin >> c;
+
+    for (int i = 0; i < ONE_THOUSAND * 2; ++i) {
+        YarnBall::Run(std::make_shared<Task>());
     }
 
     int i;
-
-    cout << txt << endl;
 
     cout << "Done waiting" << endl;
     cin >> i;
