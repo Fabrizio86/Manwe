@@ -5,11 +5,9 @@
 #ifndef YARN_IWAITABLE_H
 #define YARN_IWAITABLE_H
 
-#include "ITask.h"
-
 namespace YarnBall {
 
-    class IWaitable {
+    class IWaitable : public ITask {
     public:
         virtual ~IWaitable()  = default;
 

@@ -6,7 +6,6 @@
 #include "YarnBall.h"
 
 namespace YarnBall {
-    Waitable::Waitable(YarnBall::Operation operation) : operation(std::move(operation)) {}
 
     void Waitable::wait() {
         std::this_thread::yield();
@@ -20,10 +19,10 @@ namespace YarnBall {
 
     void Waitable::run() {
         this->operation();
-        this->notifyComplition();
+        this->notifyDone();
     }
 
-    void Waitable::notifyComplition() {
+    void Waitable::notifyDone() {
         this->done = true;
         this->cv.notify_all();
     }
@@ -37,10 +36,14 @@ namespace YarnBall {
         catch (const char *e) { this->error = e; }
         catch (...) { this->error = "Unknown error"; }
 
-        this->notifyComplition();
+        this->notifyDone();
     }
 
     std::string Waitable::errorMessage() {
         return this->error;
+    }
+
+    void Waitable::operation() {
+
     }
 }

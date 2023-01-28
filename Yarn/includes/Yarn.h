@@ -9,6 +9,8 @@
 #include "ITask.h"
 #include "IScheduler.h"
 
+#include <mutex>
+
 namespace YarnBall {
 
     class Yarn final {
@@ -31,24 +33,28 @@ namespace YarnBall {
 
         void Run(sITask task);
 
-        void SwitchScheduler(IScheduler *scheduler);
+        void SwitchScheduler(sIScheduler scheduler);
 
     private:
         Yarn();
 
-        static int ComputeThreadCount();
+        static int MaxThreadCount;
+        static int MinThreadCount;
 
-        sFiber find(FiberId id);
-
-        void shiftWork(sFiber currentFiber, sITask task);
-
-        sFiber get(int index);
+        void shiftWork(const sFiber& currentFiber, sITask task);
+        bool maxLimitReached();
+        void initializeNewThread(FiberId id, bool markAsTemp = false);
+        void arrangeQueues(FiberId currentQueueId, FiberId newQueueId);
+        FiberId firstUnusedId();
 
         void terminateFiber(FiberId id);
 
         Fibers fibers;
         sQueues queues;
-        IScheduler *scheduler;
+        sQueue pending;
+        sIScheduler scheduler;
+        std::mutex mu;
+        std::mutex cmu;
     };
 
 }

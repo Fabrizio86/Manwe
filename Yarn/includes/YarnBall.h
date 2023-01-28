@@ -10,11 +10,9 @@
 
 namespace YarnBall {
 
-    void Run(ITask* task);
-
     void Run(sITask task);
 
-    sIWaitable Post(Operation operation);
+    void Post(sIWaitable operation);
 
 }
 

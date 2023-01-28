@@ -17,11 +17,6 @@ namespace YarnBall {
         ///\brief Handles exceptions
         virtual void exception(std::exception_ptr exception) = 0;
 
-        ///\brief returns the FiberId
-        FiberId id();
-
-    private:
-        FiberId createdBy{std::this_thread::get_id()};
     };
 
 }

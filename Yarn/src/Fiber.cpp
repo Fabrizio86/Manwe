@@ -17,16 +17,18 @@ namespace YarnBall {
     void Fiber::execute(sITask task) {
         if (!this->running) return;
 
-        this->queue->push_back(task);
+        this->queue->push_back(std::move(task));
         this->condition.notify_one();
     }
 
     void Fiber::process() {
         while (this->running) {
+
+            // if we have no tasks assigned, and no more pending tasks
             if (this->queue->empty()) {
                 // if we are temp, we don't wait, just exit
                 if (this->temp) {
-                    this->signalDone(this->id());
+                    this->signalDone(this->fiberId);
                     return;
                 }
 
@@ -35,10 +37,12 @@ namespace YarnBall {
             }
 
             // after resuming from waiting, let's verify we still need to work
-            if (!this->running) return;
+            if (!this->running || this->queue == nullptr || this->queue->empty()) return;
 
             sITask task = this->queue->front();
             this->queue->pop_front();
+
+            if (task == nullptr) continue;
 
             try {
                 task->run();
@@ -52,12 +56,6 @@ namespace YarnBall {
         }
     }
 
-    void Fiber::stop() {
-        this->running = false;
-        this->queue->clear();
-        this->condition.notify_all();
-    }
-
     void Fiber::wait() {
         if (!this->running) return;
 
@@ -66,7 +64,7 @@ namespace YarnBall {
     }
 
     bool Fiber::waitCondition() {
-        bool empty = this->queue->size() != 0;
+        bool empty = !this->queue->empty();
         return !this->running || empty;
     }
 
@@ -74,7 +72,8 @@ namespace YarnBall {
         if (this->queue->size() == 0)
             return Workload::Idle;
 
-        int percent = (this->queue->size() / this->maxQueueSize) * 100;
+        int queueSize = static_cast<int>(this->queue->size());
+        int percent = (queueSize / this->maxQueueSize) * 100;
 
         if (percent <= Workload::Busy) return Workload::Busy;
         if (percent > Workload::Busy && percent < Workload::Burdened) return Workload::Burdened;
@@ -82,21 +81,30 @@ namespace YarnBall {
         return Workload::Overburdened;
     }
 
-    FiberId Fiber::id() {
-        return this->thread.get_id();
+    FiberId Fiber::id() const {
+        return this->fiberId;
     }
 
-    void Fiber::markAsTemp(SignalDone signalDone) {
+    void Fiber::markAsTemp() {
         this->temp = true;
-        this->signalDone = signalDone;
     }
 
     OsHandler Fiber::osHandler() {
         return this->thread.native_handle();
     }
 
-    Fiber::Fiber(sQueue queue) : running(true), temp(false), queue(queue) {
+    Fiber::Fiber(FiberId id, sQueue queue, SignalDone signalDone, GetFromPending getFromPending) : queue(queue),
+                                                                                                   running(true),
+                                                                                                   temp(false),
+                                                                                                   fiberId(id),
+                                                                                                   signalDone(signalDone),
+                                                                                                   getFromPending(getFromPending) {
         this->thread = std::thread(&Fiber::process, this);
+    }
+
+    void Fiber::stop() {
+        this->running = false;
+        this->condition.notify_one();
     }
 
     Fiber::~Fiber() {

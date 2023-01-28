@@ -8,18 +8,11 @@
 
 namespace YarnBall {
 
-    void Run(ITask *task) {
-        std::shared_ptr<ITask> sTask(task);
-        Yarn::instance()->Run(sTask);
-    }
-
     void Run(sITask task) {
         Yarn::instance()->Run(task);
     }
 
-    sIWaitable Post(Operation operation) {
-        auto waitable = std::make_shared<Waitable>(operation);
-        Run(waitable);
-        return waitable;
+    void Post(sIWaitable operation) {
+        Yarn::instance()->Run(operation);
     }
 }
