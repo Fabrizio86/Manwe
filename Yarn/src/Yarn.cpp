@@ -81,17 +81,24 @@ namespace YarnBall {
         };
 
         auto getFromPending = [&](FiberId id) {
-            if (this->pending->empty()) return false;
+            std::lock_guard<std::mutex> lock(this->dmu);
+            auto currentFiber = this->fibers[id];
 
-            auto task = this->pending->front();
-            this->pending->pop_front();
+            while (!this->pending->empty()) {
+                this->queues[id]->push_back(this->pending->front());
+                this->pending->pop_front();
 
-            this->fibers[id]->execute(task);
-            return true;
+                if (currentFiber->workload() >= Workload::Burdened)
+                    return;
+            }
+        };
+
+        auto anyPendingTasks = [&]() {
+            return !this->pending->empty();
         };
 
         std::lock_guard<std::mutex> lock(this->cmu);
-        auto fiber = std::make_shared<Fiber>(id, this->queues[id], signalDone, getFromPending);
+        auto fiber = std::make_shared<Fiber>(id, this->queues[id], signalDone, getFromPending, anyPendingTasks);
         this->fibers[id] = fiber;
 
         if (markAsTemp)
@@ -111,10 +118,11 @@ namespace YarnBall {
         }
     }
 
-    void Yarn::shiftWork(const sFiber& currentFiber, sITask task) {
+    void Yarn::shiftWork(const sFiber &currentFiber, sITask task) {
         std::lock_guard<std::mutex> lock(this->mu);
 
         if (this->maxLimitReached()) {
+            std::lock_guard<std::mutex> dataLock(this->dmu);
             this->pending->push_back(task);
             return;
         }
