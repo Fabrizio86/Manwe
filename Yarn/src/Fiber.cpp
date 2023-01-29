@@ -11,8 +11,10 @@
 namespace YarnBall {
 
     using namespace std;
-    static const float OPTIMAL_QUEUE_MULTIPLIER = 1.39;
-    const unsigned int Fiber::maxQueueSize = floor(pow(thread::hardware_concurrency(), 2) * OPTIMAL_QUEUE_MULTIPLIER);
+    static const float OPTIMAL_QUEUE_MULTIPLIER = 4.75;
+    static const int POWER = 2;
+    static const int HDW_THREADS = thread::hardware_concurrency();
+    const unsigned int Fiber::maxQueueSize = floor(pow(HDW_THREADS, POWER) * OPTIMAL_QUEUE_MULTIPLIER);
 
     void Fiber::execute(sITask task) {
         if (!this->running) return;
@@ -26,6 +28,12 @@ namespace YarnBall {
 
             // if we have no tasks assigned, and no more pending tasks
             if (this->queue->empty()) {
+                // check if there are pending tasks
+                if (this->anyPendingTasks()) {
+                    this->getFromPending(this->fiberId);
+                    continue;
+                }
+
                 // if we are temp, we don't wait, just exit
                 if (this->temp) {
                     this->signalDone(this->fiberId);
@@ -93,18 +101,19 @@ namespace YarnBall {
         return this->thread.native_handle();
     }
 
-    Fiber::Fiber(FiberId id, sQueue queue, SignalDone signalDone, GetFromPending getFromPending) : queue(queue),
-                                                                                                   running(true),
-                                                                                                   temp(false),
-                                                                                                   fiberId(id),
-                                                                                                   signalDone(signalDone),
-                                                                                                   getFromPending(getFromPending) {
-        this->thread = std::thread(&Fiber::process, this);
-    }
-
     void Fiber::stop() {
         this->running = false;
         this->condition.notify_one();
+    }
+
+    Fiber::Fiber(FiberId id, sQueue queue, SignalDone signalDone, GetFromPending getFromPending, AnyPendingTasks anyPendingTasks) : queue(queue),
+                                                                                                                                    running(true),
+                                                                                                                                    temp(false),
+                                                                                                                                    fiberId(id),
+                                                                                                                                    signalDone(signalDone),
+                                                                                                                                    getFromPending(getFromPending),
+                                                                                                                                    anyPendingTasks(anyPendingTasks) {
+        this->thread = std::thread(&Fiber::process, this);
     }
 
     Fiber::~Fiber() {

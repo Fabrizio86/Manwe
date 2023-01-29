@@ -13,7 +13,7 @@ namespace YarnBall {
 
     class Fiber final {
     public:
-        Fiber(FiberId id, sQueue queue, SignalDone signalDone, GetFromPending getFromPending);
+        Fiber(FiberId id, sQueue queue, SignalDone signalDone, GetFromPending getFromPending, AnyPendingTasks anyPendingTasks);
 
         ~Fiber();
 
@@ -45,6 +45,7 @@ namespace YarnBall {
         bool temp;
         SignalDone signalDone;
         GetFromPending getFromPending;
+        AnyPendingTasks anyPendingTasks;
 
         std::condition_variable condition;
         sQueue queue;

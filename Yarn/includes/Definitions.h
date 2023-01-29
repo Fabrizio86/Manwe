@@ -21,7 +21,9 @@ namespace YarnBall {
     using FiberId = unsigned int;
     using Operation = std::function<void()>;
     using SignalDone = std::function<void(FiberId)>;
-    using GetFromPending = std::function<bool(FiberId)>;
+    using AnyPendingTasks = std::function<bool(void)>;
+    using GetFromPending = std::function<void(FiberId)>;
+
     using OsHandler = std::thread::native_handle_type;
 
     using Queue = std::deque<sITask>;

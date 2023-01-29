@@ -55,6 +55,7 @@ namespace YarnBall {
         sIScheduler scheduler;
         std::mutex mu;
         std::mutex cmu;
+        std::mutex dmu;
     };
 
 }

@@ -28,8 +28,6 @@ public:
 
                 ss << i << ", ";
             }
-
-            cout  << ss.str() << endl;
         };
     }
 
@@ -60,7 +58,6 @@ public:
 
         cout << "before editing: " << txt << endl;
         txt += " edited in thread";
-        cout << "after editing: " << txt << endl;
     }
 
     std::string txt;
@@ -80,15 +77,21 @@ int main() {
 
     wt->wait();
 
-    cout << wt->txt << endl;
+    cout << "after editing: " << wt->txt << endl;
 
     cout << "done waiting, press any key to continue: ";
 
     char c;
     cin >> c;
 
-    for (int i = 0; i < ONE_THOUSAND * 2; ++i) {
+    for (int i = 0; i < HUNDRED_THOUSANDS; ++i) {
         YarnBall::Run(std::make_shared<Task>());
+
+        if (i == (ONE_THOUSAND * 3) || i == (ONE_THOUSAND * 4) || i == (ONE_THOUSAND * 5) || i == (ONE_THOUSAND * 6) || i == (ONE_THOUSAND * 7) || i == (ONE_THOUSAND * 8) ||
+            i == (ONE_THOUSAND * 9) || i == (ONE_THOUSAND * 15)) {
+            cout << "pause point, press to continue: ";
+            cin >> c;
+        }
     }
 
     int i;
