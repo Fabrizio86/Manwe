@@ -2,8 +2,8 @@
 // Created by Fabrizio Paino on 2022-01-19.
 //
 
-#ifndef YARN_WORKLOAD_H
-#define YARN_WORKLOAD_H
+#ifndef YARN_WORKLOAD_HPP
+#define YARN_WORKLOAD_HPP
 
 namespace YarnBall {
 
@@ -16,4 +16,4 @@ namespace YarnBall {
 
 }
 
-#endif //YARN_WORKLOAD_H
+#endif //YARN_WORKLOAD_HPP

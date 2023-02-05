@@ -10,20 +10,20 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
 endif ()
 
 add_library(Yarn
-        includes/Yarn.h
+        includes/Yarn.hpp
         src/Yarn.cpp
-        includes/ITask.h
-        includes/Fiber.h
+        includes/ITask.hpp
+        includes/Fiber.hpp
         src/Fiber.cpp
-        includes/IScheduler.h
-        includes/RandomScheduler.h
+        includes/IScheduler.hpp
+        includes/RandomScheduler.hpp
         src/RandomScheduler.cpp
-        includes/YarnBall.h
+        includes/YarnBall.hpp
         src/YarnBall.cpp
-        includes/IWaitable.h
+        includes/IWaitable.hpp
         src/Waitable.cpp
-        includes/StopExecutionException.h
+        includes/StopExecutionException.hpp
         src/StopExecutionException.cpp
-        includes/Definitions.h)
+        includes/Definitions.hpp)
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -G MinGW Makefiles")

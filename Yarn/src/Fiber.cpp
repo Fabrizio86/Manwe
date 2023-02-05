@@ -2,10 +2,10 @@
 // Created by Fabrizio Paino on 2022-01-16.
 //
 
-#include "Fiber.h"
-#include "Workload.h"
-#include "ITask.h"
-#include "StopExecutionException.h"
+#include "Fiber.hpp"
+#include "Workload.hpp"
+#include "ITask.hpp"
+#include "StopExecutionException.hpp"
 
 
 namespace YarnBall {

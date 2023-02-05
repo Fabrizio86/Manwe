@@ -2,12 +2,12 @@
 // Created by Fabrizio Paino on 2022-01-15.
 //
 
-#ifndef YARN_FIBER_H
-#define YARN_FIBER_H
+#ifndef YARN_FIBER_HPP
+#define YARN_FIBER_HPP
 
 #include <vector>
-#include "ITask.h"
-#include "Workload.h"
+#include "ITask.hpp"
+#include "Workload.hpp"
 
 namespace YarnBall {
 
@@ -59,4 +59,4 @@ namespace YarnBall {
     using Fibers = std::vector<sFiber>;
 }
 
-#endif //YARN_FIBER_H
+#endif //YARN_FIBER_HPP

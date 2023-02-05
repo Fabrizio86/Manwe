@@ -2,12 +2,12 @@
 // Created by Fabrizio Paino on 2022-01-14.
 //
 
-#ifndef YARN_YARN_H
-#define YARN_YARN_H
+#ifndef YARN_YARN_HPP
+#define YARN_YARN_HPP
 
-#include "Fiber.h"
-#include "ITask.h"
-#include "IScheduler.h"
+#include "Fiber.hpp"
+#include "ITask.hpp"
+#include "IScheduler.hpp"
 
 #include <mutex>
 
@@ -60,4 +60,4 @@ namespace YarnBall {
 
 }
 
-#endif //YARN_YARN_H
+#endif //YARN_YARN_HPP

@@ -2,9 +2,9 @@
 // Created by Fabrizio Paino on 2022-01-16.
 //
 
-#include "YarnBall.h"
-#include "Yarn.h"
-#include "Waitable.h"
+#include "YarnBall.hpp"
+#include "Yarn.hpp"
+#include "Waitable.hpp"
 
 namespace YarnBall {
 

@@ -2,8 +2,8 @@
 // Created by Fabrizio Paino on 2022-01-16.
 //
 
-#ifndef YARN_IWAITABLE_H
-#define YARN_IWAITABLE_H
+#ifndef YARN_IWAITABLE_HPP
+#define YARN_IWAITABLE_HPP
 
 namespace YarnBall {
 
@@ -22,4 +22,4 @@ namespace YarnBall {
 
 }
 
-#endif //YARN_IWAITABLE_H
+#endif //YARN_IWAITABLE_HPP

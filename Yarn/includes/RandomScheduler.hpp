@@ -2,10 +2,10 @@
 // Created by Fabrizio Paino on 2022-01-16.
 //
 
-#ifndef YARN_RANDOMSCHEDULER_H
-#define YARN_RANDOMSCHEDULER_H
+#ifndef YARN_RANDOMSCHEDULER_HPP
+#define YARN_RANDOMSCHEDULER_HPP
 
-#include "IScheduler.h"
+#include "IScheduler.hpp"
 #include <random>
 
 namespace YarnBall {
@@ -25,4 +25,4 @@ namespace YarnBall {
 
 }
 
-#endif //YARN_RANDOMSCHEDULER_H
+#endif //YARN_RANDOMSCHEDULER_HPP
