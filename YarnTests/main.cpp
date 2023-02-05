@@ -1,10 +1,10 @@
 #include <iostream>
 #include <sstream>
 #include <utility>
-#include "../Yarn/includes/ITask.h"
-#include "../Yarn/includes/YarnBall.h"
-#include "../Yarn/includes/Yarn.h"
-#include "../Yarn/includes/Waitable.h"
+#include "../Yarn/includes/ITask.hpp"
+#include "../Yarn/includes/YarnBall.hpp"
+#include "../Yarn/includes/Yarn.hpp"
+#include "../Yarn/includes/Waitable.hpp"
 
 using namespace std;
 

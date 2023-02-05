@@ -2,7 +2,7 @@
 // Created by Fabrizio Paino on 2022-01-16.
 //
 
-#include "RandomScheduler.h"
+#include "RandomScheduler.hpp"
 
 namespace YarnBall {
 

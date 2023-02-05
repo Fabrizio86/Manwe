@@ -2,8 +2,8 @@
 // Created by Fabrizio Paino on 2022-03-29.
 //
 
-#ifndef YARN_DEFINITIONS_H
-#define YARN_DEFINITIONS_H
+#ifndef YARN_DEFINITIONS_HPP
+#define YARN_DEFINITIONS_HPP
 
 #include <deque>
 #include <exception>
@@ -11,7 +11,7 @@
 #include <memory>
 #include <thread>
 #include <unordered_map>
-#include "IScheduler.h"
+#include "IScheduler.hpp"
 
 namespace YarnBall {
 
@@ -34,4 +34,4 @@ namespace YarnBall {
     using Locket = std::unique_lock<std::mutex>;
 }
 
-#endif //YARN_DEFINITIONS_H
+#endif //YARN_DEFINITIONS_HPP

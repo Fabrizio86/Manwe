@@ -1,7 +1,7 @@
 #ifndef ITASK_H
 #define ITASK_H
 
-#include "Definitions.h"
+#include "Definitions.hpp"
 
 namespace YarnBall {
 

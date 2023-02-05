@@ -2,12 +2,12 @@
 // Created by Fabrizio Paino on 2022-01-16.
 //
 
-#ifndef YARN_WAITABLE_H
-#define YARN_WAITABLE_H
+#ifndef YARN_WAITABLE_HPP
+#define YARN_WAITABLE_HPP
 
-#include "Yarn.h"
-#include "ITask.h"
-#include "IWaitable.h"
+#include "Yarn.hpp"
+#include "ITask.hpp"
+#include "IWaitable.hpp"
 
 namespace YarnBall {
 
@@ -42,4 +42,4 @@ namespace YarnBall {
     };
 }
 
-#endif //YARN_WAITABLE_H
+#endif //YARN_WAITABLE_HPP
