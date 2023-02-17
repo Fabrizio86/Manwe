@@ -1,4 +1,4 @@
-# Install script for directory: /Users/fabriziopaino/CLionProjects/Manwë/Manwë
+# Install script for directory: /Users/fabriziopaino/CLionProjects/Manwe/Manwe
 
 # Set the install prefix
 if(NOT DEFINED CMAKE_INSTALL_PREFIX)
