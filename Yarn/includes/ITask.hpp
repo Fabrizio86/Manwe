@@ -5,7 +5,7 @@
 
 namespace YarnBall {
 
-    ///\brief Interface for Yarn to call upon
+    ///\brief Interface for Manwë to call upon
     class ITask {
     public:
         ///\brief Virtual destructor

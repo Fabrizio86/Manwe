@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.19)
-project(Yarn)
+project(Manwë)
 
 set(LIBS ${CMAKE_CURRENT_SOURCE_DIR}/Lib)
 set(CMAKE_CXX_STANDARD 23)
