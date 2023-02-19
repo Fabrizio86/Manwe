@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.19)
-project(Manwë)
+project(Manwe)
 
 set(LIBS ${CMAKE_CURRENT_SOURCE_DIR}/Lib)
 set(CMAKE_CXX_STANDARD 23)
@@ -28,3 +28,4 @@ endif ()
 
 add_subdirectory(YarnTests)
 add_subdirectory(Yarn)
+add_subdirectory(Wire)
