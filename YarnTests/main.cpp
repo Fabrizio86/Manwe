@@ -23,7 +23,7 @@ public:
 
             for (int i = 0; i < randCnt; i++) {
                 srand(time(NULL));
-                int randDly = rand() % 50 + 5;
+                int randDly = rand() % 10 + 3;
                 this_thread::sleep_for(chrono::milliseconds(randDly));
 
                 ss << i << ", ";
@@ -96,7 +96,7 @@ int main() {
 
     int i;
 
-    cout << "Done waiting" << endl;
+    cout << "Done waiting, press a key to exit: ";
     cin >> i;
 
     return 0;
