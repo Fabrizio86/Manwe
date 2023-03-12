@@ -10,7 +10,6 @@
 #include <unordered_map>
 #include "YarnBall.hpp"
 
-/
 namespace Telegraph {
 
     template<typename... Args>
@@ -69,6 +68,5 @@ namespace Telegraph {
         };
     };
 }
-
 
 #endif //MANWE_CENTRALINE_H
