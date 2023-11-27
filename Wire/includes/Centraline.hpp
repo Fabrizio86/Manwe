@@ -49,6 +49,7 @@ namespace Telegraph {
 
         std::vector<WireInfo> store;
 
+        // internal class to post jobs on the Yarn pool
         class Task : public YarnBall::ITask {
         public:
             explicit Task(YarnBall::Operation operation) : operation(std::move(operation)) {}

@@ -3,16 +3,17 @@ project(Wire VERSION 0.0.1)
 
 set(CMAKE_CXX_STANDARD 23)
 
+SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2a -pthread -fPIC")
+
 include_directories(${LIB_PATH}/Yarn/includes)
+include_directories(${LIB_PATH}/Wire/includes)
 
 add_library(Wire
-        src/Messenger.cpp
-        includes/Messenger.h
-        includes/IMessageQueue.h
-        src/LMessageQueue.cpp
-        includes/LMessageQueue.h
-        src/MacMessageQueue.cpp
-        includes/MacMessageQueue.h)
+        includes/Epoc.hpp
+        includes/Centraline.hpp
+        includes/iEvent.hpp
+        ../WireTest/test.hpp
+        ../WireTest/main.cpp)
 
 IF (WIN32)
     set(NAME Yarn)
