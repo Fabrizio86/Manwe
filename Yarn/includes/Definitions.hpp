@@ -5,13 +5,11 @@
 #ifndef YARN_DEFINITIONS_HPP
 #define YARN_DEFINITIONS_HPP
 
-#include <deque>
-#include <exception>
 #include <functional>
 #include <memory>
 #include <thread>
-#include <unordered_map>
 #include "IScheduler.hpp"
+#include "MPMCQueue.h"
 
 namespace YarnBall {
 
@@ -26,7 +24,7 @@ namespace YarnBall {
 
     using OsHandler = std::thread::native_handle_type;
 
-    using Queue = std::deque<sITask>;
+    using Queue = MPMCQueue<sITask>;
     using sQueue = std::shared_ptr<Queue>;
     using sQueues = std::vector<sQueue>;
     using sIScheduler = std::shared_ptr<IScheduler>;

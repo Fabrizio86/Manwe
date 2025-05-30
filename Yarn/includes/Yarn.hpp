@@ -7,7 +7,6 @@
 
 #include "Fiber.hpp"
 #include "ITask.hpp"
-#include "IScheduler.hpp"
 
 #include <mutex>
 
@@ -46,6 +45,7 @@ namespace YarnBall {
         void initializeNewThread(FiberId id, bool markAsTemp = false);
         void arrangeQueues(FiberId currentQueueId, FiberId newQueueId);
         FiberId firstUnusedId();
+        Workload workload();
 
         void terminateFiber(FiberId id);
 
