@@ -9,7 +9,6 @@
 
 
 namespace YarnBall {
-
     using namespace std;
     static const float OPTIMAL_QUEUE_MULTIPLIER = 4.75;
     static const int POWER = 2;
@@ -19,13 +18,12 @@ namespace YarnBall {
     void Fiber::execute(sITask task) {
         if (!this->running) return;
 
-        this->queue->push_back(std::move(task));
+        this->queue->enqueue(std::move(task));
         this->condition.notify_one();
     }
 
     void Fiber::process() {
         while (this->running) {
-
             // if we have no tasks assigned, and no more pending tasks
             if (this->queue->empty()) {
                 // check if there are pending tasks
@@ -47,19 +45,18 @@ namespace YarnBall {
             // after resuming from waiting, let's verify we still need to work
             if (!this->running || this->queue == nullptr || this->queue->empty()) return;
 
-            sITask task = this->queue->front();
-            this->queue->pop_front();
+            auto task = this->queue->pop_front();
 
-            if (task == nullptr) continue;
-
-            try {
-                task->run();
-            }
-            catch (const StopExecutionException &e) {
-                task->exception(std::current_exception());
-            }
-            catch (...) {
-                task->exception(std::current_exception());
+            if (task.has_value()) {
+                auto taskValue = task.value();
+                try {
+                    taskValue->run();
+                } catch (const StopExecutionException &e) {
+                    taskValue->exception(std::current_exception());
+                }
+                catch (...) {
+                    taskValue->exception(std::current_exception());
+                }
             }
         }
     }
@@ -77,14 +74,19 @@ namespace YarnBall {
     }
 
     Workload Fiber::workload() {
-        if (this->queue->size() == 0)
+        size_t currentSize = this->queue->Size();
+
+        if (currentSize == 0)
             return Workload::Idle;
 
-        int queueSize = static_cast<int>(this->queue->size());
-        int percent = (queueSize / this->maxQueueSize) * 100;
+        // Convert to float to avoid integer division
+        float percent = (static_cast<float>(currentSize) / this->maxQueueSize) * 100.0f;
 
-        if (percent <= Workload::Busy) return Workload::Busy;
-        if (percent > Workload::Busy && percent < Workload::Burdened) return Workload::Burdened;
+        if (percent <= static_cast<float>(Workload::Busy))
+            return Workload::Busy;
+
+        if (percent < static_cast<float>(Workload::Burdened))
+            return Workload::Burdened;
 
         return Workload::Overburdened;
     }
@@ -106,13 +108,16 @@ namespace YarnBall {
         this->condition.notify_one();
     }
 
-    Fiber::Fiber(FiberId id, sQueue queue, SignalDone signalDone, GetFromPending getFromPending, AnyPendingTasks anyPendingTasks) : queue(queue),
-                                                                                                                                    running(true),
-                                                                                                                                    temp(false),
-                                                                                                                                    fiberId(id),
-                                                                                                                                    signalDone(signalDone),
-                                                                                                                                    getFromPending(getFromPending),
-                                                                                                                                    anyPendingTasks(anyPendingTasks) {
+    Fiber::Fiber(FiberId id, sQueue queue,
+                 SignalDone signalDone,
+                 GetFromPending getFromPending,
+                 AnyPendingTasks anyPendingTasks) : running(true),
+                                                    temp(false),
+                                                    signalDone(signalDone),
+                                                    getFromPending(getFromPending),
+                                                    anyPendingTasks(anyPendingTasks),
+                                                    queue(queue),
+                                                    fiberId(id) {
         this->thread = std::thread(&Fiber::process, this);
     }
 
@@ -125,5 +130,4 @@ namespace YarnBall {
         if (this->thread.joinable())
             this->thread.join();
     }
-
 }

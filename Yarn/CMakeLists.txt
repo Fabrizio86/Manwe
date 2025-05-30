@@ -24,6 +24,7 @@ add_library(Yarn
         src/Waitable.cpp
         includes/StopExecutionException.hpp
         src/StopExecutionException.cpp
-        includes/Definitions.hpp ../Wire/includes/Centraline.hpp)
+        includes/Definitions.hpp ../Wire/includes/Centraline.hpp
+        includes/MPMCQueue.h)
 
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -G MinGW Makefiles")

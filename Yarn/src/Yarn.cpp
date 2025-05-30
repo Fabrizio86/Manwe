@@ -4,6 +4,9 @@
 
 #include <cmath>
 #include "Yarn.hpp"
+
+#include <algorithm>
+
 #include "RandomScheduler.hpp"
 #include "StopExecutionException.hpp"
 
@@ -28,7 +31,6 @@ void raiseSignal(YarnBall::sFiber fiber) {
 #endif
 
 namespace YarnBall {
-
 #define MinThreads 4
 #define OptimalMultiplier 3.5
 
@@ -44,33 +46,34 @@ namespace YarnBall {
 
     void Yarn::Run(sITask task) {
         // get a thread from the scheduler
-        int index;
         int tries = 0;
+        int index = -1;
+        int currentPoolSize = -1;
         sFiber currentFiber;
         Workload compareLevel = Workload::Burdened;
-        int currentPoolSize = static_cast<int>(count_if(this->fibers.begin(), this->fibers.end(), [](auto f) { return f != nullptr; }));
 
-        do {
-            if (tries > RETRIES && compareLevel == Workload::Burdened) {
-                compareLevel = Workload::Overburdened;
-                tries = 0;
-            } else if (tries > RETRIES && compareLevel == Workload::Overburdened) {
-                // we need new fiber, system is too busy
-                this->shiftWork(currentFiber, task);
+        while (tries < RETRIES) {
+            // Fetch the current pool size and let the scheduler propose an index
+            currentPoolSize = static_cast<int>(std::ranges::count_if(this->fibers.begin(), this->fibers.end(), [](auto f) { return f != nullptr; }));
+            index = this->scheduler->ThreadIndex(currentPoolSize); // Pick the index from the scheduler
+            currentFiber = (index >= 0 && index < this->fibers.size()) ? this->fibers.at(index) : nullptr;
+            const auto currentFiberWorkload = currentFiber->workload();
+
+            // If a valid fiber is found, and it meets the workload threshold
+            if (currentFiber && currentFiberWorkload < compareLevel) {
+                currentFiber->execute(task);
                 return;
             }
 
-            do {
-                index = this->scheduler->ThreadIndex(currentPoolSize);
-                currentFiber = this->fibers.at(index);
-            } while (currentFiber == nullptr);
+            // Retry logic: escalate workload level if necessary
+            if (++tries > RETRIES && compareLevel == Workload::Burdened) {
+                compareLevel = Workload::Overburdened;
+                tries = 0;
+            }
+        }
 
-            tries++;
-
-            // continue getting a new fiber since this one is too busy
-        } while (currentFiber->workload() >= compareLevel);
-
-        currentFiber->execute(task);
+        // Fallback: shift work to a new fiber
+        this->shiftWork(currentFiber, task);
     }
 
     void Yarn::initializeNewThread(FiberId id, bool markAsTemp) {
@@ -85,11 +88,14 @@ namespace YarnBall {
             auto currentFiber = this->fibers[id];
 
             while (!this->pending->empty()) {
-                this->queues[id]->push_back(this->pending->front());
-                this->pending->pop_front();
+                auto pendingValue = this->pending->pop_front();
 
-                if (currentFiber->workload() >= Workload::Burdened)
-                    return;
+                if (pendingValue.has_value()){
+                    this->queues[id]->enqueue(pendingValue.value());
+
+                    if (currentFiber->workload() >= Workload::Burdened)
+                        return;
+                }
             }
         };
 
@@ -109,12 +115,12 @@ namespace YarnBall {
         auto queue = this->queues[currentQueueId];
         auto newQueue = this->queues.at(newQueueId);
 
-        int amountToShift = static_cast<int>(ceil(queue->size() * 0.25));
+        int amountToShift = static_cast<int>(ceil(queue->Size() * 0.25));
 
         for (int i = 0; i < amountToShift; ++i) {
-            auto transferTask = queue->back();
-            queue->pop_back();
-            newQueue->push_front(transferTask);
+            sITask transferTask;
+            queue->dequeue(transferTask);
+            newQueue->enqueue(transferTask);
         }
     }
 
@@ -123,13 +129,13 @@ namespace YarnBall {
 
         if (this->maxLimitReached()) {
             std::lock_guard<std::mutex> dataLock(this->dmu);
-            this->pending->push_back(task);
+            this->pending->enqueue(task);
             return;
         }
 
         auto newFiberId = this->firstUnusedId();
         this->arrangeQueues(currentFiber->id(), newFiberId);
-        this->queues.at(newFiberId)->push_front(task);
+        this->queues.at(newFiberId)->enqueue(task);
         this->initializeNewThread(newFiberId, true);
     }
 
@@ -176,5 +182,4 @@ namespace YarnBall {
         auto result = std::find_if(this->fibers.begin(), this->fibers.end(), [](auto f) { return f == nullptr; });
         return static_cast<FiberId>(std::distance(this->fibers.begin(), result));
     }
-
 }
