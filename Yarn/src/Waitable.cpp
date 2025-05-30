@@ -3,6 +3,9 @@
 //
 
 #include "Waitable.hpp"
+
+#include <exception>
+
 #include "YarnBall.hpp"
 
 namespace YarnBall {

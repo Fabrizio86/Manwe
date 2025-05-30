@@ -1,3 +1,4 @@
+#include <exception>
 #include <iostream>
 #include <sstream>
 #include <utility>
@@ -28,10 +29,13 @@ public:
 
                 ss << i << ", ";
             }
+
+            cout << "Task completed string gen: " << ss.str() << endl;
         };
     }
 
-    explicit Task(YarnBall::Operation operation) : operation(std::move(operation)) {}
+    explicit Task(YarnBall::Operation operation) : operation(std::move(operation)) {
+    }
 
     ~Task() override = default;
 
@@ -46,15 +50,14 @@ public:
 
 private:
     YarnBall::Operation operation;
-
 };
 
 class WaitableTask : public YarnBall::Waitable {
 public:
     void operation() override {
         srand(time(NULL));
-        int randDly = rand() % 10 + 1;
-        this_thread::sleep_for(chrono::seconds(randDly));
+        int randDly = rand() % 500 + 1;
+        this_thread::sleep_for(chrono::milliseconds(randDly));
 
         cout << "before editing: " << txt << endl;
         txt += " edited in thread";
@@ -87,8 +90,7 @@ int main() {
     for (int i = 0; i < HUNDRED_THOUSANDS; ++i) {
         YarnBall::Run(std::make_shared<Task>());
 
-        if (i == (ONE_THOUSAND * 3) || i == (ONE_THOUSAND * 4) || i == (ONE_THOUSAND * 5) || i == (ONE_THOUSAND * 6) || i == (ONE_THOUSAND * 7) || i == (ONE_THOUSAND * 8) ||
-            i == (ONE_THOUSAND * 9) || i == (ONE_THOUSAND * 15)) {
+        if (i == (ONE_THOUSAND * 3) || i == (ONE_THOUSAND * 6) || i == (ONE_THOUSAND * 9) || i == (ONE_THOUSAND * 19)) {
             cout << "pause point, press to continue: ";
             cin >> c;
         }
