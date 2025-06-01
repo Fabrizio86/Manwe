@@ -7,6 +7,48 @@
 #include "ITask.hpp"
 #include "StopExecutionException.hpp"
 
+#ifdef _WIN32
+    #include <windows.h>
+
+void SetNumaAffinity() {
+
+}
+
+#elif defined(__linux__)
+    #include <numa.h>
+    #include <sched.h>
+
+void SetNumaAffinity() {
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core_id, &cpuset); // Set to a core on NUMA node X
+    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+}
+#elif __APPLE__
+#include <pthread.h>
+#include <mach/mach.h>
+#include <mach/thread_policy.h>
+
+void SetNumaAffinity() {
+    // Get the Mach thread port for the current thread
+    thread_t thread = mach_thread_self();
+
+    // Define an affinity tag — same tag groups threads together
+    // Use a positive, non-zero integer (e.g., thread ID mod N)
+    // You can change this value if you want groups of threads to share cache
+    thread_affinity_policy_data_t policy = {1};
+
+    // Apply the affinity policy
+    thread_policy_set(thread, THREAD_AFFINITY_POLICY, (thread_policy_t) &policy, THREAD_AFFINITY_POLICY_COUNT);
+    // Clean up
+    mach_port_deallocate(mach_task_self(), thread);
+}
+#else
+void SetNumaAffinity() {
+
+}
+#endif
+
 
 namespace YarnBall {
     using namespace std;
@@ -118,6 +160,7 @@ namespace YarnBall {
                                                     anyPendingTasks(anyPendingTasks),
                                                     queue(queue),
                                                     fiberId(id) {
+        SetNumaAffinity();
         this->thread = std::thread(&Fiber::process, this);
     }
 
