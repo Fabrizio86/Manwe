@@ -30,7 +30,8 @@ public:
                 ss << i << ", ";
             }
 
-            cout << "Task completed string gen: " << ss.str() << endl;
+            string final = ss.str();
+            cout << "Task completed string gen" << endl;
         };
     }
 
