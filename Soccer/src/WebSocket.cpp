@@ -582,8 +582,20 @@ namespace Soccer {
                     break;
                 case kOpClose: {
                     if (this->open) {
-                        co_await writeFrame(this->stream, kOpClose, f.payload,
-                                              /*maskOutgoing=*/!this->serverSide);
+                        // Echo the Close frame back. The peer often
+                        // closes the socket immediately after sending
+                        // its Close, so the write can race with the
+                        // peer's RST -- on Linux that surfaces as
+                        // EPIPE / ECONNRESET. Either way the
+                        // connection is gone, so swallow the transport
+                        // error and proceed to close locally.
+                        try {
+                            co_await writeFrame(this->stream, kOpClose,
+                                                  f.payload,
+                                                  /*maskOutgoing=*/!this->serverSide);
+                        } catch (const SocketException &) {
+                            // Peer torn down before our echo landed.
+                        }
                         this->open = false;
                     }
                     throw WsException("connection closed by peer");
@@ -635,8 +647,16 @@ namespace Soccer {
         body.push_back(std::byte((code >> 8) & 0xFF));
         body.push_back(std::byte(code & 0xFF));
         for (char c : reason) body.push_back(std::byte(static_cast<std::uint8_t>(c)));
-        co_await writeFrame(this->stream, kOpClose, body,
-                              /*maskOutgoing=*/!this->serverSide);
+        // Same peer-disappeared race as the receive() Close-echo path:
+        // if the peer has already closed the socket, our Close write
+        // can surface as EPIPE / ECONNRESET on Linux. Swallow it;
+        // the local connection is closing either way.
+        try {
+            co_await writeFrame(this->stream, kOpClose, body,
+                                  /*maskOutgoing=*/!this->serverSide);
+        } catch (const SocketException &) {
+            // Peer already gone; nothing left to flush.
+        }
         this->open = false;
         co_return;
     }
