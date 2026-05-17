@@ -4,15 +4,21 @@
 
 #include "YarnBall.hpp"
 #include "Yarn.hpp"
-#include "Waitable.hpp"
 
 namespace YarnBall {
 
-    void Run(sITask task) {
-        Yarn::instance()->Run(task);
+    void run(uITask task) {
+        Yarn::instance()->run(std::move(task));
     }
 
-    void Post(sIWaitable operation) {
-        Yarn::instance()->Run(operation);
+    void run(sITask task) {
+        Yarn::instance()->run(std::move(task));
+    }
+
+    void post(sIWaitable operation) {
+        // shared_ptr<IWaitable> doesn't implicitly convert to shared_ptr<ITask>;
+        // static_pointer_cast keeps the control block intact and lets the
+        // caller observe completion through their original sIWaitable.
+        Yarn::instance()->run(std::static_pointer_cast<ITask>(std::move(operation)));
     }
 }

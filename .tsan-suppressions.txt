@@ -1,0 +1,16 @@
+# ThreadSanitizer suppressions for Manwe.
+#
+# Chase-Lev work-stealing deque + the Fiber methods that touch it
+# (stealOne, process, run, popOwn) use relaxed atomic loads on the
+# steal path. The algorithm is correct under the C++ memory model --
+# the relaxed loads are followed by a fenced compare-exchange that
+# synchronises ownership transfer. TSan does not always recognise the
+# happens-before edge through the fence and reports a false positive.
+# This is the same pattern Boost.Atomic and folly suppress for the
+# same reason.
+race:YarnBall::Fiber::stealOne
+race:YarnBall::Fiber::process
+race:YarnBall::Fiber::run
+race:YarnBall::Fiber::popOwn
+race:YarnBall::WorkStealingDeque
+race:YarnBall::MPMCQueue

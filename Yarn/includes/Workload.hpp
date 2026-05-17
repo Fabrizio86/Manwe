@@ -7,11 +7,24 @@
 
 namespace YarnBall {
 
+    /**
+     * @enum Workload
+     * @brief Coarse-grained load buckets for a fiber, derived from its local
+     *        deque occupancy. Numeric values double as the percentage upper
+     *        bound for the band, so they can be compared with the computed
+     *        percentage directly.
+     *
+     * Bands:
+     *  - @c Idle         : 0% (deque is empty).
+     *  - @c Busy         : 0% < occupancy <= 35%.
+     *  - @c Burdened     : 35% < occupancy < 70%.
+     *  - @c Overburdened : 70% <= occupancy <= 100%.
+     */
     enum Workload {
         Idle = 0,
         Busy = 35,
         Burdened = 70,
-        Overburdened
+        Overburdened = 100
     };
 
 }

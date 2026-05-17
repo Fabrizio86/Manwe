@@ -11,12 +11,12 @@
 namespace YarnBall {
 
     void Waitable::wait() {
-        std::this_thread::yield();
-        std::unique_lock<std::mutex> lk(mu);
-        cv.wait(lk, [&done = this->done] { return done; });
+        std::unique_lock<std::mutex> lk(this->mu);
+        this->cv.wait(lk, [this] { return this->done; });
     }
 
     bool Waitable::hasFailed() {
+        std::lock_guard<std::mutex> lk(this->mu);
         return this->failed;
     }
 
@@ -26,27 +26,32 @@ namespace YarnBall {
     }
 
     void Waitable::notifyDone() {
-        this->done = true;
+        {
+            std::lock_guard<std::mutex> lk(this->mu);
+            this->done = true;
+        }
         this->cv.notify_all();
     }
 
     void Waitable::exception(std::exception_ptr exception) {
-        this->failed = true;
-
-        try { std::rethrow_exception(exception); }
-        catch (const std::exception &e) { this->error = e.what(); }
-        catch (const std::string &e) { this->error = e; }
-        catch (const char *e) { this->error = e; }
-        catch (...) { this->error = "Unknown error"; }
-
-        this->notifyDone();
+        {
+            std::lock_guard<std::mutex> lk(this->mu);
+            this->failed = true;
+            try { std::rethrow_exception(exception); }
+            catch (const std::exception &e) { this->error = e.what(); }
+            catch (const std::string &e) { this->error = e; }
+            catch (const char *e) { this->error = e; }
+            catch (...) { this->error = "Unknown error"; }
+            this->done = true;
+        }
+        this->cv.notify_all();
     }
 
     std::string Waitable::errorMessage() {
+        std::lock_guard<std::mutex> lk(this->mu);
         return this->error;
     }
 
     void Waitable::operation() {
-
     }
 }

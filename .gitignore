@@ -7,6 +7,19 @@ Makefile
 lib/*
 /cmake-build-debug/
 /cmake-build-release/
+/build/
+/build_win/
+
+# In-source CMake debris from accidental `cmake .` runs at the
+# project root or inside a subdirectory. The real builds live under
+# cmake-build-* and have their own ignore above.
+/CMakeCache.txt
+/CMakeFiles/
+/cmake_install.cmake
+/ManweConfig.cmake
+/ManweConfigVersion.cmake
+/*/CMakeFiles/
+/*/cmake_install.cmake
 cmake-build-debug-visualstudio/cmake_install.cmake
 cmake-build-debug-visualstudio/CMakeCache.txt
 cmake-build-debug-visualstudio/CMakeFiles/3.17.3/CMakeCCompiler.cmake

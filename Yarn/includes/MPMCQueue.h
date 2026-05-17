@@ -6,27 +6,28 @@
 #define MPMCQUEUE_H
 
 #include <atomic>
-#include <vector>
-#include <stdexcept>
+#include <cstddef>
 #include <new>
 #include <optional>
+#include <stdexcept>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
 namespace YarnBall {
+
     /**
-     * The constant CacheLineSize defines the size of a CPU cache line in bytes.
-     * It is often used for memory alignment purposes to improve performance by
-     * avoiding false sharing and ensuring efficient cache usage.
+     * @brief CPU cache line size in bytes. Used to align hot atomic fields and
+     *        avoid false sharing between producer and consumer paths.
      */
     constexpr size_t CacheLineSize = 64;
 
     /**
      * @enum QueueSize
-     * @brief Enum representing different predefined queue sizes for the MPMCQueue.
-     *
-     * This enum provides specific sizes for different use cases:
-     * - Light:   Represents a queue size of 512 elements.
-     * - Medium:  Represents a queue size of 1024 elements.
-     * - Huge:    Represents a queue size of 4096 elements.
+     * @brief Pre-set capacities for the MPMCQueue.
+     *  - @c Light  : 512 slots — small auxiliary queues.
+     *  - @c Medium : 1024 slots — moderate fan-in queues.
+     *  - @c Huge   : 4096 slots — the executor's global injection queue.
      */
     enum QueueSize {
         Light = 512,
@@ -34,160 +35,113 @@ namespace YarnBall {
         Huge = 4096
     };
 
-    template<typename T>
     /**
      * @struct Cell
-     * @brief Represents a data container for a single slot in the MPMC queue.
+     * @brief One slot in the bounded MPMC ring.
      *
-     * This structure is aligned to `CacheLineSize` to avoid false sharing
-     * and improve performance in concurrent environments. Each `Cell` holds
-     * a sequence counter and a generic type storage.
-     *
-     * @tparam T The type of the object stored in the cell.
+     * @tparam T Element type. The cell holds raw aligned storage so the queue
+     *           manages T's lifetime entirely: constructors fire on enqueue,
+     *           destructors on dequeue, and any survivors are destroyed by the
+     *           queue destructor. Each Cell is cache-line aligned to avoid
+     *           false sharing with neighbouring slots.
      */
+    template<typename T>
     struct alignas(CacheLineSize) Cell {
         /**
-         * Represents a sequence number associated with a cell in the MPMCQueue.
-         * Used for determining whether a cell is ready for an operation (enqueue or dequeue).
-         *
-         * This atomic variable ensures thread-safe access in a multi-producer, multi-consumer context.
-         * It helps maintain coordination between producers and consumers by tracking the state
-         * of cells in the queue.
+         * @brief Sequence number that drives the producer/consumer handshake.
+         *        - @c seq == pos     => slot is empty and writable by a producer.
+         *        - @c seq == pos + 1 => slot is full and readable by a consumer.
+         *        - @c seq == pos + N (N == capacity) => recycled empty slot.
          */
-        std::atomic<size_t> sequence;
+        std::atomic<size_t> sequence{0};
+
         /**
-         * Holds an instance of type T. This member acts as the storage
-         * for the data within a Cell of the MPMCQueue structure.
-         *
-         * The `storage` is used in conjunction with atomic operations
-         * to ensure thread safety in the context of multiple producers
-         * and consumers.
+         * @brief Raw aligned storage for one T. Lifetime is managed by the
+         *        queue via placement-new (enqueue) and explicit ~T (dequeue).
          */
-        T storage;
+        alignas(T) std::byte storage[sizeof(T)];
+
+        /**
+         * @brief Pointer to the (possibly live) T within @ref storage.
+         *        Uses @c std::launder so the strict-aliasing rules accept the
+         *        reinterpret across the placement-new boundary.
+         */
+        T *ptr() noexcept {
+            return std::launder(reinterpret_cast<T *>(&storage));
+        }
     };
 
-    template<typename T>
     /**
      * @class MPMCQueue
-     * @brief A high-performance multi-producer, multi-consumer lock-free queue implementation.
+     * @brief Bounded lock-free multi-producer / multi-consumer ring queue.
      *
-     * This queue is designed to facilitate concurrent enqueue and dequeue operations
-     * in a multi-threaded environment, using lock-free techniques and atomic operations.
+     * Implementation follows Dmitry Vyukov's classic design: each slot carries
+     * a sequence number that producers and consumers use to coordinate without
+     * a global lock. Memory ordering is acquire/release on the sequence loads
+     * and stores, with relaxed CAS on @ref head / @ref tail (the handshake
+     * synchronises through the sequence numbers).
      *
-     * The queue size must be a power of two for proper functionality.
+     * Capacity must be a power of two for the @c & @c mask trick to replace
+     * modulo. The default capacity is @c QueueSize::Huge.
      *
-     * @tparam T The type of elements to be stored in the queue.
+     * @tparam T Element type. Required by the queue API; the queue does not
+     *           require @c T to be default-constructible.
      */
+    template<typename T>
     class MPMCQueue {
-        /**
-         * Constructs an instance of MPMCQueue with the specified capacity.
-         * The capacity must be a power of two. Initializes the internal sequence numbers
-         * for queue cells, and sets both head and tail pointers to 0.
-         *
-         * @param capacity The capacity of the queue. Defaults to `QueueSize::Huge` if not specified.
-         *                 Must be a power of two. Throws `std::invalid_argument` if this condition is not met.
-         *
-         * @throws std::invalid_argument if the specified capacity is not a power of two.
-         */
     public:
-        explicit MPMCQueue(size_t capacity = QueueSize::Huge) : size(capacity), mask(capacity - 1), buffer(capacity) {
-            if ((capacity & (capacity - 1)) != 0) {
-                throw std::invalid_argument("Capacity must be a power of two");
-            }
-
+        /**
+         * @brief Construct a queue with the given capacity.
+         * @param capacity Number of slots; must be a power of two.
+         * @throws std::invalid_argument If @p capacity is not a power of two
+         *                               or is zero.
+         */
+        explicit MPMCQueue(size_t capacity = QueueSize::Huge)
+            : size((capacity & (capacity - 1)) == 0 && capacity > 0
+                       ? capacity
+                       : throw std::invalid_argument("Capacity must be a power of two")),
+              mask(capacity - 1),
+              buffer(capacity) {
             for (size_t i = 0; i < size; ++i) {
                 buffer[i].sequence.store(i, std::memory_order_relaxed);
             }
-
             head.store(0, std::memory_order_relaxed);
             tail.store(0, std::memory_order_relaxed);
         }
 
         /**
-         * Adds an item to the queue if there is available capacity.
-         *
-         * @param item The item to be enqueued into the queue.
-         * @return True if the item was successfully enqueued, false if the queue is full.
+         * @brief Destructor. No concurrent access permitted; destroys any
+         *        elements still live in @c [tail, head).
          */
-        bool enqueue(const T &item) {
-            size_t pos = head.load(std::memory_order_relaxed);
-            while (true) {
-                Cell<T> &cell = buffer[pos & mask];
-                size_t seq = cell.sequence.load(std::memory_order_acquire);
-                intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
-
-                if (diff == 0) {
-                    if (head.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
-                        new(&cell.storage) T(item); // Placement new
-                        cell.sequence.store(pos + 1, std::memory_order_release);
-                        return true;
-                    }
-                } else if (diff < 0) {
-                    return false; // Queue full
-                } else {
-                    pos = head.load(std::memory_order_relaxed); // Retry
-                }
+        ~MPMCQueue() {
+            size_t t = tail.load(std::memory_order_relaxed);
+            size_t h = head.load(std::memory_order_relaxed);
+            while (t != h) {
+                buffer[t & mask].ptr()->~T();
+                ++t;
             }
         }
 
+        MPMCQueue(const MPMCQueue &) = delete;
+        MPMCQueue &operator=(const MPMCQueue &) = delete;
+        MPMCQueue(MPMCQueue &&) = delete;
+        MPMCQueue &operator=(MPMCQueue &&) = delete;
+
         /**
-         * Attempts to dequeue an element from the queue. If successful, the dequeued
-         * element is stored in the provided output parameter and removed from the queue.
-         *
-         * This function operates in a lock-free manner and adheres to the Multiple Producers,
-         * Multiple Consumers (MPMC) queue semantics. It ensures atomicity during the dequeue
-         * operation using atomic compare-and-swap (CAS) operations.
-         *
-         * @param[out] out A reference to a variable where the dequeued element will be stored.
-         *                 If the operation is unsuccessful, the contents of this variable remain unmodified.
-         * @return True if an element was successfully dequeued, false if the queue is empty.
-         *
-         * This function uses manual destruction of objects stored in the queue to avoid
-         * unnecessary overhead. The sequence number and memory ordering mechanisms are
-         * utilized to maintain thread safety and consistency.
+         * @brief Enqueue by copy.
+         * @return @c true on success, @c false if the queue is full.
          */
-        bool dequeue(T &out) {
-            size_t pos = tail.load(std::memory_order_relaxed);
-            while (true) {
-                Cell<T> &cell = buffer[pos & mask];
-                size_t seq = cell.sequence.load(std::memory_order_acquire);
-                intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos + 1);
-
-                if (diff == 0) {
-                    if (tail.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
-                        out = std::move(cell.storage);
-                        cell.storage.~T(); // Destroy object manually
-                        cell.sequence.store(pos + size, std::memory_order_release);
-                        return true;
-                    }
-                } else if (diff < 0) {
-                    return false; // Queue empty
-                } else {
-                    pos = tail.load(std::memory_order_relaxed); // Retry
-                }
-            }
-        }
+        bool enqueue(const T &item) { return emplace_impl(item); }
 
         /**
-         * Removes and returns the front element from the multi-producer, multi-consumer (MPMC) queue.
-         *
-         * The function retrieves the front element from the queue in a thread-safe manner, using atomic
-         * operations to ensure proper coordination between multiple producers and consumers. If the queue
-         * is empty, it returns `std::nullopt`.
-         *
-         * @tparam T The type of elements stored in the queue.
-         * @return An `std::optional<T>` containing the front element if available, or `std::nullopt` if the
-         *         queue is empty.
-         *
-         * @note This function assumes that the MPMC queue follows a ring-buffer implementation and that
-         *       the capacity of the queue is a power of 2.
-         *
-         * @warning This function assumes that the type `T` has a callable destructor and supports move
-         *          semantics, as the front element is moved out of the queue buffer.
-         *
-         * @details The implementation checks the sequence number of the front cell in the buffer to
-         *          determine if it is safe to retrieve the element. If the cell is not ready, the function
-         *          will handle the empty condition or retry.
+         * @brief Enqueue by move.
+         * @return @c true on success, @c false if the queue is full.
+         */
+        bool enqueue(T &&item) { return emplace_impl(std::move(item)); }
+
+        /**
+         * @brief Pop the oldest element.
+         * @return The element wrapped in std::optional, or @c std::nullopt if empty.
          */
         std::optional<T> pop_front() {
             size_t pos = tail.load(std::memory_order_relaxed);
@@ -198,58 +152,45 @@ namespace YarnBall {
 
                 if (diff == 0) {
                     if (tail.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
-                        T result = std::move(cell.storage);
-                        cell.storage.~T();
+                        T result = std::move(*cell.ptr());
+                        cell.ptr()->~T();
                         cell.sequence.store(pos + size, std::memory_order_release);
                         return result;
                     }
                 } else if (diff < 0) {
-                    return std::nullopt; // Queue empty
+                    return std::nullopt;
                 } else {
-                    pos = tail.load(std::memory_order_relaxed); // Retry
+                    pos = tail.load(std::memory_order_relaxed);
                 }
             }
         }
 
         /**
-         * Clears all elements from the queue and resets its internal state.
-         *
-         * This method performs the following operations:
-         * - Dequeues and destroys all remaining objects in the queue.
-         * - Resets the sequence numbers of all cells in the buffer to their original indices.
-         * - Resets the `head` and `tail` pointers to their initial positions.
-         *
-         * The method ensures that any memory previously allocated for the objects
-         * within the queue is properly released. It is thread-unsafe and should be
-         * used with caution in multi-threaded environments.
+         * @brief Out-parameter form of @ref pop_front for callers that prefer
+         *        not to pay for an @c optional in the success path.
+         * @param[out] out Receives the dequeued element on success.
+         * @return @c true on success, @c false if empty.
          */
-        void clear() {
-            // Destroy remaining objects in the queue
-            T temp;
-            while (dequeue(temp)) {
-                // destructed in dequeue()
-            }
-
-            // Reset the sequence numbers and internal pointers
-            for (size_t i = 0; i < size; ++i) {
-                buffer[i].sequence.store(i, std::memory_order_relaxed);
-            }
-
-            head.store(0, std::memory_order_relaxed);
-            tail.store(0, std::memory_order_relaxed);
+        bool dequeue(T &out) {
+            auto v = pop_front();
+            if (!v) return false;
+            out = std::move(*v);
+            return true;
         }
 
         /**
-         * Calculates the current size of the queue based on the head and tail indices.
-         *
-         * This method computes the number of elements currently stored in the queue by
-         * subtracting the value of the tail index from the head index. The calculation
-         * takes into account that the indices are updated atomically and may roll over
-         * due to the use of a circular buffer. If the head index is greater than or
-         * equal to the tail index, the size is computed as (head - tail). If the tail
-         * index is ahead of the head, the returned size is 0 since the queue must be empty.
-         *
-         * @return The current size of the queue.
+         * @brief Single-threaded drain. The caller must guarantee no producer
+         *        or consumer touches the queue concurrently. Sequences and
+         *        indices are left in a consistent state for future enqueues.
+         */
+        void clear() {
+            while (pop_front().has_value()) {
+            }
+        }
+
+        /**
+         * @brief Approximate number of elements currently in the queue.
+         *        May be transiently inaccurate under contention.
          */
         size_t Size() const {
             size_t h = head.load(std::memory_order_relaxed);
@@ -258,69 +199,66 @@ namespace YarnBall {
         }
 
         /**
-         * Checks if the queue is empty.
-         *
-         * @return True if the queue contains no elements, false otherwise.
+         * @brief Maximum capacity, fixed at construction.
          */
-        bool empty() const {
-            return this->Size() == 0;
+        size_t capacity() const noexcept { return size; }
+
+        /**
+         * @brief Approximate emptiness.
+         */
+        bool empty() const { return Size() == 0; }
+
+    private:
+        /**
+         * @brief Common emplacement path used by both copy and move enqueue.
+         */
+        template<typename U>
+        bool emplace_impl(U &&item) {
+            size_t pos = head.load(std::memory_order_relaxed);
+            while (true) {
+                Cell<T> &cell = buffer[pos & mask];
+                size_t seq = cell.sequence.load(std::memory_order_acquire);
+                intptr_t diff = static_cast<intptr_t>(seq) - static_cast<intptr_t>(pos);
+
+                if (diff == 0) {
+                    if (head.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
+                        ::new (static_cast<void *>(&cell.storage)) T(std::forward<U>(item));
+                        cell.sequence.store(pos + 1, std::memory_order_release);
+                        return true;
+                    }
+                } else if (diff < 0) {
+                    return false;
+                } else {
+                    pos = head.load(std::memory_order_relaxed);
+                }
+            }
         }
 
         /**
-         * Represents the fixed capacity of the MPMCQueue.
-         *
-         * This variable defines the size of the buffer used to store elements
-         * in the queue. It is a constant, initialized at the time of construction,
-         * and must be a power of two to ensure efficient indexing and operation.
-         *
-         * Any modifications to the queue, such as enqueueing and dequeueing,
-         * are constrained within the range of this size.
+         * @brief Fixed capacity. Always a power of two.
          */
-    private:
         const size_t size;
-        /**
-         * A bitmask derived from the size of the queue, used for efficient modulo operations.
-         * This assumes the queue size is a power of two, enabling the replacement of modulo
-         * operations with bitwise AND for improved performance.
-         */
-        const size_t mask;
-        /**
-         * A vector of `Cell<T>` objects that serves as the underlying storage buffer
-         * for the multi-producer, multi-consumer queue.
-         *
-         * Each `Cell<T>` in the `buffer` represents a slot in the queue and is used
-         * to encapsulate both the data (storage) and the sequence number required
-         * for synchronization during enqueue and dequeue operations. The vector
-         * size is determined by the queue's capacity.
-         *
-         * This member variable is initialized during the construction of the
-         * `MPMCQueue` and its elements' sequence numbers are set accordingly to
-         * represent available slots in the queue.
-         */
-        std::vector<Cell<T> > buffer;
 
         /**
-         * @brief Atomic head pointer for a lock-free multi-producer, multi-consumer queue.
-         *
-         * This variable represents the current head position of the queue. It is used to coordinate
-         * producer operations in the queue in a thread-safe manner. This variable is aligned to
-         * the cache line size to minimize false sharing between threads when accessing
-         * adjacent variables in memory.
-         *
-         * @note The alignment to CacheLineSize ensures optimal memory access performance
-         * in concurrent environments. The atomic nature of the variable is critical to guarantee
-         * safety when multiple threads interact with the queue.
+         * @brief @c capacity - 1, used to replace modulo with bitwise AND.
+         */
+        const size_t mask;
+
+        /**
+         * @brief Slot array. Storage lifetimes are managed by the queue, not
+         *        by the vector.
+         */
+        std::vector<Cell<T>> buffer;
+
+        /**
+         * @brief Producer cursor. Cache-line aligned to prevent false sharing
+         *        with @ref tail.
          */
         alignas(CacheLineSize) std::atomic<size_t> head;
+
         /**
-         * @brief Represents the tail index of the MPMC queue used for tracking the position of the next element to be dequeued.
-         *
-         * This variable is aligned to the cache line size to minimize false sharing and improve performance in a
-         * concurrent multi-producer multi-consumer environment. It is an atomic variable to ensure thread-safe
-         * operations without requiring external synchronization mechanisms.
-         *
-         * The value of `tail` is updated atomically when elements are dequeued from the queue, and provides
-         * a critical mechanism for maintaining the internal state and consistency of the queue.
+         * @brief Consumer cursor. Cache-line aligned to prevent false sharing
+         *        with @ref head.
          */
         alignas(CacheLineSize) std::atomic<size_t> tail;
     };

@@ -4,6 +4,6 @@
 
 #include "StopExecutionException.hpp"
 
-const char *StopExecutionException::what() const _NOEXCEPT {
-    return "Operation timed out";
+const char *StopExecutionException::what() const noexcept {
+    return "Yarn task stopped by request";
 }
