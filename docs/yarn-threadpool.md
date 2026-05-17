@@ -6,7 +6,7 @@ work-stealing deques, a global lock-free injection queue for external
 submissions, dynamic growth on backlog, and a lock-free snapshot of the
 live worker set on the hot path.
 
-## Headline numbers
+## Measured costs
 
 Apple M1 Max, Release build, `bin/bench_yarn`:
 
@@ -17,13 +17,12 @@ Apple M1 Max, Release build, `bin/bench_yarn`:
 | Deque + 2 thieves                      | ~50 ns      | ~50-80 ns         |
 | MPMC 2P/2C                             | ~125 ns     | n/a               |
 
-Submit dispatch sits inside Tokio's published best band. Combined with
-the per-hop `Task<T>` cost of ~33 ns (vs Tokio's ~80-150 ns / `.await`),
-this is what lets `bench_async_server` sustain **2.5-2.7 million
-spawn-and-complete cycles per core per second** on realistic
-await-heavy workloads. See the [README](../README.md#the-numbers) for
-the full end-to-end table and [`PERFORMANCE.md`](../PERFORMANCE.md)
-for methodology.
+Submit dispatch lands inside Tokio's published best band. Combined
+with the per-hop `Task<T>` cost of ~33 ns (against Tokio's ~80–150 ns
+per `.await`), `bench_async_server` sustains **2.5–2.7 million
+spawn-and-complete cycles per core per second** on await-heavy
+workloads. See [`PERFORMANCE.md`](../PERFORMANCE.md) for the full
+methodology.
 
 ---
 

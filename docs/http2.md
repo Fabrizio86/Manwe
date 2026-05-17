@@ -188,31 +188,30 @@ evicts it.
 
 ---
 
-## What this unlocks
+## Supported deployment shapes
 
-- **gRPC.** gRPC is HTTP/2-only. With h2 + trailers in, the gRPC story
-  is live (server returns `grpc-status` / `grpc-message` as trailers,
-  client surfaces them on `resp.trailers`).
-- **Service-mesh deployments.** Envoy / Istio / Linkerd default to
-  HTTP/2 between sidecars. Manwe slots in as the backend without
-  forcing the mesh to downgrade.
-- **Multiplex over one TCP connection.** A single connection per
-  backend carries many concurrent requests, vs HTTP/1.1's
-  connection-per-request keep-alive. Cuts handshake cost to one
-  per process.
+- **gRPC.** gRPC requires HTTP/2. With h2 + trailers, server handlers
+  return `grpc-status` / `grpc-message` as trailers, and clients
+  surface them on `resp.trailers`.
+- **Service meshes.** Envoy, Istio, and Linkerd default to HTTP/2
+  between sidecars. Manwe acts as a backend without requiring the
+  mesh to downgrade.
+- **Multiplexing.** A single TCP connection per backend carries many
+  concurrent requests, against HTTP/1.1's connection-per-request
+  keep-alive. Handshake cost is paid once per process per backend.
 
 ---
 
-## Why nghttp2 and not an inline implementation?
+## Rationale for nghttp2
 
-The HTTP/2 wire format is ~3,000 lines of careful state-machine code
+The HTTP/2 wire format is roughly 3,000 lines of state-machine code
 (framing, HPACK, flow control, stream state, connection state, ALPN).
-There are roughly fifty published CVE classes against HTTP/2
-implementations; nghttp2 already carries the patches and the
-conformance pass against `h2spec`. Re-implementing inline would buy
-zero external dependency at the cost of owning the security backlog of
-a wire protocol that turnkey libraries already solve.
+Approximately fifty CVE classes have been published against HTTP/2
+implementations; nghttp2 carries the patches and passes `h2spec`
+conformance. An inline implementation would trade one external
+dependency for ownership of the security backlog of a wire protocol
+already addressed by turnkey libraries.
 
-The wrapper is ~600 lines on top of nghttp2's callback model; the
-performance budget for the wrapper is dominated by the syscall cost
-of TLS reads, not by callback indirection.
+The wrapper is approximately 600 lines on top of nghttp2's callback
+model. The performance budget is dominated by the syscall cost of TLS
+reads, not by callback indirection.

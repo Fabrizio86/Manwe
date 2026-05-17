@@ -214,7 +214,7 @@ Task<HttpResponse> getItem(HttpRequest req) {
 }
 ```
 
-One handler. One counter. One histogram. One trace context that
-survives a database `co_await` resuming on a different worker. One
-structured log line that ships to your log aggregator with the trace
-id pre-filled so you can pivot to the trace view by clicking it.
+A single handler combines a counter increment, a histogram observation,
+a trace context that survives a database `co_await` resuming on a
+different worker, and a structured log line carrying the trace id so
+the log aggregator can pivot directly to the trace view.
