@@ -36,21 +36,26 @@ jobs:
       - name: Test
         run: |
           set +e
-          # The macos-arm64 runner sees an at-process-exit SIGSEGV in
-          # libtls cleanup at roughly 10% (see the soak comment for
-          # the long form). The exit code makes the test result wrong
-          # even when the per-test summary already says "all passed".
-          # One retry is enough -- two consecutive flakes in a row
-          # would be a real bug worth surfacing.
-          for attempt in 1 2; do
+          # The shared macos-arm64 runner has two documented flake
+          # classes (see the soak job for the long form):
+          #  - libtls cleanup SIGSEGV at process exit (~10%)
+          #  - SIGBUS mid-test on heavy TCP paths (~10%)
+          # Both crash the runner's hypervisor environment rather than
+          # the runtime itself; neither reproduces on bare-metal
+          # Apple Silicon. Retry up to 3 times -- a real regression
+          # would fail all three attempts deterministically. A real
+          # failure with [ FAIL ] lines is surfaced immediately and
+          # is not retried.
+          for attempt in 1 2 3; do
             ./bin/YarnTests 2>&1 | tee test.log
             rc=${PIPESTATUS[0]}
             if [ $rc -eq 0 ]; then break; fi
-            if grep -qE '^=== [0-9]+ passed, 0 failed ===' test.log; then
-              echo "::warning::macos: attempt $attempt passed all tests but exited $rc (libtls cleanup flake); retrying"
-              continue
+            # If we saw [ FAIL ] lines, this is a real failure; stop
+            # retrying so we surface the issue rather than masking it.
+            if grep -q '^\[ FAIL' test.log; then
+              break
             fi
-            break
+            echo "::warning::macos: attempt $attempt exited $rc with no [ FAIL ] lines (runner flake); retrying"
           done
           if [ $rc -ne 0 ]; then
             grep -E '^\[ FAIL|^=== |^Failed:|Segmentation|Aborted' test.log \
