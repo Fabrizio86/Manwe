@@ -36,18 +36,29 @@ jobs:
       - name: Test
         run: |
           set +e
-          ./bin/YarnTests 2>&1 | tee test.log
-          rc=${PIPESTATUS[0]}
+          # The macos-arm64 runner sees an at-process-exit SIGSEGV in
+          # libtls cleanup at roughly 10% (see the soak comment for
+          # the long form). The exit code makes the test result wrong
+          # even when the per-test summary already says "all passed".
+          # One retry is enough -- two consecutive flakes in a row
+          # would be a real bug worth surfacing.
+          for attempt in 1 2; do
+            ./bin/YarnTests 2>&1 | tee test.log
+            rc=${PIPESTATUS[0]}
+            if [ $rc -eq 0 ]; then break; fi
+            if grep -qE '^=== [0-9]+ passed, 0 failed ===' test.log; then
+              echo "::warning::macos: attempt $attempt passed all tests but exited $rc (libtls cleanup flake); retrying"
+              continue
+            fi
+            break
+          done
           if [ $rc -ne 0 ]; then
-            # Emit the failing test names + summary line as annotations.
             grep -E '^\[ FAIL|^=== |^Failed:|Segmentation|Aborted' test.log \
               | head -n 10 \
               | while IFS= read -r line; do
                   esc=$(printf '%s' "$line" | sed 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')
                   printf '::error::%s\n' "$esc"
                 done
-            # Also print the last 30 lines so a hard crash (no [FAIL] line)
-            # still leaves something readable in the live log.
             echo "---- tail of test.log ----"
             tail -n 30 test.log
           fi
