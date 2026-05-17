@@ -60,18 +60,17 @@ fixtures, no setup/teardown ceremony.
 | `EXPECT_NE(a, b)` | Fail if `a == b` |
 | `EXPECT_THROWS_AS(expr, T)` | Fail if `expr` doesn't throw a `T` |
 
-### Why not doctest?
+### Rationale for the in-tree harness
 
-Three reasons:
+- The harness is ~150 lines, against ~7,000 for doctest.
+- No external dependency; the suite builds anywhere a C++23 compiler
+  is available.
+- Custom matchers (for example `EXPECT_NEAR(a, b, eps)`) are a
+  ~5-line patch in `test_framework.hpp` rather than a vendor diff.
 
-1. **No vendoring tax.** The harness is ~150 lines. doctest is ~7000.
-2. **Zero external dependency.** Builds anywhere a C++23 compiler exists.
-3. **Custom matchers when needed.** Adding e.g. `EXPECT_NEAR(a, b, eps)`
-   is a 5-line patch in `test_framework.hpp` rather than a vendor diff.
-
-This isn't a permanent decision; if the suite grows past what the harness
-comfortably handles (matchers, parallelism, fixtures), swapping in a real
-framework is mechanical.
+The decision is not permanent. If the suite outgrows what the harness
+handles comfortably (matchers, parallelism, fixtures), swapping in an
+external framework is mechanical.
 
 ---
 

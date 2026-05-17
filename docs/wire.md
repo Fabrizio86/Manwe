@@ -175,24 +175,21 @@ The losers stay parked on their original channels — calling
 
 ---
 
-## Why not the previous Wire?
+## Rewrite history
 
-The original Wire was `Centraline<Args...>` (singleton-per-signature
-signal) plus `Epoc` (string-keyed event registry). It had several
-issues that the rewrite addresses:
+The current Wire replaced an earlier `Centraline<Args...>` /
+`Epoc` API. The rewrite addressed:
 
-- `Centraline::connect`'s body used a non-existent overload of
-  `std::vector::push_back` — the template wouldn't compile when actually
-  instantiated.
-- `disconnect` compared `std::function` to a raw function pointer, which
-  always returns false; the slot list grew without bound.
-- All access was unsynchronised; concurrent `connect` + `emit` was a
-  data race.
+- A non-instantiable template in `Centraline::connect` (used a
+  non-existent overload of `std::vector::push_back`).
+- A `disconnect` that compared `std::function` to a raw function
+  pointer (always false), leaving the slot list to grow without
+  bound.
+- Unsynchronised access — concurrent `connect` and `emit` raced.
 - No coroutine integration.
-- Per-signature singleton meant two unrelated modules sharing a
-  parameter signature collided unintentionally.
+- A per-signature singleton that caused two unrelated modules with
+  matching argument signatures to share state.
 
-The new `Signal<Args...>` is per-instance, locked, coroutine-aware, and
-its compile-time errors are localised. `Channel<T>` replaces `Epoc` for
-the producer/consumer pattern (which is what most `Epoc` users actually
-wanted under a fancier name).
+The current `Signal<Args...>` is per-instance, locked, coroutine-
+aware, and produces localised compile errors. `Channel<T>` replaces
+`Epoc` for the producer/consumer pattern.

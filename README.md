@@ -1,14 +1,15 @@
 # Manwe
 
-**A C++23 async runtime that finishes a 50-await DB request in 570
-nanoseconds. Tokio takes ~5,000.**
+**A C++23 async runtime. 50-await DB-shaped request: 570 ns. Tokio
+published: ~5,000 ns.**
 
-One library. Work-stealing thread pool, C++20 coroutines, kqueue /
-epoll / io_uring / IOCP reactor, TCP / UDP / TLS / Unix / Raw sockets,
-WebSocket, HTTP/1.1, HTTP/2 (nghttp2), observability (metrics +
-structured logs + W3C trace propagation), Pi-grade GPIO and serial.
-Zero runtime dependencies beyond the C++23 standard library and your
-OS. Compiles on Apple Silicon, x86_64 Linux, and MSVC Windows.
+One library: work-stealing thread pool, C++20 coroutines with
+symmetric transfer, kqueue / epoll / io_uring / IOCP reactor, TCP /
+UDP / TLS / Unix / Raw sockets, WebSocket, HTTP/1.1, HTTP/2 via
+nghttp2, observability (metrics, structured logs, W3C trace
+propagation), POSIX serial and Linux GPIO. No runtime dependencies
+beyond the C++23 standard library and the host OS. Builds on Apple
+Silicon, x86_64 Linux, and MSVC Windows.
 
 ```bash
 git clone https://github.com/Fabrizio86/Manwe.git && cd Manwe
@@ -19,7 +20,7 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 
 ---
 
-## The numbers
+## Measured performance
 
 Apple M1 Max, Release build, sustained throughput.
 
@@ -31,11 +32,11 @@ Apple M1 Max, Release build, sustained throughput.
 | Deep coroutine pipeline (200 awaits)   | **665 ns**  | 3.3 ns    | **1.5 M req/sec/core**  |
 | Spawn+join fan-out (16 children)       | 4.0 µs      | 253 ns    | 250 K fanouts/sec/core  |
 
-A 16-core box absorbs **40 million requests per second** before the
-runtime is the bottleneck. After that, the limiting factor is your
-handler, your database, or your network.
+A 16-core machine sustains **40 million requests per second** before
+the runtime is the bottleneck; beyond that the limiting factor is the
+handler, the database, or the network.
 
-### Head-to-head with Tokio
+### Comparison with Tokio
 
 | Operation                              | Manwe          | Tokio (published) | Boost.Asio   |
 |----------------------------------------|----------------|-------------------|--------------|
@@ -45,45 +46,44 @@ handler, your database, or your network.
 | 50-await DB endpoint, end-to-end       | **~570 ns**    | ~5000 ns          | n/a          |
 | Throughput / core (50-await endpoint)  | **1.7 M req/s**| ~200 K req/s      | n/a          |
 
-For a service that handles 100,000 requests per second of mixed
-traffic, that's **roughly 10-15 Manwe cores versus 50 Tokio cores**.
-At cluster scale, fewer servers.
+For a service handling 100,000 requests per second of mixed traffic,
+this is approximately **10–15 Manwe cores against 50 Tokio cores**.
 
-Tokio chose to optimise the spawn path — and it did so brilliantly,
-around 300 ns. Manwe stays within noise of that number on dispatch
-and spends its budget on the await path instead, because a real
-request spawns once and awaits ten to fifty times. Every `co_await`
-in Manwe lowers to a tail call into the awaited coroutine's frame:
-no `Waker`, no `poll`, no atomic state machine.
+Tokio optimises the spawn path (~300 ns dispatch). Manwe lands within
+noise of that number on dispatch and spends its budget on the await
+path, since a real request spawns once and awaits 10–50 times. In
+Manwe, each `co_await` lowers to a tail call into the awaited
+coroutine's frame: no `Waker`, no `poll`, no per-await atomic state
+transition.
 
-Full methodology and reproducer: [`PERFORMANCE.md`](PERFORMANCE.md).
-Plain-English design rationale: [`PHILOSOPHY.md`](PHILOSOPHY.md).
+Full methodology and reproducer in [`PERFORMANCE.md`](PERFORMANCE.md).
+Design rationale in [`PHILOSOPHY.md`](PHILOSOPHY.md).
 
 ---
 
-## What's in the library
+## Library contents
 
-| Subsystem | What's in it |
+| Subsystem | Components |
 |---|---|
 | **Yarn** — work-stealing pool | Per-worker Chase-Lev deques (0.9 ns push+pop, owner-only no-CAS), lock-free MPMC injection queue, futex-based park/wake, dynamic growth on backlog, lock-free live-worker snapshot. |
 | **Coroutines** | `Task<T>` (lazy, symmetric-transfer), `syncWait`, `coSpawn`, `spawnJoinable` / `JoinHandle<T>`, `scheduleOn`, `whenAll`, `whenAny`, `withTimeout`, `deadlineToken`, cooperative cancellation via `stop_token`, `Stream<T>` async generator with `streamMap` / `Filter` / `Take` / `Drop`. |
-| **AsyncSync** | Coroutine-aware FIFO primitives: `AsyncMutex`, `AsyncSemaphore`, `AsyncRwLock` (writer-preferring), `AsyncEvent` (latched), `AsyncOnce` (coroutine `call_once`), `AsyncBarrier` (cyclic), `AsyncNotify` (Tokio-style wait/notify). |
+| **AsyncSync** | Coroutine-aware FIFO primitives: `AsyncMutex`, `AsyncSemaphore`, `AsyncRwLock` (writer-preferring), `AsyncEvent` (latched), `AsyncOnce` (coroutine `call_once`), `AsyncBarrier` (cyclic), `AsyncNotify` (wait/notify). |
 | **Reactor** — async I/O | kqueue (macOS/BSD), epoll + eventfd (Linux), `io_uring` + SQPOLL (opt-in), WSAPoll + IOCP (Windows). Awaiter-driven, one-shot registration, O(1) handle lookup, resumptions land on Yarn workers. |
 | **File I/O** | `YarnBall::fs::File` plus `readToString` / `readToBytes` / `writeString` / `writeBytes` / `remove`. Worker-hop for blocking syscalls on macOS/epoll; native `io_uring` / IOCP file paths are a planned follow-up. |
 | **Soccer** — networking | Coroutine TCP / UDP (with multicast) / Unix-domain / Raw / ICMP / TLS (libtls). WebSocket (RFC 6455, with continuation-frame reassembly). HTTP/1.1 (client + server + keep-alive pool). HTTP/2 (via nghttp2: client + server + multiplexed pool, with trailers for gRPC). `tcpServe` accept loop. `BufferedReader` for line protocols. Windows-native `asyncRecvOverlapped` / `asyncSendOverlapped` on IOCP. |
 | **Wire** — push notifications | Coroutine-aware `Telegraph::Signal<Args...>` multicast, unbounded `Channel<T>`, fixed-capacity `BoundedChannel<T>`, `channelSelect` (race N channels). |
 | **Signals** | `SignalSet({SIGINT, SIGTERM})` + `co_await sigs.next()` — POSIX signals as coroutine events via a self-pipe under `sigaction`. |
-| **Observability** | `YarnBall::metrics` — Counter / Gauge / Histogram + Prometheus text exposition. `YarnBall::log` — structured JSON logger with levels and typed fields. `YarnBall::trace` — W3C `traceparent` propagation, carried on the coroutine promise so context survives suspend / resume across workers. |
-| **Embedded** | `SerialPort` (POSIX termios), `GpioChip` + `GpioLine` (Linux character-device `/dev/gpiochip*`, edge-triggered `co_await waitForEvent`). Same Reactor, same `co_await` — ~30 ns from kernel edge to handler, against Python `gpiozero`'s 50-100 µs. |
+| **Observability** | `YarnBall::metrics` — Counter / Gauge / Histogram + Prometheus text exposition. `YarnBall::log` — structured JSON logger with levels and typed fields. `YarnBall::trace` — W3C `traceparent` propagation carried on the coroutine promise so context survives suspend / resume across workers. |
+| **Embedded** | `SerialPort` (POSIX termios), `GpioChip` + `GpioLine` (Linux character-device `/dev/gpiochip*`, edge-triggered `co_await waitForEvent`). Same Reactor, same `co_await`; ~30 ns from kernel edge to handler. |
 | **Tests** | In-tree minimal harness. 157 declared cases, 155 enabled on macOS/Linux with TLS + nghttp2. Full suite runs in ~5 seconds. |
 | **Examples** | Echo server, HTTP GET, HTTP server, HTTP/2 GET, signal-driven chat, channel pipeline, ICMP ping, WebSocket echo, graceful-shutdown HTTP server. |
 | **Benchmarks** | `bench_yarn` (deque / MPMC / submit / Task chain), `bench_async_server` (end-to-end request shapes). |
 
 ---
 
-## What it looks like
+## Examples
 
-A "hello, pool":
+A minimal coroutine:
 
 ```cpp
 #include "Yarn/includes/Coroutines.h"
@@ -142,7 +142,7 @@ int main() {
 }
 ```
 
-A pipeline from hardware → channel → network:
+Hardware input bridged to a channel and an outbound serial write:
 
 ```cpp
 auto button = chip.requestInputEdge(27, Embedded::Edge::Rising);
@@ -160,46 +160,36 @@ while (true) {
 }
 ```
 
-One coroutine. No callbacks, no threads, no polling loops. The same
-`co_await` ergonomics for a button press, a database query, and an
-HTTP/2 response.
+The same `co_await` ergonomics apply to a button press, a database
+query, and an HTTP/2 response.
 
 ---
 
-## Why Manwe
+## Design properties
 
-**Fast where async runtimes actually spend their time.** Tokio's
-submit dispatch is excellent — around 300 ns — but each `.await`
-after that pays 80-150 ns of poll-loop bookkeeping. Manwe matches
-Tokio on dispatch (310 ns) and spends 33 ns per await. On a typical
-request, that compounds into the gap shown in the head-to-head
-table above.
-
-**One mental model from the edge to the cloud.** Same `Task<T>`,
-same Reactor, same observability primitives whether you're handling
-an HTTP/2 request on a server or a GPIO edge on a Pi Zero. No
-interpreter to install, no context switch between "embedded code"
-and "server code."
-
-**No third-party runtime dependencies.** Plain C++23 throughout —
-no Boost, no Folly, no third-party channel or future library. Only
-optional `libtls` (for TLS) and optional `nghttp2` (for HTTP/2),
-both detected by CMake; absent dependencies disable the matching
-feature without affecting the rest of the build. Compiles on
-AppleClang, gcc, and MSVC.
-
-**Production features, not just primitives.** mTLS, structured JSON
-logs, Prometheus metrics, W3C trace propagation that survives
-`co_await` across worker boundaries, graceful shutdown via signal
-sets, HTTP/2 trailers for gRPC, WebSocket continuation frames.
-Verified end-to-end against `nghttp2.org`. Not a toy.
-
-**Built to be read.** Every public class and every non-obvious
-invariant is Doxygen-commented. In-tree test harness with 155
-enabled cases, no external test framework. Reproducer benchmarks
-in `benchmarks/`. Where a feature isn't done (Windows IOCP file
-I/O, native io_uring file paths) the docs call it out as planned
-work, not as "supported."
+- **Await-path optimised.** Submit dispatch matches Tokio (~310 ns
+  vs ~300 ns); each `co_await` costs ~33 ns versus ~80–150 ns for
+  Tokio's poll/Waker protocol. Symmetric transfer lowers chained
+  `co_await` to a tail call.
+- **One coroutine model across edge and server.** The same `Task<T>`,
+  Reactor, and observability primitives serve an HTTP/2 request and a
+  GPIO edge. No interpreter, no context switch between embedded and
+  server stacks.
+- **No third-party runtime dependencies.** Plain C++23, no Boost, no
+  Folly, no third-party channel or future library. Optional `libtls`
+  (TLS) and `nghttp2` (HTTP/2) are detected by CMake; absent
+  dependencies disable the matching feature without affecting the
+  rest of the build. AppleClang, gcc, and MSVC are supported.
+- **Production-shaped feature set.** mTLS, structured JSON logs,
+  Prometheus metrics, W3C trace propagation that survives `co_await`
+  across worker boundaries, graceful shutdown via signal sets,
+  HTTP/2 trailers for gRPC, WebSocket continuation frames.
+  End-to-end verified against `nghttp2.org`.
+- **Documented surface.** Every public class and non-obvious
+  invariant carries a Doxygen block. The in-tree test harness runs
+  155 enabled cases. Reproducer benchmarks live in `benchmarks/`.
+  Incomplete features (Windows IOCP file I/O, native io_uring file
+  paths) are listed as planned work rather than as supported.
 
 ---
 
@@ -213,9 +203,9 @@ cmake --build build -j
 ./bin/echo_server         # see examples/ for more
 ```
 
-Requires a C++23 compiler. Validated on macOS (AppleClang on
-Xcode 16+), Linux (gcc 13+, clang 17+), and Windows (MSVC on Visual
-Studio 2022+ with the WSAPoll + IOCP reactor).
+Requires a C++23 compiler. Validated on macOS (AppleClang on Xcode
+16+), Linux (gcc 13+, clang 17+), and Windows (MSVC on Visual Studio
+2022+ with the WSAPoll + IOCP reactor).
 
 Optional dependencies, picked up automatically by CMake:
 
@@ -252,10 +242,10 @@ the CMake package config is at `<prefix>/lib/cmake/Manwe/`.
 
 ## Documentation
 
-| Doc | What it covers |
+| Doc | Coverage |
 |---|---|
-| [`PERFORMANCE.md`](PERFORMANCE.md) | Every benchmarked number, methodology, head-to-head with Tokio. |
-| [`PHILOSOPHY.md`](PHILOSOPHY.md) | Plain-English design rationale. No jargon. |
+| [`PERFORMANCE.md`](PERFORMANCE.md) | Benchmarked numbers, methodology, comparison with Tokio. |
+| [`PHILOSOPHY.md`](PHILOSOPHY.md) | Design rationale. |
 | [`docs/yarn-threadpool.md`](docs/yarn-threadpool.md) | Work-stealing pool, Chase-Lev deques, dynamic growth. |
 | [`docs/coroutines.md`](docs/coroutines.md) | `Task<T>`, combinators, AsyncSync, Stream, JoinHandle. |
 | [`docs/reactor.md`](docs/reactor.md) | kqueue / epoll / io_uring / IOCP backends, awaiter shape. |
@@ -274,12 +264,11 @@ the CMake package config is at `<prefix>/lib/cmake/Manwe/`.
 
 Manwe follows [SemVer](https://semver.org/). Patch versions are
 strictly non-breaking, minor versions add API without removing,
-and breaking changes land only in major versions.
+breaking changes land only in major versions.
 
 Current version: **1.0.0**. See [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 
-Apache 2.0 — see [`LICENSE`](LICENSE). Use it commercially, ship it
-in your binaries, fork it; no attribution beyond the license text
-required.
+Apache 2.0 — see [`LICENSE`](LICENSE). Use commercially, ship in
+binaries, fork; no attribution beyond the license text required.
