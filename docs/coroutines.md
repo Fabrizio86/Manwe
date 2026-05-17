@@ -5,24 +5,25 @@ and uses symmetric transfer for everything that can chain on a single
 worker — the scheduler only gets involved when work genuinely suspends
 (I/O, explicit `scheduleOn`, `coSpawn`).
 
-## Why this design wins on real servers
+## Cost model
 
-Every `co_await someTask` in Manwe is a tail-call — one
-`std::coroutine_handle::resume()` that the compiler lowers to a
-register-shuffle plus an indirect jump. No `Waker` heap object, no
-`poll()` virtual call, no atomic state bits per hop. The cost on an
-Apple M1 Max is **~33 ns / hop** measured, **~3 ns / hop amortised** on
-deep chains where the symmetric-transfer chain is the entire workload.
+Each `co_await someTask` lowers to a single
+`std::coroutine_handle::resume()`, which the compiler emits as a
+register move plus an indirect jump. There is no `Waker` heap object,
+no `poll()` virtual call, and no per-hop atomic state transition.
+Measured cost on Apple M1 Max: **~33 ns / hop**, amortising to **~3 ns
+/ hop** on deep chains where symmetric transfer dominates the
+workload.
 
-Tokio's poll-loop futures pay **~80-150 ns per `.await`** for the
-same operation — that's the irreducible overhead of the
-`poll(&mut self, &mut Context)` protocol every Future has to
-implement. Manwe's protocol is `coroutine_handle::resume()`.
+Tokio's poll-based futures pay **~80–150 ns per `.await`** for the
+equivalent operation — the irreducible overhead of the
+`poll(&mut self, &mut Context)` protocol. Manwe's equivalent is
+`coroutine_handle::resume()`.
 
-This is the architectural advantage that compounds on every await in
-every request. At K=50 awaits/request (a typical DB-heavy endpoint)
-the difference is **3-5× end-to-end** vs Tokio. See the
-[README](../README.md#performance) for the full breakdown.
+The per-await difference compounds with the number of awaits per
+request. At K=50 awaits (a typical DB-heavy endpoint) the end-to-end
+ratio is roughly 3–5× versus Tokio. See
+[`PERFORMANCE.md`](../PERFORMANCE.md) for the full breakdown.
 
 ---
 
@@ -42,7 +43,7 @@ It is **lazy**: the coroutine body does not run on construction. Instead:
   transfers to the stored continuation, or — for *detached* tasks
   (set by `coSpawn`) — destroys the coroutine frame in place.
 
-The detached flag is the trick that makes `coSpawn` leak-free even when
+The detached flag is what makes `coSpawn` leak-free even when
 the spawned coroutine suspends across reactor I/O: there is no external
 "owner" that has to remember to destroy the frame later. The coroutine
 self-cleans at its own final suspend point.

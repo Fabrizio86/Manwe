@@ -1,22 +1,23 @@
 # Embedded — Pi / IoT / hardware-adjacent primitives
 
-The `Manwe::Embedded` library exposes hardware-adjacent I/O primitives
-that compose on top of Yarn's Reactor. Same coroutine model as Soccer,
-same `co_await` ergonomics, same lock-free hot path under the hood.
+The `Manwe::Embedded` library exposes hardware-adjacent I/O
+primitives composed on top of Yarn's Reactor. The coroutine model,
+`co_await` ergonomics, and lock-free hot path are shared with Soccer.
 
-The component exists because **the Pi / maker market is dominated by
-Python-or-Node prototypes that pay 50-100 µs of interpreter overhead
-per hardware interrupt**. A Manwe `co_await line.waitForEvent()` lands
-on a Yarn worker via symmetric transfer in ~30 ns. That's a >1000× gap
-for the inner loop of any sensor / motor / radio handler.
+Edge-event latency: `co_await line.waitForEvent()` resumes on a Yarn
+worker via symmetric transfer in ~30 ns from the kernel readiness
+event. Equivalent callback paths in interpreter-hosted runtimes
+(`gpiozero` in CPython, `onoff` in Node) typically measure 50–100 µs
+per event due to GIL acquisition, interpreter dispatch, and per-event
+heap allocation.
 
 > **Validation status.** This component is marked
-> `MANWE_UNTESTED_PLATFORM` in v1: the dev machine the code was
-> written on (Apple M1 Max) has no USB-serial dongle and no Pi
-> attached. The POSIX/Linux syscall patterns are the canonical
-> documented ones; the Reactor-driven suspend path is shared with
-> Soccer and is well-exercised. Validate on actual hardware before
-> depending on it in production.
+> `MANWE_UNTESTED_PLATFORM` in v1: the development machine (Apple
+> M1 Max) has no USB-serial dongle and no Pi attached. The POSIX/Linux
+> syscall patterns are the canonical documented ones, and the
+> Reactor-driven suspend path is shared with Soccer (which is
+> exercised by the test suite). Validate on the target hardware
+> before production use.
 
 ---
 
@@ -224,29 +225,24 @@ while (true) {
 }
 ```
 
-Hardware in, channel through, UART out — all one coroutine pipeline,
+Hardware input, a channel hop, UART output — one coroutine pipeline,
 no callbacks, no threads, no polling loops. The same `co_await`
-ergonomics you use for sockets work for hardware lines.
+ergonomics used for sockets apply to hardware lines.
 
 ---
 
-## Why not Python?
+## Comparison with interpreter-hosted runtimes
 
-Three reasons.
+For Pi-class deployments, the practical alternatives are CPython
+(`gpiozero`, `pyserial`) and Node (`onoff`, `serialport`). The
+trade-offs differ on three axes:
 
-1. **Hard-real-time-ish latency.** A Manwe `waitForEvent` resumes
-   the user coroutine ~30 ns after the kernel marks the line fd
-   readable. Python's `gpiozero` callback path goes through the
-   GIL acquire, interpreter dispatch, and a heap allocation per
-   event — typically 50-100 µs.
-2. **No deployment bloat.** Manwe ships as static libraries.
-   No interpreter, no `pip install`, no virtual environment.
-   A Pi Zero W boots, runs an `apt`-less binary, and uses 4 MB.
-3. **Same runtime as your server.** The Pi reads sensors; the
-   cloud aggregates them. Same `Task<T>`, same `Reactor`, same
-   profiling tools, same mental model on both sides of the
-   network.
+| Axis | Interpreter-hosted | Manwe |
+|---|---|---|
+| Edge-event latency | 50–100 µs per event (GIL acquire + dispatch + per-event allocation) | ~30 ns per event (kernel-fd readiness → symmetric-transfer resume) |
+| Deployment footprint | Interpreter + virtual environment + dependency tree | Static libraries; a Pi Zero W binary is ~4 MB |
+| Runtime homogeneity | Different runtime from the cloud side that aggregates the data | Same `Task<T>`, `Reactor`, and profiling tools on both sides |
 
-If you're not pushing the timing envelope, Python is fine. If you
-are — or if you want a single mental model across the whole stack —
-this is what Manwe is for.
+For workloads that are not latency-sensitive, the interpreter-hosted
+options are adequate. The above table covers the cases where the
+extra cost matters.
