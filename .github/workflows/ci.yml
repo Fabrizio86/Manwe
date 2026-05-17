@@ -1,0 +1,369 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+jobs:
+  macos:
+    name: macOS / kqueue / libtls
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: brew install libressl
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        id: build
+        run: |
+          set +e
+          cmake --build build --verbose -j 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            # GitHub caps annotations at 10 per check_run, so emit each
+            # error-bearing line as its own annotation up to that cap.
+            grep -E 'error:|undefined reference|fatal error|undeclared' build.log \
+              | head -n 10 \
+              | while IFS= read -r line; do
+                  esc=$(printf '%s' "$line" | sed 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')
+                  printf '::error::%s\n' "$esc"
+                done
+          fi
+          exit $rc
+      - name: Test
+        run: |
+          set +e
+          ./bin/YarnTests 2>&1 | tee test.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            # Emit the failing test names + summary line as annotations.
+            grep -E '^\[ FAIL|^=== |^Failed:|Segmentation|Aborted' test.log \
+              | head -n 10 \
+              | while IFS= read -r line; do
+                  esc=$(printf '%s' "$line" | sed 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')
+                  printf '::error::%s\n' "$esc"
+                done
+            # Also print the last 30 lines so a hard crash (no [FAIL] line)
+            # still leaves something readable in the live log.
+            echo "---- tail of test.log ----"
+            tail -n 30 test.log
+          fi
+          exit $rc
+
+  macos-soak:
+    name: macOS soak (20 iterations)
+    runs-on: macos-latest
+    needs: macos
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: brew install libressl
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        run: cmake --build build -j
+      - name: Soak
+        # Stay in non-failing mode for the whole loop -- grep returning 1
+        # for "no match" is expected, not an error.
+        shell: bash --noprofile --norc -uo pipefail {0}
+        run: |
+          # 20 iterations, tolerating up to 3 transient failures (15%).
+          # The recurring offender is soccer_tls_loopback_round_trip --
+          # libtls cleanup races with the test's TLS-handshake teardown
+          # on macOS-arm64 at roughly a 10% rate, producing SIGSEGV at
+          # process exit independent of anything in the runtime. The
+          # soak's purpose is to flush threading / lifetime races in
+          # Yarn/Reactor/Soccer, not to re-verify libtls determinism
+          # (the single-iteration macos job already does that).
+          MAX_FAILURES=3
+          failures=0
+          for i in $(seq 1 20); do
+            ./bin/YarnTests > run-$i.log 2>&1
+            rc=$?
+            if [ $rc -ne 0 ]; then
+              echo "==== run $i failed (exit $rc); tail of run-$i.log ===="
+              tail -n 40 run-$i.log
+              failures=$((failures + 1))
+              {
+                grep -E '^\[ FAIL|^=== |Failed:' run-$i.log || true
+                grep -E '^\[ RUN' run-$i.log | tail -n 1 || true
+                echo "exit $rc on iteration $i"
+              } | head -n 10 | while IFS= read -r line; do
+                  esc=$(printf '%s' "$line" | sed 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')
+                  printf '::warning::soak run %s: %s\n' "$i" "$esc"
+                done
+              if [ $failures -gt $MAX_FAILURES ]; then
+                echo "::error::soak: $failures iterations failed; cap is $MAX_FAILURES"
+                exit 1
+              fi
+            else
+              echo "run $i ok"
+            fi
+          done
+          echo "soak: $failures of 20 iterations failed (cap: $MAX_FAILURES)"
+
+  linux-epoll:
+    name: Linux / epoll / libtls
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libtls-dev libnuma-dev openssl
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Build
+        id: build
+        run: |
+          set +e
+          cmake --build build --verbose -j 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            # GitHub caps annotations at 10 per check_run, so emit each
+            # error-bearing line as its own annotation up to that cap.
+            grep -E 'error:|undefined reference|fatal error|undeclared' build.log \
+              | head -n 10 \
+              | while IFS= read -r line; do
+                  esc=$(printf '%s' "$line" | sed 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')
+                  printf '::error::%s\n' "$esc"
+                done
+          fi
+          exit $rc
+      - name: Test
+        run: |
+          set +e
+          ./bin/YarnTests 2>&1 | tee test.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            # Emit the failing test names + summary line as annotations.
+            grep -E '^\[ FAIL|^=== |^Failed:|Segmentation|Aborted' test.log \
+              | head -n 10 \
+              | while IFS= read -r line; do
+                  esc=$(printf '%s' "$line" | sed 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')
+                  printf '::error::%s\n' "$esc"
+                done
+            # Also print the last 30 lines so a hard crash (no [FAIL] line)
+            # still leaves something readable in the live log.
+            echo "---- tail of test.log ----"
+            tail -n 30 test.log
+          fi
+          exit $rc
+
+  linux-io-uring:
+    name: Linux / io_uring / libtls
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libtls-dev libnuma-dev liburing-dev openssl
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DYARN_USE_IO_URING=ON
+      - name: Build
+        id: build
+        run: |
+          set +e
+          cmake --build build --verbose -j 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            # GitHub caps annotations at 10 per check_run, so emit each
+            # error-bearing line as its own annotation up to that cap.
+            grep -E 'error:|undefined reference|fatal error|undeclared' build.log \
+              | head -n 10 \
+              | while IFS= read -r line; do
+                  esc=$(printf '%s' "$line" | sed 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')
+                  printf '::error::%s\n' "$esc"
+                done
+          fi
+          exit $rc
+      - name: Test
+        run: |
+          set +e
+          ./bin/YarnTests 2>&1 | tee test.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            # Emit the failing test names + summary line as annotations.
+            grep -E '^\[ FAIL|^=== |^Failed:|Segmentation|Aborted' test.log \
+              | head -n 10 \
+              | while IFS= read -r line; do
+                  esc=$(printf '%s' "$line" | sed 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')
+                  printf '::error::%s\n' "$esc"
+                done
+            # Also print the last 30 lines so a hard crash (no [FAIL] line)
+            # still leaves something readable in the live log.
+            echo "---- tail of test.log ----"
+            tail -n 30 test.log
+          fi
+          exit $rc
+
+  windows-iocp:
+    name: Windows / WSAPoll + IOCP / MSVC
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure
+        # Default Visual Studio generator + x64 architecture; the GitHub
+        # runner's vswhere picks the latest VS 2022 toolchain.
+        run: cmake -B build -A x64
+      - name: Build
+        run: cmake --build build --config Release -j
+      - name: Test
+        shell: pwsh
+        run: |
+          $out = & .\bin\Release\YarnTests.exe 2>&1
+          $code = $LASTEXITCODE
+          $out | Write-Output
+          if ($code -ne 0) {
+            # Emit FAIL lines + summary + last [ RUN line so a crash-mid-
+            # test (no [ FAIL ] printed) still pins the failing test name
+            # as an annotation. The summary or "exit $code" line acts as
+            # a guaranteed-non-empty fallback.
+            $marker = @($out | Where-Object { $_ -match '\[ FAIL \]|^=== .+ passed|^Failed:' })
+            $lastRun = @($out | Where-Object { $_ -match '^\[ RUN' } | Select-Object -Last 1)
+            $combined = @($marker + $lastRun + "exit $code from YarnTests.exe")
+            foreach ($l in $combined | Select-Object -First 10) {
+              $esc = ($l -replace '%','%25') -replace "`r",'%0D' -replace "`n",'%0A'
+              Write-Output "::error::$esc"
+            }
+          }
+          exit $code
+
+  linux-sanitizers:
+    name: Linux / epoll / ASan + UBSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libtls-dev libnuma-dev openssl
+      - name: Configure
+        # -fsanitize=address,undefined is the canonical "find UAF + UB
+        # before code review" pair; runtime overhead is ~2x, fine for CI.
+        # -fno-omit-frame-pointer keeps sanitizer reports actionable.
+        # -O1 (not the default -O0) so coroutines actually get optimised
+        # enough to trigger real codegen paths; ASan still works.
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -O1" \
+            -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -O1" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+      - name: Build
+        run: cmake --build build --verbose -j 2>&1 | tail -n 60
+      - name: Test
+        # UBSan: abort on first violation so the CI shows a clear stop.
+        # ASan: detect_leaks=0 -- Yarn's static pool intentionally leaks
+        # its static threads at process exit; that's a known pattern,
+        # not a real leak.
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:halt_on_error=1
+        run: |
+          set +e
+          ./bin/YarnTests 2>&1 | tee test.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            grep -E '^==|runtime error|AddressSanitizer|UndefinedBehaviorSanitizer|^\[ FAIL' test.log \
+              | head -n 10 \
+              | while IFS= read -r line; do
+                  esc=$(printf '%s' "$line" | sed 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')
+                  printf '::error::%s\n' "$esc"
+                done
+          fi
+          exit $rc
+
+  linux-tsan:
+    name: Linux / epoll / TSan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libtls-dev libnuma-dev openssl
+      - name: Configure
+        # ThreadSanitizer catches data races that ASan misses.
+        # -O1 keeps coroutines optimised enough to trigger real codegen
+        # paths but is below TSan's documented breakage threshold.
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -O1" \
+            -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer -O1" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=thread"
+      - name: Build
+        run: cmake --build build --verbose -j 2>&1 | tail -n 60
+      - name: Test
+        # halt_on_error so the first race aborts cleanly with a clear
+        # CI failure rather than spamming successive reports. The
+        # suppressions file silences the documented Chase-Lev relaxed-
+        # atomic false-positives in WorkStealingDeque (see
+        # .tsan-suppressions.txt for the full justification).
+        env:
+          TSAN_OPTIONS: halt_on_error=1:abort_on_error=1:second_deadlock_stack=1:suppressions=${{ github.workspace }}/.tsan-suppressions.txt
+        run: |
+          set +e
+          ./bin/YarnTests 2>&1 | tee test.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            grep -E 'WARNING: ThreadSanitizer|^\[ FAIL|data race|deadlock' test.log \
+              | head -n 10 \
+              | while IFS= read -r line; do
+                  esc=$(printf '%s' "$line" | sed 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')
+                  printf '::error::%s\n' "$esc"
+                done
+          fi
+          exit $rc
+
+  install-consumer:
+    name: Install + find_package consumer check (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install dependencies
+        run: brew install libressl
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=${{ runner.temp }}/manwe-install
+      - name: Build + install
+        id: build
+        run: |
+          set +e
+          cmake --build build --verbose -j 2>&1 | tee build.log
+          rc=${PIPESTATUS[0]}
+          if [ $rc -ne 0 ]; then
+            tail -n 8 build.log | while IFS= read -r line; do
+              esc=$(printf '%s' "$line" | sed 's/%/%25/g; s/\r/%0D/g; s/\n/%0A/g')
+              printf '::error::%s\n' "$esc"
+            done
+            exit $rc
+          fi
+          cmake --install build
+      - name: Build a tiny consumer against the installed package
+        run: |
+          mkdir -p ${{ runner.temp }}/consumer
+          cd ${{ runner.temp }}/consumer
+          cat > CMakeLists.txt <<'EOF'
+          cmake_minimum_required(VERSION 3.19)
+          project(consumer LANGUAGES CXX)
+          set(CMAKE_CXX_STANDARD 23)
+          find_package(Manwe 0.3 REQUIRED)
+          add_executable(consumer main.cpp)
+          target_link_libraries(consumer PRIVATE Manwe::Yarn Manwe::Wire Manwe::Soccer)
+          EOF
+          cat > main.cpp <<'EOF'
+          #include <Coroutines.h>
+          #include <Yarn.hpp>
+          int main() {
+              auto t = []() -> YarnBall::Task<int> { co_return 7; }();
+              return YarnBall::syncWait(std::move(t)) == 7 ? 0 : 1;
+          }
+          EOF
+          cmake -B build -DCMAKE_PREFIX_PATH=${{ runner.temp }}/manwe-install .
+          cmake --build build -j
+          ./build/consumer
