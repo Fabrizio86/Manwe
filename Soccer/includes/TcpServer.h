@@ -33,6 +33,7 @@
 #endif
 
 #include "Coroutines.h"
+#include "PlatformNet.h"
 #include "SocketException.h"
 #include "TcpListener.h"
 #include "TcpStream.h"
@@ -106,7 +107,7 @@ namespace Soccer {
             if (probe < 0) return;
             (void) ::connect(probe,
                               reinterpret_cast<sockaddr *>(&dest), destLen);
-            (void) ::close(probe);
+            (void) YarnBall::closeSocket(probe);
         });
         while (!stop.stop_requested()) {
             try {

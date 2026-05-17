@@ -247,8 +247,13 @@ namespace Soccer {
          */
         SocketAddress localAddress() const;
 
-    private:
+    public:
+        // Forward-declared opaque state (defined in Http2.cpp). Public
+        // so file-scope helpers in the .cpp can name it without a
+        // friend declaration; users have no reason to access it.
         struct ServerState;
+
+    private:
         std::shared_ptr<ServerState> serverState;
     };
 

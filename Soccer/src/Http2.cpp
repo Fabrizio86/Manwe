@@ -1075,10 +1075,15 @@ namespace Soccer {
         return this->serverState->listener.localAddress();
     }
 
-    YarnBall::Task<void> Http2Server::serve(std::stop_token stop) {
-        // Per-connection: build a server session, spawn the driver.
-        auto handler = [server = this->serverState](TcpStream client)
-                -> YarnBall::Task<void> {
+    namespace {
+        // Free coroutine that owns its parameters by value. Used by
+        // Http2Server::serve so the per-connection handler does NOT
+        // live inside a lambda-coroutine closure (which would dangle:
+        // the closure is a temporary in tcpServe's frame; the
+        // coroutine's implicit @c this would point at freed memory).
+        YarnBall::Task<void> runServerConnection(
+            std::shared_ptr<Http2Server::ServerState> server,
+            TcpStream client) {
             auto pipe = std::make_unique<TcpPipe>(std::move(client));
             auto state = std::make_shared<Http2ServerConnectionState>(
                 std::move(pipe), &server->routes);
@@ -1093,12 +1098,22 @@ namespace Soccer {
 
             co_await serverDriver(state);
             co_return;
+        }
+    }
+
+    YarnBall::Task<void> Http2Server::serve(std::stop_token stop) {
+        // The factory below is NOT a coroutine. It forwards into the
+        // free @c runServerConnection coroutine, whose own frame owns
+        // @c server and @c client by value -- the only safe lifetime
+        // pattern for tcpServe handlers (see HttpServer::serve for the
+        // sibling case and docs/coroutines.md for the rationale).
+        auto serverState = this->serverState;
+        auto factory = [serverState](TcpStream client) -> YarnBall::Task<void> {
+            return runServerConnection(serverState, std::move(client));
         };
 
-        // Reuse the accept-loop helper from TcpServer.h, which already
-        // wires the stop-callback / loopback-knock unblock.
         co_await tcpServe(std::move(this->serverState->listener),
-                           handler, stop);
+                           factory, stop);
         co_return;
     }
 

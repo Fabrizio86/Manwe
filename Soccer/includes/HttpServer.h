@@ -129,9 +129,20 @@ namespace Soccer {
             // in adversarial shutdown ordering).
             auto routesPtr = std::make_shared<RouteTable>(this->routes);
 
+            // CRITICAL: the factory lambda is NOT a coroutine. It is a
+            // plain function that forwards into the free @c handleOne
+            // coroutine. Making the lambda body itself a coroutine
+            // (`co_await ... co_return`) would crash: the lambda
+            // closure is a temporary in tcpServe's frame, and the
+            // resulting coroutine references the closure's captures
+            // through implicit @c this -- as soon as the closure dies,
+            // the coroutine's @c this dangles (see the lambda-coroutine
+            // warning in docs/coroutines.md). @c handleOne is a free
+            // coroutine that owns @c routesPtr by value, so its frame
+            // holds the only live reference for the connection's
+            // lifetime.
             auto factory = [routesPtr](TcpStream client) -> YarnBall::Task<void> {
-                co_await handleOne(routesPtr, std::move(client));
-                co_return;
+                return handleOne(routesPtr, std::move(client));
             };
 
             co_await tcpServe(std::move(this->listener),
