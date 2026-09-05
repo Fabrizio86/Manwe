@@ -382,7 +382,7 @@ jobs:
           cmake_minimum_required(VERSION 3.19)
           project(consumer LANGUAGES CXX)
           set(CMAKE_CXX_STANDARD 23)
-          find_package(Manwe 0.3 REQUIRED)
+          find_package(Manwe 1.1 REQUIRED)
           add_executable(consumer main.cpp)
           target_link_libraries(consumer PRIVATE Manwe::Yarn Manwe::Wire Manwe::Soccer)
           EOF
