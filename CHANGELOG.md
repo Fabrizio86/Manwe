@@ -2,10 +2,31 @@
 
 All notable changes to Manwe are listed here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions adhere
-to [SemVer](https://semver.org/) with the pre-1.0 caveats spelled out in
-the README.
+to [SemVer](https://semver.org/).
 
-## [Unreleased]
+## [1.1.0] - 2026-09-04
+
+Added `MANWE_BUILD_TESTS`, `MANWE_BUILD_EXAMPLES`, and `MANWE_BUILD_BENCHMARKS`
+CMake options (all default `ON`), so a consumer embedding Manwe via
+`add_subdirectory` (as Mortis3d does, at `third_party/manwe`) can opt out of
+building `YarnTests`, `examples/`, and `benchmarks/` as part of its own
+configure. No source or behavioural changes otherwise.
+
+## [1.0.0] - 2026-05-16
+
+First stable release. The runtime is feature-complete for the v1
+scope: work-stealing pool, C++20 coroutines with symmetric transfer,
+multi-backend reactor, networking (TCP/UDP/TLS/Unix/Raw/ICMP),
+WebSocket (with continuation frames), HTTP/1.1, HTTP/2 via nghttp2
+(client + server + multiplexed pool, with trailers), structured logs,
+Prometheus metrics, W3C trace propagation, Pi-grade serial + GPIO,
+and an in-tree test harness with 157 cases (155 enabled on the
+macOS/Linux reference build). End-to-end-verified against
+`nghttp2.org`, with `bench_async_server` sustaining ~2.5 million
+DB-heavy requests per second per core on an Apple M1 Max.
+
+The entries below were drafted in the Unreleased section before
+the cut; they ship as part of 1.0.0.
 
 ### Added
 
@@ -585,5 +606,6 @@ kqueue / epoll defaults, opt-in io_uring, Windows IOCP scaffold.
 
 Initial Yarn correctness pass: 23 bug fixes from the audit.
 
-[Unreleased]: https://github.com/Fabrizio86/Manwe/compare/v0.3.0...HEAD
+[1.1.0]: https://github.com/Fabrizio86/Manwe/releases/tag/v1.1.0
+[1.0.0]: https://github.com/Fabrizio86/Manwe/releases/tag/v1.0.0
 [0.3.0]: https://github.com/Fabrizio86/Manwe/releases/tag/v0.3.0

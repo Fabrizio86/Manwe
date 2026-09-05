@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.19)
-project(Manwe VERSION 0.3.0 LANGUAGES CXX)
+project(Manwe VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,13 +13,26 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/bin")
 set(LIB_PATH ${PROJECT_SOURCE_DIR})
 
 # ---- Components ----------------------------------------------------------
+# Consumers embedding Manwe as a submodule (e.g. via add_subdirectory) rarely
+# want its own test/example/benchmark executables in their build graph; these
+# default ON so a standalone checkout behaves exactly as before.
+option(MANWE_BUILD_TESTS "Build YarnTests" ON)
+option(MANWE_BUILD_EXAMPLES "Build the examples/ executables" ON)
+option(MANWE_BUILD_BENCHMARKS "Build the benchmarks/ executables" ON)
+
 add_subdirectory(Yarn)
 add_subdirectory(Wire)
 add_subdirectory(Soccer)
 add_subdirectory(Embedded)
-add_subdirectory(YarnTests)
-add_subdirectory(examples)
-add_subdirectory(benchmarks)
+if (MANWE_BUILD_TESTS)
+    add_subdirectory(YarnTests)
+endif ()
+if (MANWE_BUILD_EXAMPLES)
+    add_subdirectory(examples)
+endif ()
+if (MANWE_BUILD_BENCHMARKS)
+    add_subdirectory(benchmarks)
+endif ()
 
 # ---- Install / find_package(Manwe) ---------------------------------------
 include(GNUInstallDirs)
