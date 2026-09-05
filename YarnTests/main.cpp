@@ -2571,10 +2571,8 @@ namespace {
 }
 
 TEST(soccer_unix_socket_round_trip) {
-    // Per-test path under /tmp so concurrent test runs do not collide.
     // Sub-100-char to fit sun_path on every supported platform.
-    const std::string path = "/tmp/manwe-test-unix-" +
-                              std::to_string(::getpid()) + ".sock";
+    const std::string path = fsTempPath("unix.sock");
 
     auto listener = Soccer::TcpListener::bindUnix(path);
     YarnBall::coSpawn(unixEchoOnce(std::move(listener)));
