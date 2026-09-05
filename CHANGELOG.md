@@ -4,6 +4,42 @@ All notable changes to Manwe are listed here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions adhere
 to [SemVer](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- **CI consumer-check stale version pin** — the `install-consumer` job's
+  `find_package(Manwe 0.3 REQUIRED)` predated the 1.1.0 version bump;
+  `SameMinorVersion` compatibility rejected it outright, failing the job
+  on every push. Bumped the pin to `1.1`.
+- **`soccer_unix_socket_round_trip` hardcoded `/tmp`** — the test built
+  its socket path as `"/tmp/manwe-test-unix-" + pid`, which doesn't
+  exist on Windows runners and made `bind(AF_UNIX)` fail outright.
+  Switched to the existing `fsTempPath()` helper other tests already
+  use for cross-platform temp paths.
+- **No job-level CI timeout** — none of the eight jobs in `ci.yml` set
+  `timeout-minutes`, so a hang silently rode GitHub's 6-hour default
+  (observed once: a `master` push run sat "in progress" for
+  `6h1m8s` before being cancelled). Added `timeout-minutes: 15`
+  (`20` for the soak job) to every job so a hang surfaces in minutes,
+  not hours.
+
+### Deferred (next iteration)
+- **Rare macOS scheduler deadlock under `yarn_runs_50k_tasks`** — on a
+  shared `macos-latest` runner, the macOS-flake retry loop's second
+  attempt (after the documented SIGBUS-at-cleanup flake fired on
+  attempt 1) hung indefinitely inside `yarn_runs_50k_tasks` — the test
+  normally completes in ~30ms. Not a `wait_for` timeout issue (that
+  helper correctly bounds at 30s); the hang is upstream of it, most
+  likely in `Yarn::dispatch`/`Yarn::enqueueInjection`'s inbox/injection/
+  grow/inline-fallback path under the burst of 50,000 synchronous
+  submissions from a single caller thread. Only reproduced twice so
+  far, both on the shared CI runner under contention; has not
+  reproduced locally. Needs a thread dump captured mid-hang (e.g. via
+  a `tmate`/debugger CI step) to pin down which lock or CAS loop is
+  stuck. The new job timeout (above) turns this into a fast, visible
+  CI failure instead of a multi-hour silent hang; it does not fix the
+  underlying race.
+
 ## [1.1.0] - 2026-09-04
 
 Added `MANWE_BUILD_TESTS`, `MANWE_BUILD_EXAMPLES`, and `MANWE_BUILD_BENCHMARKS`
