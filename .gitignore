@@ -220,3 +220,9 @@ cmake-build-release-visualstudio/CMakeFiles/3.17.5/CompilerIdCXX/CMakeCXXCompile
 /bin/._chat_signals
 /bin/._echo_server
 /bin/._http_server
+/bin/Release/libEmbedded.a
+/bin/Release/libSoccer.a
+/bin/Debug/libYarn.a
+/bin/Release/libYarn.a
+/bin/Debug/libSoccer.a
+/bin/Debug/libEmbedded.a
