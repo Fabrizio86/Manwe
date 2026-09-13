@@ -11,6 +11,7 @@ jobs:
   macos:
     name: macOS / kqueue / libtls
     runs-on: macos-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
@@ -73,6 +74,7 @@ jobs:
   macos-soak:
     name: macOS soak (20 iterations)
     runs-on: macos-latest
+    timeout-minutes: 20
     needs: macos
     steps:
       - uses: actions/checkout@v4
@@ -129,6 +131,7 @@ jobs:
   linux-epoll:
     name: Linux / epoll / libtls
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
@@ -177,6 +180,7 @@ jobs:
   linux-io-uring:
     name: Linux / io_uring / libtls
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
@@ -225,6 +229,7 @@ jobs:
   windows-iocp:
     name: Windows / WSAPoll + IOCP / MSVC
     runs-on: windows-latest
+    timeout-minutes: 15
     # Best-effort while we work through the windows-2025 GitHub runner's
     # virtualised-environment flake: STATUS_ACCESS_VIOLATION fires at
     # random points across the coSpawn + AsyncSync test cluster (different
@@ -266,6 +271,7 @@ jobs:
   linux-sanitizers:
     name: Linux / epoll / ASan + UBSan
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
@@ -311,6 +317,7 @@ jobs:
   linux-tsan:
     name: Linux / epoll / TSan
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
@@ -354,6 +361,7 @@ jobs:
   install-consumer:
     name: Install + find_package consumer check (macOS)
     runs-on: macos-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - name: Install dependencies
@@ -382,7 +390,7 @@ jobs:
           cmake_minimum_required(VERSION 3.19)
           project(consumer LANGUAGES CXX)
           set(CMAKE_CXX_STANDARD 23)
-          find_package(Manwe 0.3 REQUIRED)
+          find_package(Manwe 1.1 REQUIRED)
           add_executable(consumer main.cpp)
           target_link_libraries(consumer PRIVATE Manwe::Yarn Manwe::Wire Manwe::Soccer)
           EOF
