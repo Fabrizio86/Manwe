@@ -340,6 +340,26 @@ namespace YarnBall {
 
         /**
          * @brief Covers @c fibers and @c graveyard transitions.
+         *
+         * @invariant Non-recursive. Never call anything while holding
+         *      @c cmu that can transitively reach @ref currentSnapshot's
+         *      slow path (the @c std::lock_guard<std::mutex> branch
+         *      taken when a thread's cached snapshot is stale) or
+         *      @ref wakeOneParked (which calls @ref currentSnapshot).
+         *      Concretely: never call @c Fiber::seed while holding
+         *      @c cmu -- @c seed can call @c wakeOneIdle ->
+         *      @ref wakeOneParked -> @ref currentSnapshot, and a
+         *      snapshot freshly rebuilt under this same lock (e.g. by
+         *      @ref maybeGrowLocked) guarantees the calling thread's
+         *      cache is stale, so that path WILL try to re-lock @c cmu
+         *      on the same thread. A previous version of
+         *      @c enqueueInjection violated this and self-deadlocked
+         *      the entire pool under ordinary load (temp-fiber growth
+         *      racing with any other worker being parked). If you need
+         *      to seed a fiber found under @c cmu, copy out an
+         *      @c sFiber (shared_ptr, keeps the Fiber alive if it
+         *      retires concurrently) while still holding the lock,
+         *      release the lock, then call @c seed on the copy.
          */
         mutable std::mutex cmu;
 
