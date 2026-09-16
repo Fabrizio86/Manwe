@@ -104,6 +104,16 @@ namespace Soccer {
             // data_provider callback.
             std::string body;
             std::size_t bodyOffset{0};
+            // Latched once the accumulated response body exceeds the
+            // per-stream cap (see kHttp2MaxBodyBytes in Http2.cpp).
+            // Once set, on_data_chunk_recv_callback stops touching
+            // response.body entirely -- a plain "clear and keep
+            // counting from zero" reset would let the cap silently
+            // reset itself on every subsequent chunk instead of
+            // permanently rejecting the stream. StreamAwaiter checks
+            // this and throws rather than returning a body that was
+            // truncated mid-stream.
+            bool bodyRejected{false};
         };
     } // namespace detail
 

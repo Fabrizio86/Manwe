@@ -164,20 +164,32 @@ namespace Soccer {
         // Random helpers for the client-side nonce and per-frame masks.
         // Not cryptographically strong -- they don't need to be. Both
         // are protocol scaffolding, not secrecy.
+        //
+        // randomMask() is on the hot per-frame send path (every masked
+        // client->server frame, including every fragment of a
+        // fragmented send, calls it once). Constructing a fresh
+        // std::random_device per call opens (and, on destruction,
+        // closes) a handle to the OS entropy source on most
+        // implementations -- a syscall-class cost per frame. Seed one
+        // generator per thread instead and reuse it; masking has no
+        // cryptographic requirement, so a thread-local generator loses
+        // nothing in correctness while removing the per-frame syscall.
         // ----------------------------------------------------------------
 
+        std::mt19937 &tlsMaskRng() {
+            thread_local std::mt19937 gen(std::random_device{}());
+            return gen;
+        }
+
         std::array<std::uint8_t, 16> randomNonce() {
-            std::random_device rd;
-            std::mt19937_64 gen(rd());
+            auto &gen = tlsMaskRng();
             std::array<std::uint8_t, 16> out{};
             for (auto &b : out) b = static_cast<std::uint8_t>(gen());
             return out;
         }
 
         std::uint32_t randomMask() {
-            std::random_device rd;
-            std::mt19937 gen(rd());
-            return gen();
+            return tlsMaskRng()();
         }
 
         // ----------------------------------------------------------------
@@ -280,7 +292,8 @@ namespace Soccer {
 
         YarnBall::Task<WsFrame> readFrame(TcpStream &s,
                                               std::vector<std::byte> &preBuf,
-                                              std::size_t &preOffset) {
+                                              std::size_t &preOffset,
+                                              bool isServer) {
             std::array<std::byte, 2> hdr{};
             co_await exactRead(s, preBuf, preOffset, hdr);
             const std::uint8_t b0 = std::to_integer<std::uint8_t>(hdr[0]);
@@ -292,6 +305,19 @@ namespace Soccer {
             if (rsv != 0) throw WsException("RSV bits set; no extensions negotiated");
             f.opcode = b0 & 0x0F;
             const bool masked = (b1 & 0x80) != 0;
+            // RFC 6455 §5.1: a server MUST close the connection upon
+            // receiving an unmasked frame, and a client MUST do the
+            // same for a masked frame. This is the protocol's specific
+            // defence against cache-poisoning attacks on transparent
+            // proxies that would otherwise misinterpret unmasked
+            // WebSocket traffic as plaintext HTTP -- it is a security
+            // control, not a style rule, so it is enforced before any
+            // further bytes of this frame are trusted.
+            if (masked != isServer) {
+                throw WsException(isServer
+                    ? "protocol violation: unmasked frame received from client"
+                    : "protocol violation: masked frame received from server");
+            }
             std::uint64_t plen = b1 & 0x7F;
 
             if (plen == 126) {
@@ -529,7 +555,8 @@ namespace Soccer {
 
         while (true) {
             WsFrame f = co_await readFrame(this->stream,
-                                              this->preBuf, this->preOffset);
+                                              this->preBuf, this->preOffset,
+                                              this->serverSide);
             switch (f.opcode) {
                 case kOpText:
                 case kOpBinary: {

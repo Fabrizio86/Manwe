@@ -59,6 +59,52 @@ namespace YarnBall {
         constexpr size_t kGrowBacklogThreshold = 64;
 
         /**
+         * @brief Thread-local trampoline queue for
+         *        @ref Yarn::enqueueInjection's last-resort
+         *        inline-execution fallback (used once the local deque,
+         *        every probed peer inbox, and the central injection
+         *        queue are all full).
+         *
+         *        A task run inline this way may itself submit further
+         *        work (coSpawn / scheduleOn), which re-enters
+         *        @c dispatch on the same thread and, under sustained
+         *        saturation -- the exact condition this fallback
+         *        exists for -- lands right back in this same fallback.
+         *        Naive recursion (task->run() -> dispatch() ->
+         *        enqueueInjection() -> task->run() -> ...) would grow
+         *        the native call stack without bound on a chained
+         *        fan-out (e.g. a pipeline coroutine tree), risking a
+         *        stack overflow at exactly peak load.
+         *
+         *        Rejecting the submission instead is not a safe
+         *        alternative: @c ITask::exception() is a no-op for
+         *        @c CoroutineITask (Coroutines.h) and @c CallableITask
+         *        (below) -- the two task types that dominate this
+         *        path -- so refusing to run a task here would silently
+         *        strand a coroutine chain (or a syncWait caller)
+         *        forever instead of failing loud. That is a worse
+         *        production failure mode than the crash it would
+         *        replace.
+         *
+         *        Instead this trampolines: when a drain loop is
+         *        already active on this thread (non-null), a nested
+         *        call just appends to it and returns immediately --
+         *        an O(1) push, not a nested call. The outermost call
+         *        becomes the drain loop and runs tasks (including any
+         *        the loop itself pushes) until the queue is empty.
+         *        Recursion depth is therefore O(1) regardless of
+         *        fan-out depth, while every submitted task still runs
+         *        to completion, in the same try/run/catch/exception
+         *        shape as the normal dispatch path -- no task is ever
+         *        silently dropped. The queue is heap-backed (bounded
+         *        by available memory, i.e. the machine's real
+         *        capacity) rather than the ~8 MiB native stack, so the
+         *        failure mode under truly pathological backlog is
+         *        graceful memory growth, not a stack-overflow crash.
+         */
+        thread_local std::vector<TaskPtr> *tlsInlineDrainQueue = nullptr;
+
+        /**
          * @brief Internal adapter that lets a shared_ptr-owned task flow
          *        through the executor as a raw @c ITask*. The shared_ptr
          *        ref-count is touched exactly once on submission and once on
@@ -251,18 +297,68 @@ namespace YarnBall {
         // Injection queue is full. Try to grow first; if that fails too, run
         // inline on the caller. Inline execution under pool exhaustion is the
         // standard back-pressure fallback (.NET, Folly, Tokio all do this).
+        //
+        // seed() is deliberately called AFTER releasing cmu, not
+        // inside the lock scope: seed() can call wakeOneIdle ->
+        // wakeOneParked -> currentSnapshot, and maybeGrowLocked just
+        // rebuilt the snapshot under this same lock, which guarantees
+        // *this* thread's cached snapshot is stale -- so if any other
+        // worker anywhere happens to be parked, currentSnapshot's slow
+        // path would try to re-lock cmu on the thread that already
+        // holds it, self-deadlocking and wedging the whole pool (see
+        // cmu's invariant comment in Yarn.hpp). `grown` is an sFiber
+        // (shared_ptr), not a raw pointer, copied out while still
+        // holding cmu, so the Fiber stays alive even if it retires
+        // concurrently between releasing the lock and calling seed().
+        sFiber grown;
         {
             std::lock_guard<std::mutex> lk(this->cmu);
             int newId = this->maybeGrowLocked();
-            if (newId >= 0) {
-                if (this->fibers[newId] && this->fibers[newId]->seed(task)) return;
-            }
+            if (newId >= 0 && this->fibers[newId]) grown = this->fibers[newId];
+        }
+        if (grown && grown->seed(task)) return;
+
+        // Trampoline instead of recurse -- see tlsInlineDrainQueue's
+        // comment for the full rationale. A nested re-entry (this
+        // thread is already draining) just parks the task and returns;
+        // O(1), no added native stack depth.
+        if (tlsInlineDrainQueue) {
+            tlsInlineDrainQueue->push_back(task);
+            return;
         }
 
-        try { task->run(); } catch (...) {
-            try { task->exception(std::current_exception()); } catch (...) { }
+        // We are the outermost call: become the drain loop. Any task
+        // run below that submits further work re-enters this function,
+        // sees tlsInlineDrainQueue set, and appends to `drain` instead
+        // of recursing -- so this loop, not the call stack, absorbs
+        // however deep the fan-out goes.
+        //
+        // The thread-local pointer is reset via RAII, not a plain
+        // trailing assignment: nothing in the loop body is expected to
+        // throw past its own try/catch (ITask's pooled operator delete
+        // implementations are noexcept), but if something ever did, a
+        // trailing `tlsInlineDrainQueue = nullptr;` would be skipped,
+        // leaving the pointer dangling at this now-destroyed `drain` --
+        // the next call on this thread would push_back through a
+        // stale pointer into freed stack memory. The guard makes that
+        // unreachable by construction instead of relying on the loop
+        // body never throwing.
+        struct DrainQueueGuard {
+            explicit DrainQueueGuard(std::vector<TaskPtr> &d) noexcept {
+                tlsInlineDrainQueue = &d;
+            }
+            ~DrainQueueGuard() noexcept { tlsInlineDrainQueue = nullptr; }
+        };
+        std::vector<TaskPtr> drain{task};
+        DrainQueueGuard guard(drain);
+        while (!drain.empty()) {
+            TaskPtr t = drain.back();
+            drain.pop_back();
+            try { t->run(); } catch (...) {
+                try { t->exception(std::current_exception()); } catch (...) { }
+            }
+            delete t;
         }
-        delete task;
     }
 
     int Yarn::maybeGrowLocked() {
@@ -408,13 +504,22 @@ namespace YarnBall {
         };
 
         PushPending pushPending = [this](TaskPtr t) {
-            if (!this->injection->enqueue(t)) {
-                // Backlog full at the worst time. Run inline rather than leak.
-                try { t->run(); } catch (...) {
-                    try { t->exception(std::current_exception()); } catch (...) { }
-                }
-                delete t;
-            }
+            // Route through the normal dispatch path -- which itself
+            // tries the injection queue, then falls back through
+            // enqueueInjection's trampolined inline-execution path
+            // under saturation -- instead of duplicating a second,
+            // unhardened "run it inline if the queue is full" here.
+            // Keeps exactly one implementation of "what do we do with
+            // a task that can't be queued normally" in the codebase,
+            // so hardening applied there (e.g. the trampoline that
+            // bounds native stack depth under sustained saturation)
+            // automatically covers this call site too. Safe to call
+            // from the retiring fiber's own thread: tls_currentFiber
+            // still points at `this` fiber here, but its `running`
+            // flag was already flipped false by the caller, so
+            // dispatch's in-worker fast path (self->seed) correctly
+            // declines and falls through to peer/injection/trampoline.
+            this->dispatch(t);
         };
 
         TryStealFromPeers tryStealFromPeers = [this](FiberId fid) {
