@@ -2777,10 +2777,21 @@ TEST(http2_loopback_client_to_server_round_trip) {
     });
 
     std::stop_source stopSrc;
-    YarnBall::coSpawn([](Soccer::Http2Server *s, std::stop_token st) -> YarnBall::Task<void> {
-        try { co_await s->serve(st); } catch (...) {}
-        co_return;
-    }(&server, stopSrc.get_token()));
+    // Call server.serve(...) directly -- do NOT wrap it in an extra
+    // lambda coroutine that captures &server by value. That extra
+    // layer reintroduces the exact use-after-free Http2Server::serve
+    // itself was fixed against: a lambda coroutine is just as lazy as
+    // a member-function one, so a raw Http2Server* captured into it
+    // would only be dereferenced on the wrapper's own first resume --
+    // which can happen after `server` is destroyed if this function
+    // returns before that resume occurs. server.serve(...) is safe to
+    // coSpawn directly: it synchronously captures everything it needs
+    // from `this` before returning, so the Task it returns has no
+    // remaining dependency on `server`'s lifetime. Any exception it
+    // throws is already discarded harmlessly by a detached task's
+    // final-suspend path, so the try/catch this used to need is gone
+    // too.
+    YarnBall::coSpawn(server.serve(stopSrc.get_token()));
 
     auto combined = YarnBall::syncWait(http2Loopback(port));
     EXPECT_EQ(combined, std::string("h2-hello|echo:body-bytes"));
@@ -2804,10 +2815,21 @@ TEST(http2_server_emits_trailers_client_receives_them) {
     });
 
     std::stop_source stopSrc;
-    YarnBall::coSpawn([](Soccer::Http2Server *s, std::stop_token st) -> YarnBall::Task<void> {
-        try { co_await s->serve(st); } catch (...) {}
-        co_return;
-    }(&server, stopSrc.get_token()));
+    // Call server.serve(...) directly -- do NOT wrap it in an extra
+    // lambda coroutine that captures &server by value. That extra
+    // layer reintroduces the exact use-after-free Http2Server::serve
+    // itself was fixed against: a lambda coroutine is just as lazy as
+    // a member-function one, so a raw Http2Server* captured into it
+    // would only be dereferenced on the wrapper's own first resume --
+    // which can happen after `server` is destroyed if this function
+    // returns before that resume occurs. server.serve(...) is safe to
+    // coSpawn directly: it synchronously captures everything it needs
+    // from `this` before returning, so the Task it returns has no
+    // remaining dependency on `server`'s lifetime. Any exception it
+    // throws is already discarded harmlessly by a detached task's
+    // final-suspend path, so the try/catch this used to need is gone
+    // too.
+    YarnBall::coSpawn(server.serve(stopSrc.get_token()));
 
     auto client = [](std::uint16_t p) -> YarnBall::Task<Soccer::Http2Response> {
         auto conn = co_await Soccer::Http2Connection::connectPlain("127.0.0.1", p);
@@ -2844,10 +2866,21 @@ TEST(http2_pool_returns_same_connection_for_same_host) {
         co_return r;
     });
     std::stop_source stopSrc;
-    YarnBall::coSpawn([](Soccer::Http2Server *s, std::stop_token st) -> YarnBall::Task<void> {
-        try { co_await s->serve(st); } catch (...) {}
-        co_return;
-    }(&server, stopSrc.get_token()));
+    // Call server.serve(...) directly -- do NOT wrap it in an extra
+    // lambda coroutine that captures &server by value. That extra
+    // layer reintroduces the exact use-after-free Http2Server::serve
+    // itself was fixed against: a lambda coroutine is just as lazy as
+    // a member-function one, so a raw Http2Server* captured into it
+    // would only be dereferenced on the wrapper's own first resume --
+    // which can happen after `server` is destroyed if this function
+    // returns before that resume occurs. server.serve(...) is safe to
+    // coSpawn directly: it synchronously captures everything it needs
+    // from `this` before returning, so the Task it returns has no
+    // remaining dependency on `server`'s lifetime. Any exception it
+    // throws is already discarded harmlessly by a detached task's
+    // final-suspend path, so the try/catch this used to need is gone
+    // too.
+    YarnBall::coSpawn(server.serve(stopSrc.get_token()));
 
     Soccer::Http2ConnectionPool pool;
     auto fetch = [](Soccer::Http2ConnectionPool *p, std::string host,
