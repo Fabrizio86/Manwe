@@ -40,7 +40,12 @@ namespace {
      * @brief Deque capacities used by the benchmark, expressed as
      *        power-of-two literals so the requirement is self-evident.
      */
-    constexpr std::size_t kBenchDequeCapacityOwner = std::size_t{1} << 13; // 8192
+    // Must be >= kDequeOwnerOps: this scenario pushes all N items before
+    // popping any of them, so a smaller capacity would silently truncate
+    // most pushes to no-ops (push() fails closed, it does not grow or
+    // block), leaving the reported ns/op dominated by fast-fail branches
+    // instead of the LIFO push/pop path this benchmark exists to measure.
+    constexpr std::size_t kBenchDequeCapacityOwner = std::size_t{1} << 20; // 1,048,576
     constexpr std::size_t kBenchDequeCapacityConcurrent = std::size_t{1} << 14; // 16384
     constexpr std::size_t kBenchMpmcCapacity = std::size_t{1} << 14; // 16384
 
