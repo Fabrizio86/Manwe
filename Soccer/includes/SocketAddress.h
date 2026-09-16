@@ -7,6 +7,7 @@
 
 #include <cstdint>
 #include <string>
+#include <vector>
 
 #include "Coroutines.h"
 #include "PlatformNet.h"
@@ -35,8 +36,27 @@ namespace Soccer {
          * @note Synchronous: runs @c getaddrinfo on the calling thread.
          *       For non-blocking flows use @c resolveAsync, which hops
          *       to a Yarn worker first.
+         *
+         * @note Returns only the FIRST candidate. A host with multiple
+         *       A/AAAA records (routine for load-balanced or multi-
+         *       homed backends) may have working addresses beyond the
+         *       first; a caller that wants to fall back across
+         *       candidates when one is unreachable (as @c tcpConnect
+         *       does) should call @ref resolveAll instead.
          */
         static SocketAddress resolve(const std::string &host, std::uint16_t port);
+
+        /**
+         * @brief Resolve @p host:@p port to every candidate address
+         *        @c getaddrinfo returns, in the order the resolver
+         *        supplied them. @ref resolve is this call's
+         *        first-candidate-only convenience wrapper.
+         *
+         * @throws SocketException on resolution failure. Never returns
+         *         an empty vector on success.
+         */
+        static std::vector<SocketAddress> resolveAll(const std::string &host,
+                                                       std::uint16_t port);
 
         /**
          * @brief Same as @ref resolve but hops onto a Yarn worker before
@@ -49,6 +69,14 @@ namespace Soccer {
          */
         static YarnBall::Task<SocketAddress> resolveAsync(std::string host,
                                                             std::uint16_t port);
+
+        /**
+         * @brief Same as @ref resolveAll but hops onto a Yarn worker
+         *        first, matching @ref resolveAsync's non-blocking
+         *        contract.
+         */
+        static YarnBall::Task<std::vector<SocketAddress>> resolveAllAsync(
+            std::string host, std::uint16_t port);
 
         /**
          * @brief Construct from a raw kernel address (e.g. one returned by

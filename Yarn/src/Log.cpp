@@ -121,8 +121,21 @@ namespace YarnBall::log {
         }
         line.append("}\n");
 
-        std::lock_guard<std::mutex> lk(g_sinkMu);
-        if (g_sink) g_sink(line);
+        // Copy the sink under the lock, then invoke it after releasing:
+        // a sink that itself calls back into emit() (a network sink
+        // logging its own write failure, a sink that forwards into
+        // another logging framework that round-trips here) would
+        // otherwise re-lock g_sinkMu on the same thread while this
+        // lock_guard is still held -- a guaranteed self-deadlock on
+        // the non-recursive std::mutex. Telegraph::Signal::emit()
+        // (TelegraphSignal.h) already establishes this exact pattern
+        // for the same reason; this brings emit() in line with it.
+        Sink sinkCopy;
+        {
+            std::lock_guard<std::mutex> lk(g_sinkMu);
+            sinkCopy = g_sink;
+        }
+        if (sinkCopy) sinkCopy(line);
     }
 
 }

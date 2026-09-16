@@ -288,12 +288,25 @@ namespace YarnBall {
 
     /**
      * @brief Yield at most @p n values, then end the stream.
+     *
+     * Pulls @c input.next() at most @p n times -- checking the limit
+     * BEFORE pulling, not after. The previous shape pulled first and
+     * checked second, so on the call that would have been the (n+1)th
+     * yield it still unconditionally pulled that (n+1)th value from
+     * @c input before discarding it via the limit check, silently
+     * consuming one extra element the caller never sees. That matters
+     * whenever @c input has a per-pull side effect (a network read, a
+     * database fetch, any I/O-backed combinator): every well-known
+     * equivalent (Rust's Iterator::take, Python's itertools.islice,
+     * C++ ranges::views::take) calls the underlying next() exactly
+     * @p n times, never @c n+1.
      */
     template<typename T>
     Stream<T> streamTake(Stream<T> input, std::size_t n) {
         std::size_t taken = 0;
-        while (auto v = co_await input.next()) {
-            if (taken >= n) co_return;
+        while (taken < n) {
+            auto v = co_await input.next();
+            if (!v) co_return;
             co_yield std::move(*v);
             ++taken;
         }

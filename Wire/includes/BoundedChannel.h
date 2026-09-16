@@ -96,7 +96,7 @@ namespace Telegraph {
             // sender on the senders queue; a receiver will wake us
             // once a slot frees up (or close() will fail the send).
             auto sender = std::make_shared<SendWaiter>();
-            sender->value = std::move(value);
+            sender->value.emplace(std::move(value));
             co_await SendAwaiter{this, sender};
             co_return sender->ok;
         }
@@ -121,7 +121,7 @@ namespace Telegraph {
                     if (!this->senders.empty()) {
                         wakeSender = std::move(this->senders.front());
                         this->senders.pop_front();
-                        this->buffer.push_back(std::move(wakeSender->value));
+                        this->buffer.push_back(std::move(*wakeSender->value));
                     }
                     if (wakeSender) {
                         wakeSender->ok = true;
@@ -185,7 +185,16 @@ namespace Telegraph {
 
         struct SendWaiter {
             std::coroutine_handle<> handle{};
-            T value;
+            // std::optional<T>, not a plain T: this struct is default-
+            // constructed via std::make_shared<SendWaiter>() in send()
+            // before the value is known, so a bare T member would
+            // silently require T to be default-constructible --
+            // contradicting this class's own documented "T must be
+            // move-constructible" contract (and its sibling Channel<T>,
+            // which only ever wraps T in std::optional and has no such
+            // requirement). optional<T> starts empty regardless of T,
+            // matching the promised contract exactly.
+            std::optional<T> value;
             bool ok = false;
         };
 
@@ -231,13 +240,13 @@ namespace Telegraph {
                 if (!ch->receivers.empty()) {
                     auto receiver = std::move(ch->receivers.front());
                     ch->receivers.pop_front();
-                    receiver->slot.emplace(std::move(waiter->value));
+                    receiver->slot.emplace(std::move(*waiter->value));
                     dispatch(receiver->handle);
                     waiter->ok = true;
                     return false;
                 }
                 if (ch->buffer.size() < ch->capacityVal) {
-                    ch->buffer.push_back(std::move(waiter->value));
+                    ch->buffer.push_back(std::move(*waiter->value));
                     waiter->ok = true;
                     return false;
                 }
