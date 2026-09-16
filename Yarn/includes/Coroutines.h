@@ -437,11 +437,35 @@ namespace YarnBall {
          */
         class ManualResetEvent {
         public:
+            /**
+             * @brief Notify_all is called WHILE STILL HOLDING @c mu, not
+             *        after releasing it. @c event lives on syncWait's
+             *        stack frame, with nothing keeping it alive past
+             *        wait() returning: if the lock were released before
+             *        notify_all(), the waiting thread's cv.wait(lk,
+             *        pred) can observe `ready == true` and return via a
+             *        plain spurious wakeup -- a real, standards-
+             *        permitted occurrence, not a bug -- entirely
+             *        independent of this notify_all() call. syncWait()
+             *        then returns, its stack frame (including this
+             *        ManualResetEvent) is reused by whatever runs next
+             *        on that thread, and the still-pending notify_all()
+             *        call here executes against memory that has since
+             *        been reinitialized as a *different*, currently-
+             *        live condition_variable -- corrupting its internal
+             *        state and surfacing as an unrelated, later wait()
+             *        call throwing "condition_variable wait failed:
+             *        Invalid argument" on whatever unlucky syncWait
+             *        happens to run next. Holding the lock across
+             *        notify_all() closes the race: the waiter cannot
+             *        observe `ready == true` and proceed to destroy
+             *        this object until AFTER this function has released
+             *        the mutex, by which point notify_all() has already
+             *        completed.
+             */
             void set() {
-                {
-                    std::lock_guard<std::mutex> lk(this->mu);
-                    this->ready = true;
-                }
+                std::lock_guard<std::mutex> lk(this->mu);
+                this->ready = true;
                 this->cv.notify_all();
             }
 

@@ -1226,20 +1226,50 @@ namespace Soccer {
         }
     }
 
-    YarnBall::Task<void> Http2Server::serve(std::stop_token stop) {
-        // The factory below is NOT a coroutine. It forwards into the
-        // free @c runServerConnection coroutine, whose own frame owns
-        // @c server and @c client by value -- the only safe lifetime
-        // pattern for tcpServe handlers (see HttpServer::serve for the
-        // sibling case and docs/coroutines.md for the rationale).
-        auto serverState = this->serverState;
-        auto factory = [serverState](TcpStream client) -> YarnBall::Task<void> {
-            return runServerConnection(serverState, std::move(client));
-        };
+    namespace {
+        // Free coroutine that owns @p serverState and @p stop by
+        // value. Used by Http2Server::serve (below) for the same
+        // reason runServerConnection above is a free coroutine rather
+        // than a lambda: the factory forwards into it, owning its
+        // parameters by value instead of depending on anything with a
+        // shorter lifetime.
+        YarnBall::Task<void> serveHttp2(
+            std::shared_ptr<Http2Server::ServerState> serverState,
+            std::stop_token stop) {
+            auto factory = [serverState](TcpStream client) -> YarnBall::Task<void> {
+                return runServerConnection(serverState, std::move(client));
+            };
+            co_await tcpServe(std::move(serverState->listener), factory, stop);
+            co_return;
+        }
+    }
 
-        co_await tcpServe(std::move(this->serverState->listener),
-                           factory, stop);
-        co_return;
+    YarnBall::Task<void> Http2Server::serve(std::stop_token stop) {
+        // Deliberately NOT a coroutine itself. Task is lazy: a
+        // member-function coroutine's body -- including a line as
+        // early as "copy this->serverState into a local", which is
+        // exactly what this function used to do -- only executes on
+        // the coroutine's FIRST RESUME, not at the call to serve()
+        // itself. A caller that does
+        //   coSpawn(server.serve(stop)); ...; stopSrc.request_stop();
+        // and then returns/destroys `server` without waiting for the
+        // spawned task to actually finish races that first resume
+        // against the Http2Server object's destruction: if a worker
+        // thread resumes the coroutine after `server` is already
+        // gone, the old code's "auto serverState = this->serverState;"
+        // read freed memory -- a genuine, observed use-after-free
+        // (SIGBUS while copy-constructing the dangling shared_ptr),
+        // not a hypothetical one.
+        //
+        // Making serve() an ordinary (non-coroutine) function fixes
+        // this at the root for every caller: the shared_ptr copy
+        // below runs synchronously, on the caller's own thread, while
+        // `this` is unquestionably still valid (we are inside a live
+        // member-function call). The Task that serveHttp2 returns
+        // then owns serverState by value and has no dependency on
+        // `this` at all for the rest of its lifetime, however much
+        // later or on whichever thread it actually gets resumed.
+        return serveHttp2(this->serverState, stop);
     }
 
     // =================================================================

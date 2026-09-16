@@ -122,33 +122,36 @@ namespace Soccer {
          *        fires (between accepts) or the listener errors.
          */
         YarnBall::Task<void> serve(std::stop_token stop = {}) {
-            // Capture the routes by shared_ptr so the per-connection
-            // coroutines can outlive @c this without UAF (the serve()
-            // coroutine's frame owns the route table, but per-connection
-            // handlers are co_spawn'd and may run beyond serve()'s scope
-            // in adversarial shutdown ordering).
+            // Deliberately NOT a coroutine itself. Task is lazy: a
+            // member-function coroutine's body -- including a line as
+            // early as "copy this->routes into a shared_ptr", which is
+            // exactly what this function used to do first -- only
+            // executes on the coroutine's FIRST RESUME, not at the
+            // call to serve() itself. A caller that does
+            //   coSpawn(server.serve(stop)); ...; src.request_stop();
+            // and then returns/destroys `server` without waiting for
+            // the spawned task to actually finish races that first
+            // resume against the HttpServer object's destruction: if a
+            // worker thread resumes the coroutine after `server` is
+            // already gone, the old code's capture of this->routes
+            // (and its std::move(this->listener) a few lines later)
+            // read from freed memory -- the exact use-after-free
+            // (SIGBUS while copy-constructing a dangling shared_ptr)
+            // that surfaced in Soccer::Http2Server::serve's identical
+            // pattern; see the long comment there (Http2.cpp) for the
+            // full diagnosis.
+            //
+            // Making serve() an ordinary (non-coroutine) function
+            // fixes this at the root: the captures below run
+            // synchronously, on the caller's own thread, while `this`
+            // is unquestionably still valid (we are inside a live
+            // member-function call). The Task that serveHttp returns
+            // then owns everything it needs by value and has no
+            // dependency on `this` for the rest of its lifetime,
+            // however much later or on whichever thread it actually
+            // gets resumed.
             auto routesPtr = std::make_shared<RouteTable>(this->routes);
-
-            // CRITICAL: the factory lambda is NOT a coroutine. It is a
-            // plain function that forwards into the free @c handleOne
-            // coroutine. Making the lambda body itself a coroutine
-            // (`co_await ... co_return`) would crash: the lambda
-            // closure is a temporary in tcpServe's frame, and the
-            // resulting coroutine references the closure's captures
-            // through implicit @c this -- as soon as the closure dies,
-            // the coroutine's @c this dangles (see the lambda-coroutine
-            // warning in docs/coroutines.md). @c handleOne is a free
-            // coroutine that owns @c routesPtr by value, so its frame
-            // holds the only live reference for the connection's
-            // lifetime.
-            auto factory = [routesPtr](TcpStream client) -> YarnBall::Task<void> {
-                return handleOne(routesPtr, std::move(client));
-            };
-
-            co_await tcpServe(std::move(this->listener),
-                               std::move(factory),
-                               stop);
-            co_return;
+            return serveHttp(std::move(routesPtr), std::move(this->listener), stop);
         }
 
         /**
@@ -182,9 +185,32 @@ namespace Soccer {
         }
 
         /**
+         * @brief Free-standing accept loop, called by @ref serve.
+         *        Owns @p routesPtr and @p listener by value so it has
+         *        no dependency on the HttpServer object's lifetime --
+         *        see the long comment on @ref serve for why that
+         *        matters. The factory lambda passed to tcpServe is
+         *        NOT a coroutine itself; it forwards into the free
+         *        @c handleOne coroutine below, whose own frame owns
+         *        @c routesPtr and the accepted client by value (the
+         *        same lambda-coroutine-UAF avoidance @c handleOne's
+         *        own docblock already explains).
+         */
+        static YarnBall::Task<void> serveHttp(
+            std::shared_ptr<RouteTable> routesPtr,
+            TcpListener listener,
+            std::stop_token stop) {
+            auto factory = [routesPtr](TcpStream client) -> YarnBall::Task<void> {
+                return handleOne(routesPtr, std::move(client));
+            };
+            co_await tcpServe(std::move(listener), std::move(factory), stop);
+            co_return;
+        }
+
+        /**
          * @brief Parse one request, dispatch to a route, write the
          *        response, close. Per-connection handler used by
-         *        @ref serve.
+         *        @ref serveHttp.
          */
         static YarnBall::Task<void> handleOne(
             std::shared_ptr<RouteTable> routes,
