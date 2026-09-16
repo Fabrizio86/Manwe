@@ -59,36 +59,50 @@ namespace YarnBall {
         constexpr size_t kGrowBacklogThreshold = 64;
 
         /**
-         * @brief Bound on how many times @ref Yarn::enqueueInjection's
-         *        last-resort inline-execution fallback may recurse on
-         *        one thread before refusing further submissions
-         *        outright.
+         * @brief Thread-local trampoline queue for
+         *        @ref Yarn::enqueueInjection's last-resort
+         *        inline-execution fallback (used once the local deque,
+         *        every probed peer inbox, and the central injection
+         *        queue are all full).
          *
-         *        Inline execution (running the task synchronously on
-         *        the submitting thread) is the standard backpressure
-         *        fallback once the local deque, every probed peer
-         *        inbox, and the central injection queue are all full.
-         *        But a task run this way may itself submit further
-         *        work (coSpawn / scheduleOn) which re-enters dispatch
-         *        on the same thread and, under sustained saturation
-         *        (the exact condition this fallback exists for), lands
-         *        back in this same inline path -- as a nested native
-         *        call, not an independent scheduler hop. A chained
-         *        fan-out (e.g. a pipeline coroutine tree) can then grow
-         *        the call stack without bound instead of receiving
-         *        backpressure. Capping the recursion turns that into an
-         *        explicit rejection the caller can react to (retry,
-         *        503, drop) rather than a stack-overflow crash at peak
-         *        load.
+         *        A task run inline this way may itself submit further
+         *        work (coSpawn / scheduleOn), which re-enters
+         *        @c dispatch on the same thread and, under sustained
+         *        saturation -- the exact condition this fallback
+         *        exists for -- lands right back in this same fallback.
+         *        Naive recursion (task->run() -> dispatch() ->
+         *        enqueueInjection() -> task->run() -> ...) would grow
+         *        the native call stack without bound on a chained
+         *        fan-out (e.g. a pipeline coroutine tree), risking a
+         *        stack overflow at exactly peak load.
+         *
+         *        Rejecting the submission instead is not a safe
+         *        alternative: @c ITask::exception() is a no-op for
+         *        @c CoroutineITask (Coroutines.h) and @c CallableITask
+         *        (below) -- the two task types that dominate this
+         *        path -- so refusing to run a task here would silently
+         *        strand a coroutine chain (or a syncWait caller)
+         *        forever instead of failing loud. That is a worse
+         *        production failure mode than the crash it would
+         *        replace.
+         *
+         *        Instead this trampolines: when a drain loop is
+         *        already active on this thread (non-null), a nested
+         *        call just appends to it and returns immediately --
+         *        an O(1) push, not a nested call. The outermost call
+         *        becomes the drain loop and runs tasks (including any
+         *        the loop itself pushes) until the queue is empty.
+         *        Recursion depth is therefore O(1) regardless of
+         *        fan-out depth, while every submitted task still runs
+         *        to completion, in the same try/run/catch/exception
+         *        shape as the normal dispatch path -- no task is ever
+         *        silently dropped. The queue is heap-backed (bounded
+         *        by available memory, i.e. the machine's real
+         *        capacity) rather than the ~8 MiB native stack, so the
+         *        failure mode under truly pathological backlog is
+         *        graceful memory growth, not a stack-overflow crash.
          */
-        constexpr int kMaxInlineFallbackDepth = 8;
-
-        /**
-         * @brief Per-thread nesting depth of the inline-execution
-         *        fallback in @ref Yarn::enqueueInjection. See
-         *        @ref kMaxInlineFallbackDepth.
-         */
-        thread_local int tlsInlineFallbackDepth = 0;
+        thread_local std::vector<TaskPtr> *tlsInlineDrainQueue = nullptr;
 
         /**
          * @brief Internal adapter that lets a shared_ptr-owned task flow
@@ -291,27 +305,47 @@ namespace YarnBall {
             }
         }
 
-        // See kMaxInlineFallbackDepth: past this bound we refuse the
-        // submission outright instead of recursing further.
-        if (tlsInlineFallbackDepth >= kMaxInlineFallbackDepth) {
-            try {
-                task->exception(std::make_exception_ptr(std::runtime_error(
-                    "Yarn: submission rejected -- pool and queues are exhausted "
-                    "and the inline-fallback recursion budget ran out")));
-            } catch (...) { }
-            delete task;
+        // Trampoline instead of recurse -- see tlsInlineDrainQueue's
+        // comment for the full rationale. A nested re-entry (this
+        // thread is already draining) just parks the task and returns;
+        // O(1), no added native stack depth.
+        if (tlsInlineDrainQueue) {
+            tlsInlineDrainQueue->push_back(task);
             return;
         }
 
-        struct DepthGuard {
-            DepthGuard() noexcept { ++tlsInlineFallbackDepth; }
-            ~DepthGuard() noexcept { --tlsInlineFallbackDepth; }
-        } depthGuard;
-
-        try { task->run(); } catch (...) {
-            try { task->exception(std::current_exception()); } catch (...) { }
+        // We are the outermost call: become the drain loop. Any task
+        // run below that submits further work re-enters this function,
+        // sees tlsInlineDrainQueue set, and appends to `drain` instead
+        // of recursing -- so this loop, not the call stack, absorbs
+        // however deep the fan-out goes.
+        //
+        // The thread-local pointer is reset via RAII, not a plain
+        // trailing assignment: nothing in the loop body is expected to
+        // throw past its own try/catch (ITask's pooled operator delete
+        // implementations are noexcept), but if something ever did, a
+        // trailing `tlsInlineDrainQueue = nullptr;` would be skipped,
+        // leaving the pointer dangling at this now-destroyed `drain` --
+        // the next call on this thread would push_back through a
+        // stale pointer into freed stack memory. The guard makes that
+        // unreachable by construction instead of relying on the loop
+        // body never throwing.
+        struct DrainQueueGuard {
+            explicit DrainQueueGuard(std::vector<TaskPtr> &d) noexcept {
+                tlsInlineDrainQueue = &d;
+            }
+            ~DrainQueueGuard() noexcept { tlsInlineDrainQueue = nullptr; }
+        };
+        std::vector<TaskPtr> drain{task};
+        DrainQueueGuard guard(drain);
+        while (!drain.empty()) {
+            TaskPtr t = drain.back();
+            drain.pop_back();
+            try { t->run(); } catch (...) {
+                try { t->exception(std::current_exception()); } catch (...) { }
+            }
+            delete t;
         }
-        delete task;
     }
 
     int Yarn::maybeGrowLocked() {
