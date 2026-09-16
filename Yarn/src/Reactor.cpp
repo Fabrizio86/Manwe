@@ -338,6 +338,64 @@ namespace YarnBall {
         inline constexpr std::uintptr_t kWakeupSentinel = 1;
     }
 
+    /**
+     * @brief Heap-allocated entry that owns the timerfd we created for a
+     *        sleep. The run loop's epoll completion handler casts
+     *        data.ptr back to this, closes the fd, schedules the handle,
+     *        and frees the entry. Tagged so we can distinguish it from
+     *        the wakeup sentinel and from coroutine handles directly.
+     *
+     *        Declared ahead of the constructor/destructor (rather than
+     *        next to @ref Reactor::registerTimer, where it used to
+     *        live) so @c ~Reactor can also reference it when reclaiming
+     *        any entry still outstanding at shutdown -- see
+     *        @ref Reactor::pendingTimers.
+     */
+    namespace {
+        struct TimerEntry {
+            int fd;
+            std::coroutine_handle<> handle;
+        };
+
+        /**
+         * @brief Low-bit-tag in data.ptr to mark "this is a TimerEntry".
+         *        coroutine_handle::address() is aligned at least 8 bytes,
+         *        so the low 3 bits are free. We OR in 0x2 for timers
+         *        (0x1 is the wakeup sentinel).
+         */
+        constexpr std::uintptr_t kTimerTag = 0x2;
+
+        inline void *tagTimer(TimerEntry *e) {
+            return reinterpret_cast<void *>(
+                reinterpret_cast<std::uintptr_t>(e) | kTimerTag);
+        }
+
+        inline bool isTimer(void *p) {
+            return (reinterpret_cast<std::uintptr_t>(p) & 0x3) == kTimerTag;
+        }
+
+        inline TimerEntry *untagTimer(void *p) {
+            return reinterpret_cast<TimerEntry *>(
+                reinterpret_cast<std::uintptr_t>(p) & ~static_cast<std::uintptr_t>(0x3));
+        }
+
+        /**
+         * @brief Remove (without deleting) @p entry from @p pending if
+         *        present. Linear scan over a vector that in practice
+         *        holds at most a handful of concurrently-armed timers;
+         *        swap-pop since order does not matter.
+         */
+        void untrackTimer(std::vector<void *> &pending, TimerEntry *entry) {
+            for (std::size_t i = 0; i < pending.size(); ++i) {
+                if (pending[i] == static_cast<void *>(entry)) {
+                    pending[i] = pending.back();
+                    pending.pop_back();
+                    return;
+                }
+            }
+        }
+    }
+
     Reactor::Reactor() {
         this->epfd = ::epoll_create1(EPOLL_CLOEXEC);
         if (this->epfd < 0) throw std::runtime_error("Reactor: epoll_create1 failed");
@@ -360,6 +418,21 @@ namespace YarnBall {
     Reactor::~Reactor() {
         this->stop();
         if (this->thread.joinable()) this->thread.join();
+        // The run loop has now definitively exited (joined above), so
+        // nothing else touches pendingTimers concurrently. Any timer
+        // that was registered but never fired -- e.g. a long sleepFor
+        // still armed when the Reactor is torn down -- would otherwise
+        // leave its TimerEntry and timerfd unreachable once epfd
+        // closes below; reclaim them explicitly instead of leaking.
+        {
+            std::lock_guard<std::mutex> lk(this->timerSetMu);
+            for (void *p : this->pendingTimers) {
+                auto *entry = static_cast<TimerEntry *>(p);
+                ::close(entry->fd);
+                delete entry;
+            }
+            this->pendingTimers.clear();
+        }
         if (this->wakefd >= 0) ::close(this->wakefd);
         if (this->epfd >= 0) ::close(this->epfd);
     }
@@ -394,42 +467,6 @@ namespace YarnBall {
         }
     }
 
-    /**
-     * @brief Heap-allocated entry that owns the timerfd we created for a
-     *        sleep. The run loop's epoll completion handler casts
-     *        data.ptr back to this, closes the fd, schedules the handle,
-     *        and frees the entry. Tagged so we can distinguish it from
-     *        the wakeup sentinel and from coroutine handles directly.
-     */
-    namespace {
-        struct TimerEntry {
-            int fd;
-            std::coroutine_handle<> handle;
-        };
-
-        /**
-         * @brief Low-bit-tag in data.ptr to mark "this is a TimerEntry".
-         *        coroutine_handle::address() is aligned at least 8 bytes,
-         *        so the low 3 bits are free. We OR in 0x2 for timers
-         *        (0x1 is the wakeup sentinel).
-         */
-        constexpr std::uintptr_t kTimerTag = 0x2;
-
-        inline void *tagTimer(TimerEntry *e) {
-            return reinterpret_cast<void *>(
-                reinterpret_cast<std::uintptr_t>(e) | kTimerTag);
-        }
-
-        inline bool isTimer(void *p) {
-            return (reinterpret_cast<std::uintptr_t>(p) & 0x3) == kTimerTag;
-        }
-
-        inline TimerEntry *untagTimer(void *p) {
-            return reinterpret_cast<TimerEntry *>(
-                reinterpret_cast<std::uintptr_t>(p) & ~static_cast<std::uintptr_t>(0x3));
-        }
-    }
-
     void Reactor::registerTimer(std::chrono::nanoseconds duration,
                                  std::coroutine_handle<> h) noexcept {
         const int tfd = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
@@ -447,10 +484,18 @@ namespace YarnBall {
             return;
         }
         auto *entry = new TimerEntry{tfd, h};
+        {
+            std::lock_guard<std::mutex> lk(this->timerSetMu);
+            this->pendingTimers.push_back(entry);
+        }
         struct epoll_event ev{};
         ev.events = EPOLLIN | EPOLLONESHOT;
         ev.data.ptr = tagTimer(entry);
         if (::epoll_ctl(this->epfd, EPOLL_CTL_ADD, tfd, &ev) < 0) {
+            {
+                std::lock_guard<std::mutex> lk(this->timerSetMu);
+                untrackTimer(this->pendingTimers, entry);
+            }
             delete entry;
             ::close(tfd);
             this->schedule(h);
@@ -480,6 +525,10 @@ namespace YarnBall {
                     (void) ::read(entry->fd, &expirations, sizeof(expirations));
                     ::close(entry->fd);
                     std::coroutine_handle<> h = entry->handle;
+                    {
+                        std::lock_guard<std::mutex> lk(this->timerSetMu);
+                        untrackTimer(this->pendingTimers, entry);
+                    }
                     delete entry;
                     this->schedule(h);
                     continue;

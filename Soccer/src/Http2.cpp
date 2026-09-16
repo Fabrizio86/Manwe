@@ -45,6 +45,22 @@
 
 namespace Soccer {
 
+    namespace {
+        /**
+         * @brief Hard cap on the accumulated size of a single HTTP/2
+         *        request or response body. DATA frames carry no
+         *        upfront length the way HTTP/1.1's Content-Length
+         *        does, and HTTP/2 flow control only paces delivery --
+         *        it does not bound the total bytes a stream can carry
+         *        over its lifetime. Without this cap a peer can stream
+         *        an unbounded body and grow the accumulating
+         *        @c std::string without limit. Matches the 16 MiB
+         *        ceiling @c HttpClient.h and @c WebSocket.cpp already
+         *        enforce elsewhere in Soccer.
+         */
+        inline constexpr std::size_t kHttp2MaxBodyBytes = 16ull * 1024ull * 1024ull;
+    }
+
     // -----------------------------------------------------------------
     // Internal state
     // -----------------------------------------------------------------
@@ -206,9 +222,20 @@ namespace Soccer {
 
         /**
          * @brief on_data_chunk_recv_callback: append @p data bytes to
-         *        the matching stream's response body.
+         *        the matching stream's response body, up to
+         *        @ref kHttp2MaxBodyBytes. A peer that exceeds the cap
+         *        has the stream reset rather than being allowed to
+         *        grow the accumulation buffer without limit. The
+         *        rejection is a one-way latch (@c bodyRejected): a
+         *        single @c nghttp2_submit_rst_stream call does not
+         *        stop nghttp2 from invoking this callback again for
+         *        DATA frames already parsed out of the same
+         *        @c nghttp2_session_mem_recv batch, so clearing the
+         *        body without latching would let the cap silently
+         *        reset itself and keep re-accumulating instead of
+         *        durably rejecting the stream.
          */
-        int onDataChunk(::nghttp2_session * /*session*/,
+        int onDataChunk(::nghttp2_session *session,
                           std::uint8_t /*flags*/,
                           std::int32_t stream_id,
                           const std::uint8_t *data, std::size_t len,
@@ -221,6 +248,15 @@ namespace Soccer {
                 if (it != state->streams.end()) st = it->second.get();
             }
             if (!st) return 0;
+            if (st->bodyRejected) return 0;
+            if (st->response.body.size() + len > kHttp2MaxBodyBytes) {
+                st->bodyRejected = true;
+                st->response.body.clear();
+                st->response.body.shrink_to_fit();
+                ::nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                             stream_id, NGHTTP2_ENHANCE_YOUR_CALM);
+                return 0;
+            }
             st->response.body.append(reinterpret_cast<const char *>(data), len);
             return 0;
         }
@@ -313,6 +349,31 @@ namespace Soccer {
             co_await state->pipe->writeAll(std::span<const std::byte>(
                 reinterpret_cast<const std::byte *>(outBuf.data()),
                 outBuf.size()));
+            co_return;
+        }
+
+        /**
+         * @brief Best-effort GOAWAY drain + pipe teardown, run detached
+         *        via @c coSpawn instead of blocking the caller. Spelled
+         *        as a free (non-lambda) coroutine, not an
+         *        immediately-invoked lambda-coroutine, for the same
+         *        reason @c runServerConnection is below: a lambda's
+         *        captures are not guaranteed to outlive the coroutine
+         *        frame the way a by-value parameter to a named
+         *        coroutine function does. Owns @p state by value
+         *        (shared_ptr), so it stays valid even if the
+         *        @c Http2Connection that triggered the close has
+         *        already been destroyed by the time this runs.
+         */
+        YarnBall::Task<void> closeConnectionAsync(
+            std::shared_ptr<Http2Connection::State> state) {
+            try {
+                co_await drainAndWrite(state);
+            } catch (...) {
+                // Peer already gone; nothing left to flush. Fall
+                // through to close the pipe regardless.
+            }
+            state->pipe->close();
             co_return;
         }
 
@@ -430,6 +491,17 @@ namespace Soccer {
                     }
                     st = std::move(it->second);
                     state->streams.erase(it);
+                }
+                // Checked ahead of errorCode and unconditionally, not
+                // inferred from whatever nghttp2 reports as the
+                // stream's close reason: we know authoritatively (we
+                // set the latch ourselves in onDataChunk) that the
+                // response body was truncated and must not be handed
+                // to the caller as if it were complete.
+                if (st->bodyRejected) {
+                    throw std::runtime_error(
+                        "HTTP/2 response body exceeded the per-stream cap; "
+                        "stream was reset");
                 }
                 if (st->errorCode != 0) {
                     throw std::runtime_error("HTTP/2 stream error: nghttp2 code " +
@@ -584,19 +656,27 @@ namespace Soccer {
 
     void Http2Connection::close() noexcept {
         if (!this->state) return;
-        if (this->state->closed.load(std::memory_order_acquire)) return;
+        // exchange, not load-then-store: makes the "close exactly
+        // once" guard atomic against a concurrent close() (e.g. one
+        // thread's explicit close() racing another's ~Http2Connection
+        // teardown of a moved-from copy) and against the driver
+        // observing EOF at the same time.
+        if (this->state->closed.exchange(true, std::memory_order_acq_rel)) return;
         {
             std::lock_guard<std::mutex> lk(this->state->sessionMu);
             ::nghttp2_submit_goaway(this->state->session, NGHTTP2_FLAG_NONE,
                                      0, NGHTTP2_NO_ERROR, nullptr, 0);
         }
-        // Best-effort drain; if it can't be flushed, the driver will
-        // shut the connection down on the next iteration anyway.
-        try {
-            YarnBall::syncWait(drainAndWrite(this->state));
-        } catch (...) {}
-        this->state->closed.store(true, std::memory_order_release);
-        this->state->pipe->close();
+        // Drain the GOAWAY and close the pipe on the Yarn pool rather
+        // than blocking here with syncWait. close() runs from
+        // ~Http2Connection(), which fires wherever the object goes out
+        // of scope -- including from inside a coroutine running on a
+        // Yarn worker, where syncWait would tie up that worker for the
+        // full round trip; syncWait's own contract explicitly forbids
+        // calling it from a Yarn worker. The spawned task holds
+        // shared_ptr<State> by value, so it stays valid regardless of
+        // this Http2Connection's own lifetime.
+        YarnBall::coSpawn(closeConnectionAsync(this->state));
     }
 
     Http2Connection::Http2Connection(Http2Connection &&other) noexcept
@@ -639,6 +719,17 @@ namespace Soccer {
             std::string respStatusStr;
             bool handlerStarted{false};
             bool responseSubmitted{false};
+            /**
+             * @brief Latched once the accumulated request body exceeds
+             *        the per-stream cap (see kHttp2MaxBodyBytes). Once
+             *        set, serverOnDataChunk stops touching req.body,
+             *        and the driver's dispatch walk skips this stream
+             *        instead of handing a truncated request body to a
+             *        route handler. See onDataChunk's docblock for why
+             *        this must be a one-way latch rather than a
+             *        clear-and-keep-counting reset.
+             */
+            bool bodyRejected{false};
         };
     }
 
@@ -907,7 +998,7 @@ namespace Soccer {
             return 0;
         }
 
-        int serverOnDataChunk(::nghttp2_session * /*session*/,
+        int serverOnDataChunk(::nghttp2_session *session,
                                 std::uint8_t /*flags*/,
                                 std::int32_t stream_id,
                                 const std::uint8_t *data, std::size_t len,
@@ -916,6 +1007,27 @@ namespace Soccer {
             std::lock_guard<std::mutex> lk(state->streamsMu);
             auto it = state->streams.find(stream_id);
             if (it == state->streams.end()) return 0;
+            // Untrusted input: cap accumulated request-body size so a
+            // client cannot force unbounded memory growth by streaming
+            // an ever-larger body across DATA frames (HTTP/2 flow
+            // control only paces delivery; it does not bound the
+            // total). Latched, not a plain clear-and-reset: a single
+            // nghttp2_submit_rst_stream call does not stop nghttp2
+            // from invoking this callback again for DATA frames
+            // already parsed out of the same nghttp2_session_mem_recv
+            // batch, so clearing without latching would let the cap
+            // silently reset itself instead of durably rejecting the
+            // stream (see onDataChunk's docblock, same issue on the
+            // client side).
+            if (it->second->bodyRejected) return 0;
+            if (it->second->req.body.size() + len > kHttp2MaxBodyBytes) {
+                it->second->bodyRejected = true;
+                it->second->req.body.clear();
+                it->second->req.body.shrink_to_fit();
+                ::nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                             stream_id, NGHTTP2_ENHANCE_YOUR_CALM);
+                return 0;
+            }
             it->second->req.body.append(reinterpret_cast<const char *>(data), len);
             return 0;
         }
@@ -1019,6 +1131,19 @@ namespace Soccer {
                 {
                     std::lock_guard<std::mutex> lk(state->streamsMu);
                     for (auto &kv : state->streams) {
+                        // A body-rejected stream was already reset in
+                        // serverOnDataChunk; its req.body is a
+                        // deliberately-cleared partial fragment, not a
+                        // usable request. Skip it here too (rather
+                        // than relying solely on nghttp2 to suppress
+                        // further frame-recv events for a reset
+                        // stream) so a route handler is never invoked
+                        // with a truncated body. Mark it submitted so
+                        // this entry is not re-considered every tick.
+                        if (kv.second->bodyRejected) {
+                            kv.second->responseSubmitted = true;
+                            continue;
+                        }
                         if (kv.second->handlerStarted &&
                             !kv.second->responseSubmitted) {
                             // Move req out; mark responseSubmitted=true

@@ -53,6 +53,17 @@ namespace Soccer {
         inline constexpr std::size_t kHttpMaxHeaderBytes = 64 * 1024;
 
         /**
+         * @brief Maximum number of 1xx interim responses (e.g. a
+         *        proactive "100 Continue") tolerated before the final
+         *        response, per request. Real servers send at most a
+         *        handful (typically one); without a cap, a malicious
+         *        or broken peer sending an endless stream of otherwise-
+         *        valid 1xx responses would keep HttpClient looping
+         *        forever waiting for a final status that never comes.
+         */
+        inline constexpr int kHttpMaxInterimResponses = 8;
+
+        /**
          * @brief Trim leading + trailing ASCII whitespace from @p s
          *        in place. Used to clean up header values after the
          *        @c name:value split.
@@ -98,8 +109,15 @@ namespace Soccer {
      *        header vector, body bytes.
      */
     struct HttpResponse {
-        /// HTTP status (e.g. 200, 404).
-        int status = 0;
+        /// HTTP status (e.g. 200, 404). Defaults to 200, not 0: this
+        /// struct is also what a server route handler constructs and
+        /// returns (see HttpServer.h), and a handler that forgets to
+        /// set status on a success response is a far more common
+        /// mistake than one that means to send status 0. Parsing a
+        /// real response (HttpClient's readResponse) always
+        /// overwrites this from the wire, so the default only matters
+        /// for a freshly-constructed HttpResponse.
+        int status = 200;
 
         /// Reason phrase from the status line (e.g. "OK").
         std::string reason;
@@ -298,15 +316,121 @@ namespace Soccer {
 
     private:
         /**
+         * @brief Shared response-parsing path used by both @ref request
+         *        and @ref pooledRequest: read the status line, skip
+         *        past any 1xx interim responses (e.g. a proactively
+         *        sent "100 Continue" ahead of the real answer -- some
+         *        servers send these unconditionally for requests with
+         *        a body, without the client asking for them), read the
+         *        final status line + headers, then frame the body.
+         *
+         *        Per RFC 9110 §6.4.1 / §15.4.5, a @c 204 or @c 304
+         *        response never carries a body regardless of any
+         *        @c Content-Length header -- servers legitimately send
+         *        @c Content-Length on a @c 304 reflecting the cached
+         *        resource's length, purely for bookkeeping. Treating
+         *        that as a real body to read would wait forever for
+         *        bytes an RFC-compliant server will never send (the
+         *        connection has no reason to close: it's sitting at a
+         *        clean boundary waiting for the next request). Such
+         *        responses are handled first and unconditionally
+         *        report no body, before Content-Length is even
+         *        consulted -- this also covers the equally-broken case
+         *        where such a response has NO Content-Length at all,
+         *        which would otherwise fall into the read-to-EOF path
+         *        and hang exactly the same way.
+         *
+         * @param[out] outStreamReusable @c true iff the stream is left
+         *        at a clean next-message boundary that a caller may
+         *        safely pool (a body-forbidden response, or one framed
+         *        by a valid, present Content-Length); @c false for an
+         *        EOF-framed (identity) response, where the socket must
+         *        be read to closure and cannot be reused.
+         */
+        static YarnBall::Task<HttpResponse> readResponse(
+            BufferedReader<TcpStream> &r, bool &outStreamReusable) {
+            outStreamReusable = false;
+            HttpResponse resp;
+
+            // Loop past any 1xx interim response(s) to the real,
+            // final status line + header block. Bounded by
+            // kHttpMaxInterimResponses so a peer sending an endless
+            // stream of otherwise-valid 1xx responses cannot hang this
+            // loop forever.
+            for (int interimCount = 0; ; ++interimCount) {
+                if (interimCount >= detail::kHttpMaxInterimResponses) {
+                    throw std::runtime_error(
+                        "HttpClient: too many 1xx interim responses");
+                }
+                resp = HttpResponse{};
+                std::string status_line = co_await r.readLine();
+                if (status_line.empty()) {
+                    throw std::runtime_error(
+                        "HttpClient: connection closed before status line");
+                }
+                HttpClient::parseStatusLine(status_line, resp);
+
+                std::size_t header_bytes = status_line.size();
+                while (true) {
+                    std::string line = co_await r.readLine();
+                    header_bytes += line.size();
+                    if (header_bytes > detail::kHttpMaxHeaderBytes) {
+                        throw std::runtime_error("HttpClient: header block too large");
+                    }
+                    if (line.empty() || line == "\r\n" || line == "\n") break;
+                    HttpClient::parseHeaderLine(line, resp);
+                }
+
+                if (resp.status < 100 || resp.status >= 200) break;
+                // 1xx: no body ever accompanies it: discard and loop
+                // for the response it precedes.
+            }
+
+            if (resp.status == 204 || resp.status == 304) {
+                // No body by definition; stream is already at the next
+                // message boundary (nothing beyond the headers was
+                // ever sent), so it's safe to pool.
+                outStreamReusable = true;
+                co_return resp;
+            }
+
+            const std::string clen = resp.header("Content-Length");
+            if (!clen.empty()) {
+                const long long len = std::atoll(clen.c_str());
+                if (len < 0 ||
+                    static_cast<std::size_t>(len) > detail::kHttpMaxBodyBytes) {
+                    throw std::runtime_error("HttpClient: invalid Content-Length");
+                }
+                auto bytes = co_await r.readExact(static_cast<std::size_t>(len));
+                resp.body.assign(reinterpret_cast<const char *>(bytes.data()),
+                                 bytes.size());
+                outStreamReusable = true;
+            } else {
+                // Identity-framed: read to EOF; cannot pool afterwards.
+                std::string body_acc;
+                while (!r.eof()) {
+                    auto chunk = co_await r.readExact(4096);
+                    if (chunk.empty()) break;
+                    if (body_acc.size() + chunk.size() > detail::kHttpMaxBodyBytes) {
+                        throw std::runtime_error("HttpClient: body too large");
+                    }
+                    body_acc.append(reinterpret_cast<const char *>(chunk.data()),
+                                    chunk.size());
+                }
+                resp.body = std::move(body_acc);
+                outStreamReusable = false;
+            }
+            co_return resp;
+        }
+
+        /**
          * @brief Pooled-connection request flow. Acquires from the
          *        default pool, sends with @c Connection: keep-alive,
-         *        parses the response, and returns the connection to
-         *        the pool when:
-         *          - the response has a finite Content-Length, AND
-         *          - the response did not include @c Connection: close.
-         *        Otherwise the stream is dropped (closed). Identity-
-         *        framed (EOF-framed) responses cannot be pooled
-         *        because we cannot tell where the next message starts.
+         *        parses the response via @ref readResponse, and
+         *        returns the connection to the pool when the parse
+         *        left the stream at a clean boundary AND the response
+         *        did not include @c Connection: close. Otherwise the
+         *        stream is dropped (closed).
          */
         static YarnBall::Task<HttpResponse> pooledRequest(
             std::string method,
@@ -345,57 +469,12 @@ namespace Soccer {
             }
 
             BufferedReader<TcpStream> r(&stream);
-            HttpResponse resp;
+            bool reusable = false;
+            HttpResponse resp = co_await HttpClient::readResponse(r, reusable);
 
-            std::string status_line = co_await r.readLine();
-            if (status_line.empty()) {
-                throw std::runtime_error("HttpClient: connection closed before status line");
-            }
-            HttpClient::parseStatusLine(status_line, resp);
-
-            std::size_t header_bytes = status_line.size();
-            while (true) {
-                std::string line = co_await r.readLine();
-                header_bytes += line.size();
-                if (header_bytes > detail::kHttpMaxHeaderBytes) {
-                    throw std::runtime_error("HttpClient: header block too large");
-                }
-                if (line.empty() || line == "\r\n" || line == "\n") break;
-                HttpClient::parseHeaderLine(line, resp);
-            }
-
-            const std::string clen = resp.header("Content-Length");
-            bool reusable = !clen.empty();
-            if (reusable) {
-                const long long len = std::atoll(clen.c_str());
-                if (len < 0 ||
-                    static_cast<std::size_t>(len) > detail::kHttpMaxBodyBytes) {
-                    throw std::runtime_error("HttpClient: invalid Content-Length");
-                }
-                auto bytes = co_await r.readExact(static_cast<std::size_t>(len));
-                resp.body.assign(reinterpret_cast<const char *>(bytes.data()),
-                                 bytes.size());
-            } else {
-                // Identity-framed: read to EOF; cannot pool afterwards.
-                std::string body_acc;
-                while (!r.eof()) {
-                    auto chunk = co_await r.readExact(4096);
-                    if (chunk.empty()) break;
-                    if (body_acc.size() + chunk.size() > detail::kHttpMaxBodyBytes) {
-                        throw std::runtime_error("HttpClient: body too large");
-                    }
-                    body_acc.append(reinterpret_cast<const char *>(chunk.data()),
-                                    chunk.size());
-                }
-                resp.body = std::move(body_acc);
-                reusable = false;
-            }
-
-            // Return the connection to the pool only if the server
-            // didn't explicitly close it and the response was a
-            // discrete length. BufferedReader has consumed exactly
-            // Content-Length bytes; the stream is at the next
-            // request boundary.
+            // Return the connection to the pool only if the parse left
+            // it at a clean boundary and the server didn't explicitly
+            // close it.
             if (reusable && !detail::iequalsAscii(resp.header("Connection"), "close")) {
                 pool.release(host, port, std::move(stream));
             }
@@ -443,54 +522,8 @@ namespace Soccer {
             // Parse the response with a BufferedReader so we can do
             // line-based header parsing without per-byte read calls.
             BufferedReader<TcpStream> r(&stream);
-
-            HttpResponse resp;
-
-            // -- Status line: "HTTP/1.1 200 OK\r\n"
-            std::string status_line = co_await r.readLine();
-            if (status_line.empty()) {
-                throw std::runtime_error("HttpClient: connection closed before status line");
-            }
-            HttpClient::parseStatusLine(status_line, resp);
-
-            // -- Headers until blank line.
-            std::size_t header_bytes = status_line.size();
-            while (true) {
-                std::string line = co_await r.readLine();
-                header_bytes += line.size();
-                if (header_bytes > detail::kHttpMaxHeaderBytes) {
-                    throw std::runtime_error("HttpClient: header block too large");
-                }
-                if (line.empty() || line == "\r\n" || line == "\n") break;
-                HttpClient::parseHeaderLine(line, resp);
-            }
-
-            // -- Body: Content-Length-framed if present, else
-            // read-to-EOF (matches Connection: close semantics).
-            const std::string clen = resp.header("Content-Length");
-            if (!clen.empty()) {
-                const long long len = std::atoll(clen.c_str());
-                if (len < 0 ||
-                    static_cast<std::size_t>(len) > detail::kHttpMaxBodyBytes) {
-                    throw std::runtime_error("HttpClient: invalid Content-Length");
-                }
-                auto bytes = co_await r.readExact(static_cast<std::size_t>(len));
-                resp.body.assign(reinterpret_cast<const char *>(bytes.data()),
-                                 bytes.size());
-            } else {
-                // EOF-framed: drain until the peer half-closes.
-                std::string body_acc;
-                while (!r.eof()) {
-                    auto chunk = co_await r.readExact(4096);
-                    if (chunk.empty()) break;
-                    if (body_acc.size() + chunk.size() > detail::kHttpMaxBodyBytes) {
-                        throw std::runtime_error("HttpClient: body too large");
-                    }
-                    body_acc.append(reinterpret_cast<const char *>(chunk.data()),
-                                    chunk.size());
-                }
-                resp.body = std::move(body_acc);
-            }
+            bool reusable = false; // unused: this connection is never pooled.
+            HttpResponse resp = co_await HttpClient::readResponse(r, reusable);
             co_return resp;
         }
 
