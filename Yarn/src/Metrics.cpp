@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstring>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 
 namespace YarnBall::metrics {
@@ -80,10 +81,36 @@ namespace YarnBall::metrics {
         return r;
     }
 
+    namespace {
+        /**
+         * @brief The registry's own doc comment promises "a metric is
+         *        uniquely identified by name" across all three metric
+         *        kinds, but counters/gauges/histograms live in three
+         *        separate maps -- nothing enforced that promise. A
+         *        name collision across kinds left one object silently
+         *        unreachable from scrape() and made scrape() emit the
+         *        other kind's TYPE/value block twice (once per
+         *        registrationOrder entry), which is invalid Prometheus
+         *        exposition format and can get the whole /metrics
+         *        response rejected by a scraper. Failing loud at the
+         *        actual registration call site turns that into an
+         *        immediately attributable error instead of a deferred,
+         *        silent observability corruption.
+         */
+        [[noreturn]] void throwNameCollision(const std::string &name) {
+            throw std::logic_error(
+                "metrics::Registry: \"" + name +
+                "\" already registered as a different metric type");
+        }
+    }
+
     Counter &Registry::counter(const std::string &name, const std::string &help) {
         std::lock_guard<std::mutex> lk(this->mu);
         auto it = this->counters.find(name);
         if (it != this->counters.end()) return *it->second;
+        if (this->gauges.count(name) || this->histograms.count(name)) {
+            throwNameCollision(name);
+        }
         auto [ins, _] = this->counters.emplace(name, std::make_unique<Counter>(help));
         this->registrationOrder.push_back(name);
         return *ins->second;
@@ -93,6 +120,9 @@ namespace YarnBall::metrics {
         std::lock_guard<std::mutex> lk(this->mu);
         auto it = this->gauges.find(name);
         if (it != this->gauges.end()) return *it->second;
+        if (this->counters.count(name) || this->histograms.count(name)) {
+            throwNameCollision(name);
+        }
         auto [ins, _] = this->gauges.emplace(name, std::make_unique<Gauge>(help));
         this->registrationOrder.push_back(name);
         return *ins->second;
@@ -104,6 +134,9 @@ namespace YarnBall::metrics {
         std::lock_guard<std::mutex> lk(this->mu);
         auto it = this->histograms.find(name);
         if (it != this->histograms.end()) return *it->second;
+        if (this->counters.count(name) || this->gauges.count(name)) {
+            throwNameCollision(name);
+        }
         auto [ins, _] = this->histograms.emplace(
             name, std::make_unique<Histogram>(std::move(buckets), help));
         this->registrationOrder.push_back(name);
