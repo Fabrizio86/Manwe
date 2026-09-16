@@ -69,6 +69,17 @@ namespace Soccer {
                                 std::size_t capacity =
                                 detail::kBufferedReaderDefaultCapacity)
             : stream(stream), buf(capacity), readPos(0), writePos(0) {
+            // A zero-capacity buffer gives refill() zero headroom, so
+            // it would return without ever calling stream->read() and
+            // without setting eofObserved -- every subsequent
+            // readExact/readUntilDelim would then see readPos ==
+            // writePos still true and return an empty result forever,
+            // indistinguishable from genuine EOF, even against a
+            // healthy connection with data waiting. Reject it at
+            // construction instead of degrading silently at first use.
+            if (capacity == 0) {
+                throw SocketException("BufferedReader: capacity must be > 0");
+            }
         }
 
         BufferedReader(const BufferedReader &) = delete;
