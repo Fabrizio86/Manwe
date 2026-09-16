@@ -149,45 +149,75 @@ namespace Soccer {
         co_return TcpStream(fd);
     }
 
+    namespace {
+        /**
+         * @brief Attempt one connect to @p addr. Throws SocketException
+         *        on any failure; the fd is always closed before
+         *        throwing, so a failed attempt never leaks.
+         */
+        YarnBall::Task<TcpStream> tryConnect(const SocketAddress &addr) {
+            const int fd = static_cast<int>(::socket(addr.family(), SOCK_STREAM, 0));
+            if (fd < 0) throw SocketException("socket", YarnBall::lastSocketError());
+
+            try {
+                set_nonblocking(fd);
+            } catch (...) {
+                (void) YarnBall::closeSocket(fd);
+                throw;
+            }
+
+            int rc = ::connect(fd, addr.data(), addr.length());
+            if (rc < 0) {
+                const int err = YarnBall::lastSocketError();
+                if (!YarnBall::isInProgress(err)) {
+                    (void) YarnBall::closeSocket(fd);
+                    throw SocketException("connect", err);
+                }
+                // EINPROGRESS / WSAEWOULDBLOCK: wait for writability, then
+                // check SO_ERROR to see whether the handshake completed.
+                co_await YarnBall::io::waitWritable(fd);
+                int sockerr = 0;
+                socklen_t errlen = sizeof(sockerr);
+                if (::getsockopt(fd, SOL_SOCKET, SO_ERROR,
+                                 reinterpret_cast<char *>(&sockerr), &errlen) < 0) {
+                    const int e = YarnBall::lastSocketError();
+                    (void) YarnBall::closeSocket(fd);
+                    throw SocketException("getsockopt(SO_ERROR)", e);
+                }
+                if (sockerr != 0) {
+                    (void) YarnBall::closeSocket(fd);
+                    throw SocketException("connect (async)", sockerr);
+                }
+            }
+
+            co_return TcpStream(fd);
+        }
+    }
+
     YarnBall::Task<TcpStream> tcpConnect(std::string host, std::uint16_t port) {
         YarnBall::ensureWsaStarted();
-        auto addr = SocketAddress::resolve(host, port);
+        // Try every candidate getaddrinfo returned, not just the
+        // first: a host with multiple A/AAAA records (load-balanced
+        // services, CDNs, multi-homed backends) may have working
+        // addresses beyond the head of the list. Only the LAST
+        // candidate's failure is surfaced to the caller; earlier
+        // failures just move on to the next address. resolveAllAsync
+        // hops to a worker before the blocking getaddrinfo call, same
+        // as the single-address resolveAsync this replaces.
+        auto all = co_await SocketAddress::resolveAllAsync(host, port);
 
-        const int fd = static_cast<int>(::socket(addr.family(), SOCK_STREAM, 0));
-        if (fd < 0) throw SocketException("socket", YarnBall::lastSocketError());
-
-        try {
-            set_nonblocking(fd);
-        } catch (...) {
-            (void) YarnBall::closeSocket(fd);
-            throw;
-        }
-
-        int rc = ::connect(fd, addr.data(), addr.length());
-        if (rc < 0) {
-            const int err = YarnBall::lastSocketError();
-            if (!YarnBall::isInProgress(err)) {
-                (void) YarnBall::closeSocket(fd);
-                throw SocketException("connect", err);
-            }
-            // EINPROGRESS / WSAEWOULDBLOCK: wait for writability, then
-            // check SO_ERROR to see whether the handshake completed.
-            co_await YarnBall::io::waitWritable(fd);
-            int sockerr = 0;
-            socklen_t errlen = sizeof(sockerr);
-            if (::getsockopt(fd, SOL_SOCKET, SO_ERROR,
-                             reinterpret_cast<char *>(&sockerr), &errlen) < 0) {
-                const int e = YarnBall::lastSocketError();
-                (void) YarnBall::closeSocket(fd);
-                throw SocketException("getsockopt(SO_ERROR)", e);
-            }
-            if (sockerr != 0) {
-                (void) YarnBall::closeSocket(fd);
-                throw SocketException("connect (async)", sockerr);
+        for (std::size_t i = 0; i < all.size(); ++i) {
+            try {
+                co_return co_await tryConnect(all[i]);
+            } catch (const SocketException &) {
+                if (i + 1 == all.size()) throw;
+                // else: this candidate failed, try the next one.
             }
         }
-
-        co_return TcpStream(fd);
+        // Unreachable: resolveAll() never returns an empty vector on
+        // success, so the loop above always either returns or
+        // rethrows on its last iteration.
+        throw SocketException("tcpConnect: no addresses to try");
     }
 
 }

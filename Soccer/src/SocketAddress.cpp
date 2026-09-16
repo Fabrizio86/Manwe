@@ -29,7 +29,14 @@ namespace Soccer {
         co_return SocketAddress::resolve(host, port);
     }
 
-    SocketAddress SocketAddress::resolve(const std::string &host, std::uint16_t port) {
+    YarnBall::Task<std::vector<SocketAddress>> SocketAddress::resolveAllAsync(
+        std::string host, std::uint16_t port) {
+        co_await YarnBall::scheduleOn(YarnBall::Yarn::instance());
+        co_return SocketAddress::resolveAll(host, port);
+    }
+
+    std::vector<SocketAddress> SocketAddress::resolveAll(const std::string &host,
+                                                           std::uint16_t port) {
         // getaddrinfo on Windows requires WSAStartup; idempotent + cheap.
         YarnBall::ensureWsaStarted();
 
@@ -47,9 +54,25 @@ namespace Soccer {
             throw SocketException(std::string("getaddrinfo: ") + ::gai_strerror(rc), rc);
         }
 
-        SocketAddress addr(results->ai_addr, static_cast<socklen_t>(results->ai_addrlen));
+        // Collect every candidate, not just the first: a host with
+        // multiple A/AAAA records (load-balanced services, CDNs, any
+        // multi-homed backend) may have working addresses beyond the
+        // head of the list, and a caller doing a real connection
+        // attempt (tcpConnect) wants to fall back to the next one
+        // instead of failing outright when the first is unreachable.
+        std::vector<SocketAddress> out;
+        for (addrinfo *p = results; p != nullptr; p = p->ai_next) {
+            out.emplace_back(p->ai_addr, static_cast<socklen_t>(p->ai_addrlen));
+        }
         ::freeaddrinfo(results);
-        return addr;
+        return out;
+    }
+
+    SocketAddress SocketAddress::resolve(const std::string &host, std::uint16_t port) {
+        // resolveAll() throws on failure and never returns an empty
+        // vector on success (the list it walks always starts from a
+        // non-null `results`), so .front() is safe here.
+        return SocketAddress::resolveAll(host, port).front();
     }
 
     std::uint16_t SocketAddress::port() const noexcept {
