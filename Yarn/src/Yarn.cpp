@@ -59,6 +59,38 @@ namespace YarnBall {
         constexpr size_t kGrowBacklogThreshold = 64;
 
         /**
+         * @brief Bound on how many times @ref Yarn::enqueueInjection's
+         *        last-resort inline-execution fallback may recurse on
+         *        one thread before refusing further submissions
+         *        outright.
+         *
+         *        Inline execution (running the task synchronously on
+         *        the submitting thread) is the standard backpressure
+         *        fallback once the local deque, every probed peer
+         *        inbox, and the central injection queue are all full.
+         *        But a task run this way may itself submit further
+         *        work (coSpawn / scheduleOn) which re-enters dispatch
+         *        on the same thread and, under sustained saturation
+         *        (the exact condition this fallback exists for), lands
+         *        back in this same inline path -- as a nested native
+         *        call, not an independent scheduler hop. A chained
+         *        fan-out (e.g. a pipeline coroutine tree) can then grow
+         *        the call stack without bound instead of receiving
+         *        backpressure. Capping the recursion turns that into an
+         *        explicit rejection the caller can react to (retry,
+         *        503, drop) rather than a stack-overflow crash at peak
+         *        load.
+         */
+        constexpr int kMaxInlineFallbackDepth = 8;
+
+        /**
+         * @brief Per-thread nesting depth of the inline-execution
+         *        fallback in @ref Yarn::enqueueInjection. See
+         *        @ref kMaxInlineFallbackDepth.
+         */
+        thread_local int tlsInlineFallbackDepth = 0;
+
+        /**
          * @brief Internal adapter that lets a shared_ptr-owned task flow
          *        through the executor as a raw @c ITask*. The shared_ptr
          *        ref-count is touched exactly once on submission and once on
@@ -258,6 +290,23 @@ namespace YarnBall {
                 if (this->fibers[newId] && this->fibers[newId]->seed(task)) return;
             }
         }
+
+        // See kMaxInlineFallbackDepth: past this bound we refuse the
+        // submission outright instead of recursing further.
+        if (tlsInlineFallbackDepth >= kMaxInlineFallbackDepth) {
+            try {
+                task->exception(std::make_exception_ptr(std::runtime_error(
+                    "Yarn: submission rejected -- pool and queues are exhausted "
+                    "and the inline-fallback recursion budget ran out")));
+            } catch (...) { }
+            delete task;
+            return;
+        }
+
+        struct DepthGuard {
+            DepthGuard() noexcept { ++tlsInlineFallbackDepth; }
+            ~DepthGuard() noexcept { --tlsInlineFallbackDepth; }
+        } depthGuard;
 
         try { task->run(); } catch (...) {
             try { task->exception(std::current_exception()); } catch (...) { }

@@ -10,6 +10,7 @@
 #include <coroutine>
 #include <mutex>
 #include <thread>
+#include <vector>
 
 #if defined(__linux__) && defined(YARN_USE_IO_URING)
 // liburing's struct, forward-declared so we don't pull <liburing.h> into
@@ -211,6 +212,24 @@ namespace YarnBall {
          * @brief eventfd used to wake the event loop on @ref stop.
          */
         int wakefd = -1;
+
+        /**
+         * @brief Heap-allocated @c TimerEntry pointers (opaque here;
+         *        the concrete type lives in Reactor.cpp) created by
+         *        @ref registerTimer that have not yet fired or been
+         *        freed. The run loop removes an entry (and deletes it)
+         *        when its timer fires; @c ~Reactor reclaims any left
+         *        over when the loop exits with timers still pending,
+         *        so a Reactor destroyed mid-flight does not leak them.
+         *        Guarded by @ref timerSetMu.
+         */
+        std::vector<void *> pendingTimers;
+
+        /**
+         * @brief Guards @ref pendingTimers against concurrent
+         *        registerTimer callers and the run-loop thread.
+         */
+        std::mutex timerSetMu;
 #elif defined(_WIN32)
         /**
          * @brief Opaque pointer to the Windows backend state (IOCP handle,
