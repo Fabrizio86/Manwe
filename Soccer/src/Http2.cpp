@@ -225,7 +225,15 @@ namespace Soccer {
          *        the matching stream's response body, up to
          *        @ref kHttp2MaxBodyBytes. A peer that exceeds the cap
          *        has the stream reset rather than being allowed to
-         *        grow the accumulation buffer without limit.
+         *        grow the accumulation buffer without limit. The
+         *        rejection is a one-way latch (@c bodyRejected): a
+         *        single @c nghttp2_submit_rst_stream call does not
+         *        stop nghttp2 from invoking this callback again for
+         *        DATA frames already parsed out of the same
+         *        @c nghttp2_session_mem_recv batch, so clearing the
+         *        body without latching would let the cap silently
+         *        reset itself and keep re-accumulating instead of
+         *        durably rejecting the stream.
          */
         int onDataChunk(::nghttp2_session *session,
                           std::uint8_t /*flags*/,
@@ -240,7 +248,9 @@ namespace Soccer {
                 if (it != state->streams.end()) st = it->second.get();
             }
             if (!st) return 0;
+            if (st->bodyRejected) return 0;
             if (st->response.body.size() + len > kHttp2MaxBodyBytes) {
+                st->bodyRejected = true;
                 st->response.body.clear();
                 st->response.body.shrink_to_fit();
                 ::nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
@@ -482,6 +492,17 @@ namespace Soccer {
                     st = std::move(it->second);
                     state->streams.erase(it);
                 }
+                // Checked ahead of errorCode and unconditionally, not
+                // inferred from whatever nghttp2 reports as the
+                // stream's close reason: we know authoritatively (we
+                // set the latch ourselves in onDataChunk) that the
+                // response body was truncated and must not be handed
+                // to the caller as if it were complete.
+                if (st->bodyRejected) {
+                    throw std::runtime_error(
+                        "HTTP/2 response body exceeded the per-stream cap; "
+                        "stream was reset");
+                }
                 if (st->errorCode != 0) {
                     throw std::runtime_error("HTTP/2 stream error: nghttp2 code " +
                                               std::to_string(st->errorCode));
@@ -698,6 +719,17 @@ namespace Soccer {
             std::string respStatusStr;
             bool handlerStarted{false};
             bool responseSubmitted{false};
+            /**
+             * @brief Latched once the accumulated request body exceeds
+             *        the per-stream cap (see kHttp2MaxBodyBytes). Once
+             *        set, serverOnDataChunk stops touching req.body,
+             *        and the driver's dispatch walk skips this stream
+             *        instead of handing a truncated request body to a
+             *        route handler. See onDataChunk's docblock for why
+             *        this must be a one-way latch rather than a
+             *        clear-and-keep-counting reset.
+             */
+            bool bodyRejected{false};
         };
     }
 
@@ -979,9 +1011,17 @@ namespace Soccer {
             // client cannot force unbounded memory growth by streaming
             // an ever-larger body across DATA frames (HTTP/2 flow
             // control only paces delivery; it does not bound the
-            // total). Reset the stream instead of buffering past the
-            // cap.
+            // total). Latched, not a plain clear-and-reset: a single
+            // nghttp2_submit_rst_stream call does not stop nghttp2
+            // from invoking this callback again for DATA frames
+            // already parsed out of the same nghttp2_session_mem_recv
+            // batch, so clearing without latching would let the cap
+            // silently reset itself instead of durably rejecting the
+            // stream (see onDataChunk's docblock, same issue on the
+            // client side).
+            if (it->second->bodyRejected) return 0;
             if (it->second->req.body.size() + len > kHttp2MaxBodyBytes) {
+                it->second->bodyRejected = true;
                 it->second->req.body.clear();
                 it->second->req.body.shrink_to_fit();
                 ::nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
@@ -1091,6 +1131,19 @@ namespace Soccer {
                 {
                     std::lock_guard<std::mutex> lk(state->streamsMu);
                     for (auto &kv : state->streams) {
+                        // A body-rejected stream was already reset in
+                        // serverOnDataChunk; its req.body is a
+                        // deliberately-cleared partial fragment, not a
+                        // usable request. Skip it here too (rather
+                        // than relying solely on nghttp2 to suppress
+                        // further frame-recv events for a reset
+                        // stream) so a route handler is never invoked
+                        // with a truncated body. Mark it submitted so
+                        // this entry is not re-considered every tick.
+                        if (kv.second->bodyRejected) {
+                            kv.second->responseSubmitted = true;
+                            continue;
+                        }
                         if (kv.second->handlerStarted &&
                             !kv.second->responseSubmitted) {
                             // Move req out; mark responseSubmitted=true
