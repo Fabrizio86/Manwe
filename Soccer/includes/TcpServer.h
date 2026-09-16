@@ -53,15 +53,28 @@ namespace Soccer {
      *                  what makes the spawn ergonomic; the handler can
      *                  internally co_await other tasks freely.
      * @param stop     Cooperative stop token. When stopped, a
-     *                  @c stop_callback closes the listener fd to
-     *                  unblock any pending @c accept; the resulting
-     *                  @c SocketException is consumed silently and
-     *                  the loop returns.
+     *                  @c stop_callback makes a brief loopback
+     *                  connection to the listener's own bound address
+     *                  to unblock any pending @c accept (closing the
+     *                  fd alone does not reliably wake a kqueue-
+     *                  suspended accept on macOS); the loop then
+     *                  observes @c stop_requested() and returns.
      *
      * @note In-flight handlers are NOT cancelled when @p stop fires --
      *       C++ coroutines have no forced cancellation. If you want
      *       handlers to shorten, plumb @p stop through to them and
      *       have them check it cooperatively.
+     *
+     * @note The loopback connection used to unblock a pending accept
+     *       on stop is itself accepted and dispatched through
+     *       @p handler exactly like a real client -- it just closes
+     *       immediately without sending anything. Handlers should
+     *       already tolerate a connection that yields immediate EOF
+     *       (a routine occurrence with real clients too: health-check
+     *       probes, port scanners, failed TLS negotiations), but if
+     *       yours does something observable (log a connection event,
+     *       bump a counter) before its first read, expect exactly one
+     *       such event per graceful shutdown.
      */
     inline YarnBall::Task<void>
     tcpServe(TcpListener listener,
