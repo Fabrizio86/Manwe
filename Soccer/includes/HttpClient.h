@@ -109,8 +109,15 @@ namespace Soccer {
      *        header vector, body bytes.
      */
     struct HttpResponse {
-        /// HTTP status (e.g. 200, 404).
-        int status = 0;
+        /// HTTP status (e.g. 200, 404). Defaults to 200, not 0: this
+        /// struct is also what a server route handler constructs and
+        /// returns (see HttpServer.h), and a handler that forgets to
+        /// set status on a success response is a far more common
+        /// mistake than one that means to send status 0. Parsing a
+        /// real response (HttpClient's readResponse) always
+        /// overwrites this from the wire, so the default only matters
+        /// for a freshly-constructed HttpResponse.
+        int status = 200;
 
         /// Reason phrase from the status line (e.g. "OK").
         std::string reason;

@@ -254,6 +254,26 @@ namespace Soccer {
             }
 
             // -- Body (Content-Length-framed only; if absent, body is empty).
+            //
+            // Transfer-Encoding is checked and rejected BEFORE looking
+            // at Content-Length, not silently ignored: chunked framing
+            // isn't implemented (documented limitation), but silently
+            // treating a Transfer-Encoding: chunked request as if it
+            // had no body would drop the client's actual body bytes
+            // unread on the wire with no error anywhere. Worse, RFC
+            // 9112 6.1 requires REJECTING a request that carries both
+            // Transfer-Encoding and Content-Length outright, because a
+            // server that picks one while a front-end proxy in front
+            // of it picks the other is exactly the CL.TE request-
+            // smuggling primitive (the two disagree about where this
+            // request ends and the next one begins on the same
+            // connection). Throwing here for ANY Transfer-Encoding
+            // closes both the data-loss bug and the smuggling gap in
+            // one check, without needing to detect the conflict case
+            // specially.
+            if (!req.header("Transfer-Encoding").empty()) {
+                throw SocketException("HttpServer: Transfer-Encoding not supported");
+            }
             const std::string clen = req.header("Content-Length");
             if (!clen.empty()) {
                 const long long len = std::atoll(clen.c_str());
@@ -274,8 +294,17 @@ namespace Soccer {
          */
         static YarnBall::Task<void> writeResponse(TcpStream &client,
                                                     const HttpResponse &resp) {
+            // Defends against a route handler that explicitly sets an
+            // out-of-range status (not just the "forgot to set it"
+            // case the 200 default handles): a status outside
+            // [100, 599] is not a valid HTTP status line and most
+            // clients/proxies cannot parse it, so degrade to 500
+            // rather than putting an unparseable status line on the
+            // wire.
+            const int status = (resp.status >= 100 && resp.status <= 599)
+                ? resp.status : 500;
             std::string head =
-                "HTTP/1.1 " + std::to_string(resp.status) + " " +
+                "HTTP/1.1 " + std::to_string(status) + " " +
                 (resp.reason.empty() ? std::string("OK") : resp.reason) +
                 "\r\n";
             // User-supplied headers, then the auto-added ones.
