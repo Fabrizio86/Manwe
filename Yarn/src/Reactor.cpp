@@ -443,28 +443,58 @@ namespace YarnBall {
         (void) ::write(this->wakefd, &v, sizeof(v));
     }
 
-    void Reactor::registerReadable(int fd, std::coroutine_handle<> h) noexcept {
+    namespace {
+        /// Low-bit tag for "this event is for an fd": data.u64 = fd << 2 | 3 (0 handle, 1 wakeup sentinel, 2 timer).
+        constexpr std::uint64_t kFdTag = 0x3;
+        inline std::uint64_t tagFd(int fd) { return (static_cast<std::uint64_t>(static_cast<std::uint32_t>(fd)) << 2) | kFdTag; }
+        inline bool isFdEvent(std::uint64_t u) { return (u & 0x3) == kFdTag; }
+        inline int untagFd(std::uint64_t u) { return static_cast<int>(static_cast<std::uint32_t>(u >> 2)); }
+    }
+
+    bool Reactor::armFdLocked(int fd, const FdWaiters &w) noexcept {
         struct epoll_event ev{};
-        ev.events = EPOLLIN | EPOLLONESHOT;
-        ev.data.ptr = h.address();
-        if (::epoll_ctl(this->epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
-            if (errno == EEXIST) {
-                if (::epoll_ctl(this->epfd, EPOLL_CTL_MOD, fd, &ev) == 0) return;
+        ev.events = EPOLLONESHOT | (w.readH ? EPOLLIN : 0u) | (w.writeH ? EPOLLOUT : 0u);
+        ev.data.u64 = tagFd(fd);
+        if (::epoll_ctl(this->epfd, EPOLL_CTL_ADD, fd, &ev) == 0) return true;
+        if (errno == EEXIST && ::epoll_ctl(this->epfd, EPOLL_CTL_MOD, fd, &ev) == 0) return true;
+        return false;
+    }
+
+    void Reactor::registerFd(int fd, std::coroutine_handle<> h, bool writable) noexcept {
+        std::vector<void *> refused;
+        {
+            std::lock_guard<std::mutex> lk(this->fdMu);
+            FdWaiters &w = this->fdWaiters[fd];
+            // A fresh kernel registration (ADD succeeds) means the fd is new (a closed fd's registration is gone with it), so a
+            // waiter still recorded for the OTHER direction belongs to a closed fd: it can never be resumed, drop it.
+            (writable ? w.writeH : w.readH) = h.address();
+            struct epoll_event ev{};
+            ev.events = EPOLLONESHOT | (w.readH ? EPOLLIN : 0u) | (w.writeH ? EPOLLOUT : 0u);
+            ev.data.u64 = tagFd(fd);
+            bool ok = false;
+            if (::epoll_ctl(this->epfd, EPOLL_CTL_ADD, fd, &ev) == 0) {
+                // New registration: only this call's waiter is real.
+                if (writable) w.readH = nullptr; else w.writeH = nullptr;
+                ev.events = EPOLLONESHOT | (writable ? EPOLLOUT : EPOLLIN);
+                ok = ::epoll_ctl(this->epfd, EPOLL_CTL_MOD, fd, &ev) == 0;
+            } else if (errno == EEXIST) {
+                ok = ::epoll_ctl(this->epfd, EPOLL_CTL_MOD, fd, &ev) == 0;
             }
-            this->schedule(h);
+            if (!ok) {
+                if (w.readH) refused.push_back(w.readH);
+                if (w.writeH) refused.push_back(w.writeH);
+                this->fdWaiters.erase(fd);
+            }
         }
+        for (void *p : refused) this->schedule(std::coroutine_handle<>::from_address(p));
+    }
+
+    void Reactor::registerReadable(int fd, std::coroutine_handle<> h) noexcept {
+        this->registerFd(fd, h, /*writable=*/false);
     }
 
     void Reactor::registerWritable(int fd, std::coroutine_handle<> h) noexcept {
-        struct epoll_event ev{};
-        ev.events = EPOLLOUT | EPOLLONESHOT;
-        ev.data.ptr = h.address();
-        if (::epoll_ctl(this->epfd, EPOLL_CTL_ADD, fd, &ev) < 0) {
-            if (errno == EEXIST) {
-                if (::epoll_ctl(this->epfd, EPOLL_CTL_MOD, fd, &ev) == 0) return;
-            }
-            this->schedule(h);
-        }
+        this->registerFd(fd, h, /*writable=*/true);
     }
 
     void Reactor::registerTimer(std::chrono::nanoseconds duration,
@@ -531,6 +561,33 @@ namespace YarnBall {
                     }
                     delete entry;
                     this->schedule(h);
+                    continue;
+                }
+                if (isFdEvent(events[i].data.u64)) {
+                    const int fd = untagFd(events[i].data.u64);
+                    const std::uint32_t got = events[i].events;
+                    void *readyR = nullptr;
+                    void *readyW = nullptr;
+                    {
+                        std::lock_guard<std::mutex> lk(this->fdMu);
+                        auto it = this->fdWaiters.find(fd);
+                        if (it == this->fdWaiters.end()) continue;
+                        FdWaiters &w = it->second;
+                        // An error or hang-up is delivered to both directions so each side observes it on its next syscall.
+                        const bool err = (got & (EPOLLERR | EPOLLHUP)) != 0;
+                        if (w.readH && (err || (got & EPOLLIN))) { readyR = w.readH; w.readH = nullptr; }
+                        if (w.writeH && (err || (got & EPOLLOUT))) { readyW = w.writeH; w.writeH = nullptr; }
+                        if (!w.readH && !w.writeH) {
+                            this->fdWaiters.erase(it);
+                        } else if (!this->armFdLocked(fd, w)) {
+                            // The other direction cannot be re-armed (fd closed meanwhile): let it run and fail on its own.
+                            if (w.readH) readyR = readyR ? readyR : w.readH;
+                            if (w.writeH) readyW = readyW ? readyW : w.writeH;
+                            this->fdWaiters.erase(it);
+                        }
+                    }
+                    if (readyR) this->schedule(std::coroutine_handle<>::from_address(readyR));
+                    if (readyW) this->schedule(std::coroutine_handle<>::from_address(readyW));
                     continue;
                 }
                 auto h = std::coroutine_handle<>::from_address(p);
