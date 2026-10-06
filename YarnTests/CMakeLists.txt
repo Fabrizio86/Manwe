@@ -20,6 +20,10 @@ add_executable(YarnTests main.cpp test_framework.hpp)
 # definitions like SOCCER_HAS_TLS propagate transitively.
 target_link_libraries(YarnTests PUBLIC Soccer Wire Yarn)
 
+# Process-exit reproducer for ~Yarn (not part of YarnTests: it must be run many times, see the file header).
+add_executable(exit_race exit_race.cpp)
+target_link_libraries(exit_race PUBLIC Yarn)
+
 # If libtls is linked into Soccer, propagate the link to YarnTests too.
 # (Static libraries' PUBLIC dependencies are inherited automatically when
 # linked as targets; this is here defensively.)

@@ -216,6 +216,16 @@ namespace YarnBall {
         this->parkSignal.notify_all();
     }
 
+    void Fiber::join() {
+        if (this->thread.joinable() && this->thread.get_id() != std::this_thread::get_id()) {
+            this->thread.join();
+        }
+    }
+
+    void Fiber::abandonPending() noexcept {
+        this->pushPending = nullptr;
+    }
+
     void Fiber::poke() {
         // Fast skip when the worker isn't parked; spares a notify syscall
         // in the common busy-worker case.

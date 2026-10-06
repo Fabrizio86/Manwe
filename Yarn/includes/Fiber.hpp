@@ -125,6 +125,19 @@ namespace YarnBall {
         void stop();
 
         /**
+         * @brief Block until this fiber's OS thread has exited. No-op when it is
+         *        already joined or when called from that thread. Call @ref stop first.
+         */
+        void join();
+
+        /**
+         * @brief Drop the callback that forwards stranded tasks back into the scheduler. For Yarn::~Yarn only, after
+         *        @ref join: ~Fiber then deletes stranded tasks instead of dispatching them into a scheduler that is
+         *        being torn down. The fiber's thread must already be gone.
+         */
+        void abandonPending() noexcept;
+
+        /**
          * @brief Wake the fiber if it is parked, so it can re-evaluate its
          *        work sources.
          */

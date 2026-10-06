@@ -172,12 +172,28 @@ namespace YarnBall {
 
     Yarn::~Yarn() {
         // Phase 1: stop all workers so anyone parked or mid-spin returns.
+        Fibers workers;
         {
             std::lock_guard<std::mutex> lk(this->cmu);
             for (auto &f : this->fibers) {
-                if (f) f->stop();
+                if (f) {
+                    f->stop();
+                    workers.push_back(f);
+                }
             }
         }
+        // Phase 1b: wait for every worker thread to be gone BEFORE any member of this
+        // object is destroyed. Relying on ~Fiber to join (phase 2) is not enough: each
+        // worker's thread_local snapshot cache holds a reference to every Fiber until that
+        // worker leaves process(), so dropping `fibers` below is rarely the last reference,
+        // ~Fiber does not run, ~Yarn returns, and a worker still inside stealFromPeers /
+        // currentSnapshot then locks the destroyed `cmu` ("mutex lock failed: Invalid
+        // argument" at process exit). Joined outside `cmu`: a worker may need it to finish.
+        for (auto &f : workers) f->join();
+        // Tasks still sitting in a worker's inbox are forwarded by ~Fiber through pushPending -> Yarn::dispatch, which would run against
+        // this half-destroyed object (and recurse through the snapshot's Fiber references). Nothing runs them any more: let ~Fiber delete them.
+        for (auto &f : workers) f->abandonPending();
+        workers.clear();
         // Phase 2: dropping the sFibers triggers ~Fiber which joins. We are
         // never the worker thread here (destruction is driven by static
         // teardown on the main thread), so no self-join.
