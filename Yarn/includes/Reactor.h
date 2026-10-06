@@ -10,6 +10,7 @@
 #include <coroutine>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #if defined(__linux__) && defined(YARN_USE_IO_URING)
@@ -230,6 +231,34 @@ namespace YarnBall {
          *        registerTimer callers and the run-loop thread.
          */
         std::mutex timerSetMu;
+
+        /**
+         * @brief What is waiting on one fd. epoll keeps ONE interest set per fd (EPOLL_CTL_MOD replaces it), so a reader
+         *        and a writer waiting on the same socket cannot be registered independently: the second registration
+         *        would silently drop the first and its coroutine would never be resumed (kqueue keeps the two filters
+         *        apart, which is why this only bit on Linux). Both handles live here and the armed mask is their union.
+         */
+        struct FdWaiters {
+            void *readH = nullptr;
+            void *writeH = nullptr;
+        };
+
+        /**
+         * @brief Waiters per fd. Guarded by @ref fdMu.
+         */
+        std::unordered_map<int, FdWaiters> fdWaiters;
+        std::mutex fdMu;
+
+        /**
+         * @brief (Re)arm @p fd for the directions in @p w, one-shot. Returns false when epoll refuses the fd. fdMu held.
+         */
+        bool armFdLocked(int fd, const FdWaiters &w) noexcept;
+
+        /**
+         * @brief Add a waiter in one direction and arm the union. Falls back to scheduling @p h at once when epoll
+         *        refuses the fd (regular files, bad fds), as before.
+         */
+        void registerFd(int fd, std::coroutine_handle<> h, bool writable) noexcept;
 #elif defined(_WIN32)
         /**
          * @brief Opaque pointer to the Windows backend state (IOCP handle,
