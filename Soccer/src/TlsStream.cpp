@@ -6,6 +6,8 @@
 
 #include "TlsStream.h"
 
+#include <mutex>
+
 #include <cerrno>
 #include <fcntl.h>
 #include <string>
@@ -29,6 +31,10 @@ namespace Soccer {
         ::tls *ctx = nullptr;
         ::tls_config *cfg = nullptr;
         int fd = -1;
+        /// A libtls context is not safe for concurrent use, and a connection normally has a reader coroutine and writer coroutines
+        /// running on different threads at once. Every tls_read / tls_write call (each is non-blocking: it returns TLS_WANT_POLL*
+        /// instead of waiting) is made under this lock; the waits for readiness happen outside it.
+        std::mutex callMu;
     };
 
     TlsStream::TlsStream() : impl(std::make_unique<Impl>()) {
@@ -204,7 +210,15 @@ namespace Soccer {
             throw SocketException("read on closed TlsStream");
         }
         while (true) {
-            ssize_t n = ::tls_read(this->impl->ctx, buf.data(), buf.size());
+            ssize_t n;
+            std::string err;
+            {
+                std::lock_guard<std::mutex> lk(this->impl->callMu);
+                n = ::tls_read(this->impl->ctx, buf.data(), buf.size());
+                if (n < 0 && n != TLS_WANT_POLLIN && n != TLS_WANT_POLLOUT) {
+                    err = ::tls_error(this->impl->ctx) ? ::tls_error(this->impl->ctx) : "tls_read";
+                }
+            }
             if (n >= 0) co_return static_cast<std::size_t>(n);
             if (n == TLS_WANT_POLLIN) {
                 co_await YarnBall::io::waitReadable(this->impl->fd);
@@ -214,9 +228,6 @@ namespace Soccer {
                 co_await YarnBall::io::waitWritable(this->impl->fd);
                 continue;
             }
-            const std::string err = ::tls_error(this->impl->ctx)
-                                        ? ::tls_error(this->impl->ctx)
-                                        : "tls_read";
             throw SocketException(err);
         }
     }
@@ -227,9 +238,15 @@ namespace Soccer {
         }
         std::size_t total = 0;
         while (total < buf.size()) {
-            ssize_t n = ::tls_write(this->impl->ctx,
-                                    buf.data() + total,
-                                    buf.size() - total);
+            ssize_t n;
+            std::string err;
+            {
+                std::lock_guard<std::mutex> lk(this->impl->callMu);
+                n = ::tls_write(this->impl->ctx, buf.data() + total, buf.size() - total);
+                if (n < 0 && n != TLS_WANT_POLLIN && n != TLS_WANT_POLLOUT) {
+                    err = ::tls_error(this->impl->ctx) ? ::tls_error(this->impl->ctx) : "tls_write";
+                }
+            }
             if (n >= 0) {
                 if (n == 0) break;
                 total += static_cast<std::size_t>(n);
@@ -243,9 +260,6 @@ namespace Soccer {
                 co_await YarnBall::io::waitWritable(this->impl->fd);
                 continue;
             }
-            const std::string err = ::tls_error(this->impl->ctx)
-                                        ? ::tls_error(this->impl->ctx)
-                                        : "tls_write";
             throw SocketException(err);
         }
         co_return total;
