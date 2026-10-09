@@ -7,13 +7,17 @@
 #include "TlsListener.h"
 
 #include <cerrno>
+#include <memory>
+#include <mutex>
 #include <fcntl.h>
 #include <string>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <tls.h>
 
+#include "Coroutines.h"
 #include "IoAwaiters.h"
+#include "Timers.h"
 #include "SocketAddress.h"
 #include "SocketException.h"
 #include "TcpListener.h"
@@ -98,29 +102,73 @@ namespace Soccer {
         return l;
     }
 
-    YarnBall::Task<TlsStream> TlsListener::accept() {
+    TlsListener::PendingHandshake::PendingHandshake(PendingHandshake &&o) noexcept
+        : tcp(std::move(o.tcp)), ctx(o.ctx) {
+        o.ctx = nullptr;
+    }
+
+    TlsListener::PendingHandshake &TlsListener::PendingHandshake::operator=(PendingHandshake &&o) noexcept {
+        if (this != &o) {
+            if (ctx) ::tls_free(ctx);
+            tcp = std::move(o.tcp);
+            ctx = o.ctx;
+            o.ctx = nullptr;
+        }
+        return *this;
+    }
+
+    TlsListener::PendingHandshake::~PendingHandshake() {
+        if (ctx) ::tls_free(ctx);
+    }
+
+    namespace {
+        /// Shared between a handshake and its watchdog. The mutex orders "the handshake is over, the fd may be closed or
+        /// reused" against "the watchdog is about to shut the fd down", so a late watchdog never touches someone else's fd.
+        struct HandshakeGuard {
+            std::mutex mu;
+            bool over = false;
+        };
+
+        YarnBall::Task<void> handshakeWatchdog(std::shared_ptr<HandshakeGuard> g, int fd,
+                                               std::chrono::milliseconds limit) {
+            co_await YarnBall::sleepFor(limit);
+            std::lock_guard lock(g->mu);
+            if (!g->over) (void) ::shutdown(fd, SHUT_RDWR); // wakes the parked wait; the handshake then fails
+        }
+    }
+
+    YarnBall::Task<TlsListener::PendingHandshake> TlsListener::acceptPending() {
         if (!this->impl || !this->impl->server_ctx) {
             throw SocketException("accept on closed TlsListener");
         }
-
-        // Accept the underlying TCP connection.
-        TcpStream tcp_client = co_await this->impl->tcp.accept();
-        const int client_fd = tcp_client.fd();
-
-        // Hand the fd to libtls; it will drive the server-side handshake.
-        ::tls *client_ctx = nullptr;
-        if (::tls_accept_socket(this->impl->server_ctx, &client_ctx, client_fd) != 0) {
+        PendingHandshake p;
+        p.tcp = co_await this->impl->tcp.accept();
+        // Hand the fd to libtls; the handshake is driven later by completeHandshake.
+        if (::tls_accept_socket(this->impl->server_ctx, &p.ctx, p.tcp.fd()) != 0) {
+            p.ctx = nullptr;
             const std::string err =
                 ::tls_error(this->impl->server_ctx)
                     ? ::tls_error(this->impl->server_ctx)
                     : "tls_accept_socket";
             throw SocketException(err);
         }
+        co_return p;
+    }
 
-        // Drive the handshake.
+    YarnBall::Task<TlsStream> TlsListener::completeHandshake(PendingHandshake p, std::chrono::milliseconds timeout) {
+        ::tls *client_ctx = p.ctx;
+        const int client_fd = p.tcp.fd();
+        std::shared_ptr<HandshakeGuard> guard;
+        if (timeout.count() > 0) {
+            guard = std::make_shared<HandshakeGuard>();
+            YarnBall::coSpawn(handshakeWatchdog(guard, client_fd, timeout));
+        }
+        const auto over = [&guard] {
+            if (guard) { std::lock_guard lock(guard->mu); guard->over = true; }
+        };
         while (true) {
             int hs = ::tls_handshake(client_ctx);
-            if (hs == 0) break;
+            if (hs == 0) { over(); break; }
             if (hs == TLS_WANT_POLLIN) {
                 co_await YarnBall::io::waitReadable(client_fd);
                 continue;
@@ -131,15 +179,21 @@ namespace Soccer {
             }
             const std::string err =
                 ::tls_error(client_ctx) ? ::tls_error(client_ctx) : "tls_handshake";
-            ::tls_free(client_ctx);
-            throw SocketException(err);
+            over();
+            throw SocketException(err); // p still owns ctx and the socket: both are released with it
         }
 
-        // Transfer fd ownership from TcpStream to TlsStream. release() leaves
-        // tcp_client empty so its destructor won't close the fd.
-        const int adopted_fd = tcp_client.release();
+        // Transfer ownership of the context and the fd to the TlsStream.
+        p.ctx = nullptr;
+        const int adopted_fd = p.tcp.release();
         co_return TlsStream(client_ctx, /*cfg=*/nullptr, adopted_fd);
     }
+
+    YarnBall::Task<TlsStream> TlsListener::accept() {
+        PendingHandshake p = co_await this->acceptPending();
+        co_return co_await completeHandshake(std::move(p), std::chrono::milliseconds{0});
+    }
+
 
 }
 

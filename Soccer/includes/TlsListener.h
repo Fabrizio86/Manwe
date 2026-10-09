@@ -7,12 +7,14 @@
 
 #ifdef SOCCER_HAS_TLS
 
+#include <chrono>
 #include <cstdint>
 #include <memory>
 #include <string>
 
 #include "Coroutines.h"
 #include "SocketAddress.h"
+#include "TcpStream.h"
 #include "TlsStream.h"
 
 struct tls;
@@ -51,6 +53,47 @@ namespace Soccer {
          *        TLS handshake.
          */
         YarnBall::Task<TlsStream> accept();
+
+        /**
+         * @class PendingHandshake
+         * @brief A TCP connection accepted and handed to libtls, handshake not yet
+         *        run. Move-only; owns the connection until @ref completeHandshake
+         *        consumes it.
+         */
+        class PendingHandshake final {
+        public:
+            PendingHandshake() = default;
+            PendingHandshake(const PendingHandshake &) = delete;
+            PendingHandshake &operator=(const PendingHandshake &) = delete;
+            PendingHandshake(PendingHandshake &&o) noexcept;
+            PendingHandshake &operator=(PendingHandshake &&o) noexcept;
+            ~PendingHandshake();
+
+            /// The accepted socket (for the peer address); -1 when empty.
+            int fd() const noexcept { return tcp.fd(); }
+
+        private:
+            friend class TlsListener;
+            TcpStream tcp;
+            ::tls *ctx = nullptr;
+        };
+
+        /**
+         * @brief Accept the next TCP connection and create its libtls context, without
+         *        running the handshake. Run in the accept loop; the handshake is then
+         *        driven by @ref completeHandshake in a task of its own, so one peer that
+         *        stalls cannot hold up the others.
+         */
+        YarnBall::Task<PendingHandshake> acceptPending();
+
+        /**
+         * @brief Run the server-side handshake of @p p. A handshake not finished after
+         *        @p timeout is abandoned: the connection is shut down and a
+         *        SocketException is thrown. Zero or negative means no limit. Does not
+         *        touch the listener, so it is safe to run while the listener is closed
+         *        and rebound (certificate reload).
+         */
+        static YarnBall::Task<TlsStream> completeHandshake(PendingHandshake p, std::chrono::milliseconds timeout);
 
         /**
          * @return The local bound address (useful when bound with port 0).
