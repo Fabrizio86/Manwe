@@ -25,8 +25,11 @@ add_executable(exit_race exit_race.cpp)
 target_link_libraries(exit_race PUBLIC Yarn)
 
 # Reactor reproducer: a reader and a writer on the same fd (exit 0 = both resumed).
-add_executable(reactor_dual_wait reactor_dual_wait.cpp)
-target_link_libraries(reactor_dual_wait PUBLIC Yarn)
+# POSIX only (socketpair/fcntl); the bug it covers is epoll-specific.
+if(NOT WIN32)
+    add_executable(reactor_dual_wait reactor_dual_wait.cpp)
+    target_link_libraries(reactor_dual_wait PUBLIC Yarn)
+endif()
 
 # If libtls is linked into Soccer, propagate the link to YarnTests too.
 # (Static libraries' PUBLIC dependencies are inherited automatically when
