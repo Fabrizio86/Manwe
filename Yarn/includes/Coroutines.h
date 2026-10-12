@@ -251,7 +251,7 @@ namespace YarnBall {
                 if (this->exception) std::rethrow_exception(this->exception);
             }
 
-            Task<void> get_return_object() noexcept;
+            Task<> get_return_object() noexcept;
         };
 
     } // namespace detail
@@ -426,7 +426,7 @@ namespace YarnBall {
             return Task<T>{std::coroutine_handle<TaskPromise<T> >::from_promise(*this)};
         }
 
-        inline Task<void> TaskPromise<void>::get_return_object() noexcept {
+        inline Task<> TaskPromise<void>::get_return_object() noexcept {
             return Task<void>{std::coroutine_handle<TaskPromise<void> >::from_promise(*this)};
         }
 
@@ -625,7 +625,7 @@ namespace YarnBall {
             co_return co_await std::move(task);
         }
 
-        inline SyncWaitTask<void> makeSyncWaitTask(Task<void> task) {
+        inline SyncWaitTask<void> makeSyncWaitTask(Task<> task) {
             co_await std::move(task);
         }
 

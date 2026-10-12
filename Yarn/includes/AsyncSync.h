@@ -184,7 +184,7 @@ namespace YarnBall {
          * @brief Asynchronously take one permit; suspends if the count
          *        is zero.
          */
-        Task<void> acquire();
+        Task<> acquire();
 
         /**
          * @brief Non-suspending take.
@@ -263,7 +263,7 @@ namespace YarnBall {
         /**
          * @brief Suspend until @c notifyOne or @c notifyAll wakes us.
          */
-        Task<void> notified();
+        Task<> notified();
 
         /**
          * @brief Wake the oldest parked waiter (FIFO). No-op if none.
@@ -496,7 +496,7 @@ namespace YarnBall {
          *        (fast path, no Yarn hop) if the event is already set
          *        when this is called.
          */
-        Task<void> wait();
+        Task<> wait();
 
         /**
          * @brief Flip the latch. All currently parked waiters are woken
@@ -554,7 +554,7 @@ namespace YarnBall {
          *
          * @p fn returns a @c Task<void>; it may itself co_await.
          */
-        Task<void> callOnce(std::function<Task<void>()> fn);
+        Task<> callOnce(std::function<Task<>()> fn);
 
         /**
          * @return @c true once the inner callable has finished
@@ -621,7 +621,7 @@ namespace YarnBall {
          *        have arrived, every parked waiter resumes through
          *        Yarn and the barrier resets for the next cycle.
          */
-        Task<void> arrive();
+        Task<> arrive();
 
         /**
          * @brief @c initial - countdown. Snapshot of how many callers

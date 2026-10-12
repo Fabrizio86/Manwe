@@ -139,7 +139,7 @@ namespace YarnBall {
          *        the frame self-destroys at final suspend.
          */
         template<typename T>
-        Task<void> whenAllRunner(std::shared_ptr<WhenAllState<T>> state,
+        Task<> whenAllRunner(std::shared_ptr<WhenAllState<T>> state,
                                    size_t idx,
                                    Task<T> task) {
             try {
@@ -158,8 +158,8 @@ namespace YarnBall {
         /**
          * @brief Per-subtask wrapper for @c Task<void>.
          */
-        inline Task<void> whenAllRunnerVoid(std::shared_ptr<WhenAllVoidState> state,
-                                               Task<void> task) {
+        inline Task<> whenAllRunnerVoid(std::shared_ptr<WhenAllVoidState> state,
+                                               Task<> task) {
             try {
                 co_await std::move(task);
             } catch (...) {
@@ -248,7 +248,7 @@ namespace YarnBall {
      *        @c Task<void> has finished; rethrows the first exception
      *        observed, if any.
      */
-    inline Task<void> whenAll(std::vector<Task<void>> tasks) {
+    inline Task<> whenAll(std::vector<Task<>> tasks) {
         auto state = std::make_shared<detail::WhenAllVoidState>(tasks.size());
 
         for (auto &t : tasks) {

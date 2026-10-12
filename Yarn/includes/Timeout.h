@@ -68,7 +68,7 @@ namespace YarnBall {
          *        alive on the Yarn pool.
          */
         template<typename T>
-        Task<void> storeResultInto(std::shared_ptr<std::optional<T>> dst,
+        Task<> storeResultInto(std::shared_ptr<std::optional<T>> dst,
                                      Task<T> src) {
             *dst = co_await std::move(src);
             co_return;
@@ -78,7 +78,7 @@ namespace YarnBall {
          * @brief Sleeper task used as the timeout side of the race.
          */
         template<typename Rep, typename Period>
-        Task<void> timeout_sleeper(std::chrono::duration<Rep, Period> duration) {
+        Task<> timeout_sleeper(std::chrono::duration<Rep, Period> duration) {
             co_await sleepFor(duration);
             co_return;
         }
@@ -106,7 +106,7 @@ namespace YarnBall {
                          std::chrono::duration<Rep, Period> duration) {
         auto slot = std::make_shared<std::optional<T>>();
 
-        std::vector<Task<void>> tasks;
+        std::vector<Task<>> tasks;
         tasks.reserve(2);
         tasks.push_back(detail::storeResultInto<T>(slot, std::move(task)));
         tasks.push_back(detail::timeout_sleeper(duration));
@@ -128,9 +128,9 @@ namespace YarnBall {
      * @brief @c void overload of @ref withTimeout.
      */
     template<typename Rep, typename Period>
-    Task<void> withTimeout(Task<void> task,
+    Task<> withTimeout(Task<> task,
                             std::chrono::duration<Rep, Period> duration) {
-        std::vector<Task<void>> tasks;
+        std::vector<Task<>> tasks;
         tasks.reserve(2);
         tasks.push_back(std::move(task));
         tasks.push_back(detail::timeout_sleeper(duration));
