@@ -111,7 +111,7 @@ namespace YarnBall {
         }
     };
 
-    Task<void> AsyncSemaphore::acquire() {
+    Task<> AsyncSemaphore::acquire() {
         co_await AsyncSemAcquireAwaiter{this};
         co_return;
     }
@@ -171,7 +171,7 @@ namespace YarnBall {
         }
     };
 
-    Task<void> AsyncNotify::notified() {
+    Task<> AsyncNotify::notified() {
         co_await AsyncNotifyAwaiter{this};
         co_return;
     }
@@ -366,7 +366,7 @@ namespace YarnBall {
         }
     };
 
-    Task<void> AsyncEvent::wait() {
+    Task<> AsyncEvent::wait() {
         co_await AsyncEventAwaiter{this};
         co_return;
     }
@@ -427,7 +427,7 @@ namespace YarnBall {
         }
     };
 
-    Task<void> AsyncOnce::callOnce(std::function<Task<void>()> fn) {
+    Task<> AsyncOnce::callOnce(std::function<Task<>()> fn) {
         AsyncOnceAwaiter aw{this};
         co_await aw;
 
@@ -497,7 +497,7 @@ namespace YarnBall {
         }
     };
 
-    Task<void> AsyncBarrier::arrive() {
+    Task<> AsyncBarrier::arrive() {
         co_await AsyncBarrierAwaiter{this, {}};
         co_return;
     }

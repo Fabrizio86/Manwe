@@ -79,7 +79,7 @@ namespace YarnBall {
          *        publishes its (index, value) and resumes the awaiter.
          */
         template<typename T>
-        Task<void> whenAnyRunner(std::shared_ptr<WhenAnyState<T>> state,
+        Task<> whenAnyRunner(std::shared_ptr<WhenAnyState<T>> state,
                                    std::size_t idx,
                                    Task<T> task) {
             try {
@@ -113,9 +113,9 @@ namespace YarnBall {
          * @brief @c void runner. Same shape as the value runner; the
          *        winner publishes only the index.
          */
-        inline Task<void> whenAnyRunnerVoid(std::shared_ptr<WhenAnyVoidState> state,
+        inline Task<> whenAnyRunnerVoid(std::shared_ptr<WhenAnyVoidState> state,
                                                 std::size_t idx,
-                                                Task<void> task) {
+                                                Task<> task) {
             try {
                 co_await std::move(task);
                 if (!state->finished.exchange(true, std::memory_order_acq_rel)) {
@@ -223,7 +223,7 @@ namespace YarnBall {
      * @brief @c void overload of @ref whenAny. Returns the index of
      *        the winning subtask; rethrows its exception if it threw.
      */
-    inline Task<std::size_t> whenAny(std::vector<Task<void>> tasks) {
+    inline Task<std::size_t> whenAny(std::vector<Task<>> tasks) {
         auto state = std::make_shared<detail::WhenAnyVoidState>();
 
         for (std::size_t i = 0; i < tasks.size(); ++i) {

@@ -161,7 +161,7 @@ namespace YarnBall::fs {
         /**
          * @brief Flush buffered writes to the OS (does NOT call fsync).
          */
-        YarnBall::Task<void> flush() {
+        YarnBall::Task<> flush() {
             co_await YarnBall::scheduleOn(YarnBall::Yarn::instance());
             this->stream.flush();
             if (this->stream.fail()) {
@@ -173,7 +173,7 @@ namespace YarnBall::fs {
         /**
          * @brief Close the file. Idempotent.
          */
-        YarnBall::Task<void> close() {
+        YarnBall::Task<> close() {
             if (!this->stream.is_open()) co_return;
             co_await YarnBall::scheduleOn(YarnBall::Yarn::instance());
             this->stream.close();
@@ -230,7 +230,7 @@ namespace YarnBall::fs {
     /**
      * @brief Write @p data to @p path. Truncates existing content.
      */
-    inline YarnBall::Task<void> writeString(std::string path,
+    inline YarnBall::Task<> writeString(std::string path,
                                               std::string data) {
         co_await YarnBall::scheduleOn(YarnBall::Yarn::instance());
         std::ofstream f(path, std::ios::binary | std::ios::trunc);
@@ -247,7 +247,7 @@ namespace YarnBall::fs {
     /**
      * @brief Write @p data to @p path. Truncates existing content.
      */
-    inline YarnBall::Task<void> writeBytes(std::string path,
+    inline YarnBall::Task<> writeBytes(std::string path,
                                              std::span<const std::byte> data) {
         co_await YarnBall::scheduleOn(YarnBall::Yarn::instance());
         std::ofstream f(path, std::ios::binary | std::ios::trunc);
@@ -265,7 +265,7 @@ namespace YarnBall::fs {
     /**
      * @brief Delete @p path. Throws if the path does not exist.
      */
-    inline YarnBall::Task<void> remove(std::string path) {
+    inline YarnBall::Task<> remove(std::string path) {
         co_await YarnBall::scheduleOn(YarnBall::Yarn::instance());
         if (std::remove(path.c_str()) != 0) {
             throw FileIoError("remove(" + path + ") failed");
