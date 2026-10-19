@@ -10,7 +10,6 @@
 #include <cstdint>
 #include <stdexcept>
 #include <type_traits>
-#include <type_traits>
 #include <vector>
 
 namespace YarnBall {
@@ -36,7 +35,7 @@ namespace YarnBall {
      *    plus acquire/release on @ref top and @ref bottom, per Chase & Lev (2005).
      *
      * Memory ordering follows the canonical formulation:
-     *  - push:  buffer[b] write (relaxed) -> release fence -> bottom.store (relaxed)
+     *  - push:  buffer[b] write (relaxed) -> bottom.store (release)
      *  - pop:   bottom.store (relaxed) -> seq_cst fence -> top.load (relaxed)
      *  - steal: top.load (acquire) -> seq_cst fence -> bottom.load (acquire)
      *           -> CAS top (seq_cst on success).
@@ -89,8 +88,10 @@ namespace YarnBall {
                 return false;
             }
             this->buffer[b & this->mask].store(item, std::memory_order_relaxed);
-            std::atomic_thread_fence(std::memory_order_release);
-            this->bottom.store(b + 1, std::memory_order_relaxed);
+            // A release store publishes the slot (and everything the owner wrote to the item before pushing it) to a thief's acquire load of
+            // bottom. It is the same guarantee as a release fence followed by a relaxed store, but ThreadSanitizer does not model standalone
+            // fences and reported the construction of a pushed task as racing with the thief that runs it.
+            this->bottom.store(b + 1, std::memory_order_release);
             return true;
         }
 
