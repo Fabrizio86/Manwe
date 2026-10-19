@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.21)
 project(benchmarks)
 
 set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_executable(bench_yarn bench_yarn.cpp)
 target_link_libraries(bench_yarn PRIVATE Yarn)

@@ -6,6 +6,7 @@
 // pass a port number. Connect from another terminal with `nc 127.0.0.1 8080`.
 
 #include <array>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <span>
@@ -48,9 +49,21 @@ YarnBall::Task<void> echo_server(std::uint16_t port) {
     }
 }
 
+/// Parse a TCP port (0-65535); exits with a message on bad input instead
+/// of silently truncating through a narrowing cast.
+static std::uint16_t parsePort(const char *text) {
+    char *end = nullptr;
+    const long v = std::strtol(text, &end, 10);
+    if (end == text || *end != '\0' || v < 0 || v > 65535) {
+        std::cerr << "invalid port: " << text << "\n";
+        std::exit(1);
+    }
+    return static_cast<std::uint16_t>(v);
+}
+
 int main(int argc, char **argv) {
     const std::uint16_t port = (argc > 1)
-        ? static_cast<std::uint16_t>(std::atoi(argv[1]))
+        ? parsePort(argv[1])
         : kDefaultPort;
     YarnBall::syncWait(echo_server(port));
     return 0;

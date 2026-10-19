@@ -14,11 +14,12 @@ if (NOT MSVC)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -fPIC")
 endif ()
 
-add_executable(YarnTests main.cpp test_framework.hpp)
+add_executable(YarnTests main.cpp soccer_limits_tests.cpp cancellation_tests.cpp test_framework.hpp)
 
 # Link against the CMake targets (not raw .a paths) so that PUBLIC compile
 # definitions like SOCCER_HAS_TLS propagate transitively.
 target_link_libraries(YarnTests PUBLIC Soccer Wire Yarn)
+add_test(NAME YarnTests COMMAND YarnTests)
 
 # Process-exit reproducer for ~Yarn (not part of YarnTests: it must be run many times, see the file header).
 add_executable(exit_race exit_race.cpp)
@@ -29,6 +30,7 @@ target_link_libraries(exit_race PUBLIC Yarn)
 if(NOT WIN32)
     add_executable(reactor_dual_wait reactor_dual_wait.cpp)
     target_link_libraries(reactor_dual_wait PUBLIC Yarn)
+    add_test(NAME reactor_dual_wait COMMAND reactor_dual_wait)
 endif()
 
 # If libtls is linked into Soccer, propagate the link to YarnTests too.

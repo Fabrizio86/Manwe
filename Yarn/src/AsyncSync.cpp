@@ -22,25 +22,30 @@ namespace YarnBall {
      * violation on macOS-arm64 and on the Windows-2025 CI runner under
      * load (the WhenAll path had the same bug and the same fix).
      */
-    struct AsyncMutexLockAwaiter {
+    struct AsyncMutexLockAwaiter : detail::ParkBase<AsyncMutexLockAwaiter> {
         AsyncMutex *mutex;
+
+        explicit AsyncMutexLockAwaiter(AsyncMutex *m) noexcept
+            : ParkBase(m->mu, m->waiters), mutex(m) {
+        }
+
+        ~AsyncMutexLockAwaiter() { this->abandon(); }
+
+        // Ownership was handed over by a release, but the frame died before it could use it.
+        void revokeGrant() noexcept { this->mutex->release_one(); }
 
         bool await_ready() noexcept { return false; }
 
-        std::coroutine_handle<> await_suspend(std::coroutine_handle<> h) noexcept {
-            {
-                std::lock_guard<std::mutex> lk(this->mutex->mu);
-                if (this->mutex->held) {
-                    this->mutex->waiters.push_back(h);
-                    return std::noop_coroutine();
-                }
+        template<typename Promise>
+        std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) {
+            return this->park(h, [this] {
+                if (this->mutex->held) return false;
                 this->mutex->held = true;
-            }
-            return h;
+                return true;
+            });
         }
 
-        void await_resume() noexcept {
-        }
+        void await_resume() { this->throwIfCancelled(); }
     };
 
     Task<AsyncMutexGuard> AsyncMutex::lock() {
@@ -63,8 +68,7 @@ namespace YarnBall {
                 this->held = false;
                 return;
             }
-            next = this->waiters.front();
-            this->waiters.pop_front();
+            next = this->waiters.popFront();
             // Ownership transfers to @c next; @c held stays true.
         }
         // Dispatch through Yarn rather than inline-resuming the next
@@ -89,26 +93,29 @@ namespace YarnBall {
      *        handle. See @ref AsyncMutexLockAwaiter for why we use
      *        symmetric transfer instead of inline @c h.resume().
      */
-    struct AsyncSemAcquireAwaiter {
+    struct AsyncSemAcquireAwaiter : detail::ParkBase<AsyncSemAcquireAwaiter> {
         AsyncSemaphore *sem;
+
+        explicit AsyncSemAcquireAwaiter(AsyncSemaphore *s) noexcept
+            : ParkBase(s->mu, s->waiters), sem(s) {
+        }
+
+        ~AsyncSemAcquireAwaiter() { this->abandon(); }
+
+        void revokeGrant() noexcept { this->sem->release(); }
 
         bool await_ready() noexcept { return false; }
 
-        std::coroutine_handle<> await_suspend(std::coroutine_handle<> h) noexcept {
-            {
-                std::lock_guard<std::mutex> lk(this->sem->mu);
-                if (this->sem->count > 0) {
-                    --this->sem->count;
-                } else {
-                    this->sem->waiters.push_back(h);
-                    return std::noop_coroutine();
-                }
-            }
-            return h;
+        template<typename Promise>
+        std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) {
+            return this->park(h, [this] {
+                if (this->sem->count == 0) return false;
+                --this->sem->count;
+                return true;
+            });
         }
 
-        void await_resume() noexcept {
-        }
+        void await_resume() { this->throwIfCancelled(); }
     };
 
     Task<> AsyncSemaphore::acquire() {
@@ -128,8 +135,7 @@ namespace YarnBall {
         {
             std::lock_guard<std::mutex> lk(this->mu);
             if (!this->waiters.empty()) {
-                next = this->waiters.front();
-                this->waiters.pop_front();
+                next = this->waiters.popFront();
                 // Permit transfers to the woken waiter; count unchanged.
             } else {
                 ++this->count;
@@ -157,18 +163,21 @@ namespace YarnBall {
      *        @c notifyOne / @c notifyAll wakes the parked coroutine
      *        through Yarn.
      */
-    struct AsyncNotifyAwaiter {
-        AsyncNotify *notify;
+    struct AsyncNotifyAwaiter : detail::ParkBase<AsyncNotifyAwaiter> {
+        explicit AsyncNotifyAwaiter(AsyncNotify *n) noexcept
+            : ParkBase(n->mu, n->waiters) {
+        }
+
+        ~AsyncNotifyAwaiter() { this->abandon(); }
 
         bool await_ready() noexcept { return false; }
 
-        void await_suspend(std::coroutine_handle<> h) noexcept {
-            std::lock_guard<std::mutex> lk(this->notify->mu);
-            this->notify->waiters.push_back(h);
+        template<typename Promise>
+        std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) {
+            return this->park(h, [] { return false; });
         }
 
-        void await_resume() noexcept {
-        }
+        void await_resume() { this->throwIfCancelled(); }
     };
 
     Task<> AsyncNotify::notified() {
@@ -181,8 +190,7 @@ namespace YarnBall {
         {
             std::lock_guard<std::mutex> lk(this->mu);
             if (this->waiters.empty()) return;
-            next = this->waiters.front();
-            this->waiters.pop_front();
+            next = this->waiters.popFront();
         }
         try {
             std::unique_ptr<ITask> ct{new detail::CoroutineITask(next)};
@@ -193,11 +201,10 @@ namespace YarnBall {
     }
 
     void AsyncNotify::notifyAll() noexcept {
-        std::deque<std::coroutine_handle<>> toWake;
+        std::vector<std::coroutine_handle<>> toWake;
         {
             std::lock_guard<std::mutex> lk(this->mu);
-            toWake = std::move(this->waiters);
-            this->waiters.clear();
+            this->waiters.takeAll(toWake);
         }
         for (auto h : toWake) {
             try {
@@ -238,28 +245,36 @@ namespace YarnBall {
      *        no writer active or queued -> bump read count and
      *        skip suspend. Slow path: park as a reader waiter.
      */
-    struct AsyncRwReadAwaiter {
+    struct AsyncRwReadAwaiter : detail::ParkBase<AsyncRwReadAwaiter> {
         AsyncRwLock *lock;
+
+        explicit AsyncRwReadAwaiter(AsyncRwLock *l) noexcept
+            : ParkBase(l->mu, l->waiters), lock(l) {
+        }
+
+        ~AsyncRwReadAwaiter() { this->abandon(); }
+
+        void revokeGrant() noexcept { this->lock->releaseReader(); }
+
+        // A waiter leaving the queue can unblock the ones behind it.
+        void fixupLocked(std::vector<std::coroutine_handle<>> &wake) noexcept {
+            this->lock->promoteLocked(wake);
+        }
 
         bool await_ready() noexcept { return false; }
 
-        // Returning @c false from await_suspend tells the coroutine
-        // machinery to skip the suspension entirely (the documented
-        // "I changed my mind, resume me right away" path). Distinct
-        // from calling @c h.resume() inline -- this is well-defined
-        // and does not re-enter the coroutine mid-suspend.
-        bool await_suspend(std::coroutine_handle<> h) noexcept {
-            std::lock_guard<std::mutex> lk(this->lock->mu);
-            if (this->lock->state >= 0 && this->lock->waiters.empty()) {
+        // Taking the fast path means resuming straight away (the symmetric transfer back to @c h); no re-entry happens
+        // before await_suspend has returned.
+        template<typename Promise>
+        std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) {
+            return this->park(h, [this] {
+                if (this->lock->state < 0 || !this->lock->waiters.empty()) return false;
                 ++this->lock->state;
-                return false;
-            }
-            this->lock->waiters.push_back({h, /*isWriter=*/false});
-            return true;
+                return true;
+            });
         }
 
-        void await_resume() noexcept {
-        }
+        void await_resume() { this->throwIfCancelled(); }
     };
 
     /**
@@ -268,23 +283,34 @@ namespace YarnBall {
      *        no readers, no writer, no queue -> take exclusively and
      *        skip suspend.
      */
-    struct AsyncRwWriteAwaiter {
+    struct AsyncRwWriteAwaiter : detail::ParkBase<AsyncRwWriteAwaiter> {
         AsyncRwLock *lock;
+
+        explicit AsyncRwWriteAwaiter(AsyncRwLock *l) noexcept
+            : ParkBase(l->mu, l->waiters), lock(l) {
+            this->node.isWriter = true;
+        }
+
+        ~AsyncRwWriteAwaiter() { this->abandon(); }
+
+        void revokeGrant() noexcept { this->lock->releaseWriter(); }
+
+        void fixupLocked(std::vector<std::coroutine_handle<>> &wake) noexcept {
+            this->lock->promoteLocked(wake);
+        }
 
         bool await_ready() noexcept { return false; }
 
-        bool await_suspend(std::coroutine_handle<> h) noexcept {
-            std::lock_guard<std::mutex> lk(this->lock->mu);
-            if (this->lock->state == 0 && this->lock->waiters.empty()) {
+        template<typename Promise>
+        std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) {
+            return this->park(h, [this] {
+                if (this->lock->state != 0 || !this->lock->waiters.empty()) return false;
                 this->lock->state = -1;
-                return false;
-            }
-            this->lock->waiters.push_back({h, /*isWriter=*/true});
-            return true;
+                return true;
+            });
         }
 
-        void await_resume() noexcept {
-        }
+        void await_resume() { this->throwIfCancelled(); }
     };
 
     Task<AsyncReadGuard> AsyncRwLock::lockShared() {
@@ -297,21 +323,31 @@ namespace YarnBall {
         co_return AsyncWriteGuard{this};
     }
 
+    void AsyncRwLock::promoteLocked(std::vector<std::coroutine_handle<>> &wake) {
+        if (this->waiters.empty()) return;
+        if (this->waiters.front()->isWriter) {
+            if (this->state == 0) {
+                this->state = -1;
+                wake.push_back(this->waiters.popFront());
+            }
+        } else if (this->state >= 0) {
+            // Drain the consecutive reader batch at the head.
+            while (!this->waiters.empty() && !this->waiters.front()->isWriter) {
+                ++this->state;
+                wake.push_back(this->waiters.popFront());
+            }
+        }
+    }
+
     void AsyncRwLock::releaseReader() noexcept {
-        std::coroutine_handle<> wake{};
+        std::vector<std::coroutine_handle<>> toWake;
         {
             std::lock_guard<std::mutex> lk(this->mu);
             --this->state;
-            // Only when the last reader leaves AND a writer is at the
-            // head do we promote the writer.
-            if (this->state == 0 && !this->waiters.empty()
-                && this->waiters.front().isWriter) {
-                wake = this->waiters.front().handle;
-                this->waiters.pop_front();
-                this->state = -1;
-            }
+            // Only when the last reader leaves can a writer at the head run.
+            if (this->state == 0) this->promoteLocked(toWake);
         }
-        if (wake) dispatchToYarn(wake);
+        for (auto h : toWake) dispatchToYarn(h);
     }
 
     void AsyncRwLock::releaseWriter() noexcept {
@@ -319,22 +355,7 @@ namespace YarnBall {
         {
             std::lock_guard<std::mutex> lk(this->mu);
             this->state = 0;
-            if (!this->waiters.empty()) {
-                if (this->waiters.front().isWriter) {
-                    // Promote a single writer.
-                    toWake.push_back(this->waiters.front().handle);
-                    this->waiters.pop_front();
-                    this->state = -1;
-                } else {
-                    // Drain the consecutive reader batch at the head.
-                    while (!this->waiters.empty()
-                           && !this->waiters.front().isWriter) {
-                        toWake.push_back(this->waiters.front().handle);
-                        this->waiters.pop_front();
-                        ++this->state;
-                    }
-                }
-            }
+            this->promoteLocked(toWake);
         }
         for (auto h : toWake) dispatchToYarn(h);
     }
@@ -345,25 +366,28 @@ namespace YarnBall {
      * @brief Awaiter for @c AsyncEvent::wait(). Fast path: latched ->
      *        skip suspend. Slow path: park on the waiters queue.
      */
-    struct AsyncEventAwaiter {
+    struct AsyncEventAwaiter : detail::ParkBase<AsyncEventAwaiter> {
         AsyncEvent *event;
+
+        explicit AsyncEventAwaiter(AsyncEvent *e) noexcept
+            : ParkBase(e->mu, e->waiters), event(e) {
+        }
+
+        ~AsyncEventAwaiter() { this->abandon(); }
 
         bool await_ready() noexcept {
             return this->event->latched.load(std::memory_order_acquire);
         }
 
-        bool await_suspend(std::coroutine_handle<> h) noexcept {
-            std::lock_guard<std::mutex> lk(this->event->mu);
-            // Re-check under the lock to close the race with set().
-            if (this->event->latched.load(std::memory_order_acquire)) {
-                return false;
-            }
-            this->event->waiters.push_back(h);
-            return true;
+        template<typename Promise>
+        std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) {
+            // The latch is re-checked under the lock to close the race with set().
+            return this->park(h, [this] {
+                return this->event->latched.load(std::memory_order_acquire);
+            });
         }
 
-        void await_resume() noexcept {
-        }
+        void await_resume() { this->throwIfCancelled(); }
     };
 
     Task<> AsyncEvent::wait() {
@@ -372,13 +396,12 @@ namespace YarnBall {
     }
 
     void AsyncEvent::set() noexcept {
-        std::deque<std::coroutine_handle<>> toWake;
+        std::vector<std::coroutine_handle<>> toWake;
         {
             std::lock_guard<std::mutex> lk(this->mu);
             if (this->latched.load(std::memory_order_acquire)) return;
             this->latched.store(true, std::memory_order_release);
-            toWake = std::move(this->waiters);
-            this->waiters.clear();
+            this->waiters.takeAll(toWake);
         }
         for (auto h : toWake) dispatchToYarn(h);
     }
@@ -390,7 +413,7 @@ namespace YarnBall {
      *        first caller becomes the runner; concurrent callers park
      *        on the waiters queue and resume when the runner finishes.
      */
-    struct AsyncOnceAwaiter {
+    struct AsyncOnceAwaiter : detail::ParkBase<AsyncOnceAwaiter> {
         AsyncOnce *once;
 
         /**
@@ -403,49 +426,71 @@ namespace YarnBall {
 
         Role role = Role::kPark;
 
+        explicit AsyncOnceAwaiter(AsyncOnce *o) noexcept
+            : ParkBase(o->mu, o->waiters), once(o) {
+        }
+
+        ~AsyncOnceAwaiter() { this->abandon(); }
+
         bool await_ready() noexcept { return false; }
 
-        bool await_suspend(std::coroutine_handle<> h) noexcept {
-            std::lock_guard<std::mutex> lk(this->once->mu);
-            switch (this->once->state) {
-                case AsyncOnce::State::Idle:
-                    this->once->state = AsyncOnce::State::Running;
-                    this->role = Role::kFirstCaller;
-                    return false;
-                case AsyncOnce::State::Done:
-                    this->role = Role::kAlreadyDone;
-                    return false;
-                case AsyncOnce::State::Running:
-                    this->role = Role::kPark;
-                    this->once->waiters.push_back(h);
-                    return true;
-            }
-            return true; // unreachable
+        template<typename Promise>
+        std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) {
+            return this->park(h, [this] {
+                switch (this->once->state) {
+                    case AsyncOnce::State::Idle:
+                        this->once->state = AsyncOnce::State::Running;
+                        this->role = Role::kFirstCaller;
+                        return true;
+                    case AsyncOnce::State::Done:
+                        this->role = Role::kAlreadyDone;
+                        return true;
+                    case AsyncOnce::State::Running:
+                        break;
+                }
+                this->role = Role::kPark;
+                return false;
+            });
         }
 
-        void await_resume() noexcept {
-        }
+        void await_resume() { this->throwIfCancelled(); }
     };
 
     Task<> AsyncOnce::callOnce(std::function<Task<>()> fn) {
-        AsyncOnceAwaiter aw{this};
-        co_await aw;
+        while (true) {
+            AsyncOnceAwaiter aw{this};
+            co_await aw;
 
-        if (aw.role == AsyncOnceAwaiter::Role::kFirstCaller) {
-            try {
-                co_await fn();
-            } catch (...) {
-                this->exception = std::current_exception();
+            if (aw.role == AsyncOnceAwaiter::Role::kPark) {
+                // Woken because the runner finished (or was cancelled): look again.
+                continue;
             }
-            std::deque<std::coroutine_handle<>> wake;
-            {
-                std::lock_guard<std::mutex> lk(this->mu);
-                this->state = State::Done;
-                this->done.store(true, std::memory_order_release);
-                wake = std::move(this->waiters);
-                this->waiters.clear();
+
+            if (aw.role == AsyncOnceAwaiter::Role::kFirstCaller) {
+                bool runnerCancelled = false;
+                try {
+                    co_await fn();
+                } catch (const CancelledException &) {
+                    runnerCancelled = true;
+                } catch (...) {
+                    this->exception = std::current_exception();
+                }
+                std::vector<std::coroutine_handle<>> wake;
+                {
+                    std::lock_guard<std::mutex> lk(this->mu);
+                    if (runnerCancelled) {
+                        // Not completed: let the next caller start over.
+                        this->state = State::Idle;
+                    } else {
+                        this->state = State::Done;
+                        this->done.store(true, std::memory_order_release);
+                    }
+                    this->waiters.takeAll(wake);
+                }
+                for (auto h : wake) dispatchToYarn(h);
+                if (runnerCancelled) throw CancelledException{};
             }
-            for (auto h : wake) dispatchToYarn(h);
+            break;
         }
 
         if (this->exception) {
@@ -462,43 +507,59 @@ namespace YarnBall {
      *        arriver, drain the waiters queue (Yarn-dispatched), reset
      *        the count, and skip our own suspension. Otherwise park.
      */
-    struct AsyncBarrierAwaiter {
+    struct AsyncBarrierAwaiter : detail::ParkBase<AsyncBarrierAwaiter> {
         AsyncBarrier *barrier;
-        std::vector<std::coroutine_handle<>> toWake;
+
+        explicit AsyncBarrierAwaiter(AsyncBarrier *b) noexcept
+            : ParkBase(b->mu, b->waiters), barrier(b) {
+        }
+
+        ~AsyncBarrierAwaiter() { this->abandon(); }
+
+        // A waiter that leaves before the barrier trips withdraws its arrival.
+        void fixupLocked(std::vector<std::coroutine_handle<>> &) noexcept {
+            ++this->barrier->countdown;
+        }
 
         bool await_ready() noexcept { return false; }
 
-        bool await_suspend(std::coroutine_handle<> h) noexcept {
-            std::lock_guard<std::mutex> lk(this->barrier->mu);
-            --this->barrier->countdown;
-            if (this->barrier->countdown == 0) {
-                // We are the trigger. Capture every parked waiter to
-                // wake (off-lock) and reset for the next cycle.
-                this->toWake.reserve(this->barrier->waiters.size());
-                for (auto w : this->barrier->waiters) this->toWake.push_back(w);
-                this->barrier->waiters.clear();
-                this->barrier->countdown = this->barrier->initial;
-                return false; // don't suspend; the trigger continues
+        template<typename Promise>
+        std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) {
+            // Arrival and enqueue must be one atomic step under the lock, so the callback is armed first.
+            if (detail::TaskPromiseCore *core = detail::CancelBinding::ambient(h)) {
+                if (core->isCancellationRequested()) {
+                    this->cancelled = true;
+                    return h;
+                }
+                this->bind.arm(core, &AsyncBarrierAwaiter::cancelThunk, this);
             }
-            this->barrier->waiters.push_back(h);
-            return true;
+            std::vector<std::coroutine_handle<>> toWake;
+            {
+                std::lock_guard<std::mutex> lk(this->barrier->mu);
+                if (this->earlyCancel) {
+                    this->cancelled = true;
+                    return h;
+                }
+                --this->barrier->countdown;
+                if (this->barrier->countdown != 0) {
+                    this->node.h = this->proxy.publish(h);
+                    this->barrier->waiters.push_back(&this->node);
+                    return std::noop_coroutine();
+                }
+                // We are the trigger: take every parked waiter and reset for the next cycle.
+                this->barrier->waiters.takeAll(toWake);
+                this->barrier->countdown = this->barrier->initial;
+            }
+            // Off-lock, before our own continuation runs: the wake-ups must not depend on this frame staying alive.
+            for (auto w : toWake) dispatchToYarn(w);
+            return h; // don't suspend; the trigger continues
         }
 
-        void await_resume() noexcept {
-            // Off-lock: dispatch the wake-ups via Yarn.
-            for (auto h : this->toWake) {
-                try {
-                    std::unique_ptr<ITask> ct{new detail::CoroutineITask(h)};
-                    Yarn::instance()->run(std::move(ct));
-                } catch (...) {
-                    h.resume();
-                }
-            }
-        }
+        void await_resume() { this->throwIfCancelled(); }
     };
 
     Task<> AsyncBarrier::arrive() {
-        co_await AsyncBarrierAwaiter{this, {}};
+        co_await AsyncBarrierAwaiter{this};
         co_return;
     }
 

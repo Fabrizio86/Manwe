@@ -8,10 +8,13 @@
 #include <atomic>
 #include <chrono>
 #include <coroutine>
+#include <map>
 #include <mutex>
 #include <thread>
 #include <unordered_map>
 #include <vector>
+
+#include "SocketHandle.h"
 
 #if defined(__linux__) && defined(YARN_USE_IO_URING)
 // liburing's struct, forward-declared so we don't pull <liburing.h> into
@@ -32,6 +35,68 @@ namespace YarnBall {
      */
     struct WindowsState;
 #endif
+
+    namespace detail {
+
+        /**
+         * @brief Coroutine handles waiting on one fd in one direction, in
+         *        arrival order. The first handle is stored inline so the
+         *        common single-waiter case never allocates.
+         */
+        struct DirWaiters {
+            void *first = nullptr;
+            std::vector<void *> rest;
+
+            bool empty() const noexcept { return this->first == nullptr; }
+
+            void push(void *h) {
+                if (!this->first) this->first = h; else this->rest.push_back(h);
+            }
+
+            /// Move every handle into @p out and leave this empty.
+            void takeAll(std::vector<void *> &out) {
+                if (!this->first) return;
+                out.push_back(this->first);
+                for (void *p : this->rest) out.push_back(p);
+                this->first = nullptr;
+                this->rest.clear();
+            }
+
+            /// Remove one handle; @c true if it was present.
+            bool remove(void *h) noexcept {
+                if (this->first == h) {
+                    if (this->rest.empty()) {
+                        this->first = nullptr;
+                    } else {
+                        this->first = this->rest.front();
+                        this->rest.erase(this->rest.begin());
+                    }
+                    return true;
+                }
+                for (auto it = this->rest.begin(); it != this->rest.end(); ++it) {
+                    if (*it == h) {
+                        this->rest.erase(it);
+                        return true;
+                    }
+                }
+                return false;
+            }
+        };
+
+        /**
+         * @brief What is waiting on one fd. Any number of coroutines may wait
+         *        in each direction; a readiness event wakes all of that
+         *        direction's waiters (the loser of a race sees EAGAIN and
+         *        waits again).
+         */
+        struct FdWaiters {
+            DirWaiters readers;
+            DirWaiters writers;
+
+            bool empty() const noexcept { return this->readers.empty() && this->writers.empty(); }
+        };
+
+    } // namespace detail
 
     /**
      * @class Reactor
@@ -92,13 +157,13 @@ namespace YarnBall {
          *    which wakes via the loopback wakeup socket and rebuilds its
          *    poll set. One-shot semantics (re-await to re-arm).
          */
-        void registerReadable(int fd, std::coroutine_handle<> h) noexcept;
+        void registerReadable(SocketHandle fd, std::coroutine_handle<> h) noexcept;
 
         /**
          * @brief Register interest in @c fd becoming writable. See
          *        @ref registerReadable for semantics.
          */
-        void registerWritable(int fd, std::coroutine_handle<> h) noexcept;
+        void registerWritable(SocketHandle fd, std::coroutine_handle<> h) noexcept;
 
         /**
          * @brief Schedule @p h to be resumed after @p duration elapses.
@@ -122,6 +187,63 @@ namespace YarnBall {
                             std::coroutine_handle<> h) noexcept;
 
         /**
+         * @brief Take @p h out of a still-pending readable/writable wait on
+         *        @p fd. With @p resume the coroutine is then resumed on the
+         *        Yarn pool as if the fd had become ready (it re-checks the
+         *        fd itself); without it the handle is simply forgotten, for
+         *        a frame that is being destroyed.
+         *
+         * Ownership contract (kqueue, epoll, Windows; exact): exactly one
+         * party resumes a waiter. This call returns @c true iff it took the
+         * registration out before readiness claimed it, and then it alone
+         * decides the handle's fate (resumed now, or never resumed by the
+         * Reactor). It returns @c false when there is no such wait or the
+         * readiness event already claimed @p h: that resume is in flight or
+         * done and cannot be stopped from here.
+         *
+         * io_uring: completion is asynchronous, so the kernel is only asked
+         * to cancel the poll and @c true means "requested". With @p resume
+         * the handle is still resumed exactly once (by the cancellation or
+         * by the readiness that beat it). With @c resume = @c false the
+         * Reactor cannot tell whether that resume already happened, so a
+         * caller that must know whether @p h may still be resumed has to use
+         * @c resume = @c true and hand in a handle that tolerates the
+         * resume (Yarn's own awaiters register a detail::WaitProxy and never
+         * pass @c resume = @c false).
+         *
+         * @return See above.
+         */
+        bool cancelWait(SocketHandle fd, std::coroutine_handle<> h, bool resume = true) noexcept;
+
+        /**
+         * @brief Same as @ref cancelWait for a timer armed by
+         *        @ref registerTimer: a pending timer is removed and @p h is
+         *        resumed early (or forgotten when @p resume is false). The
+         *        same ownership contract applies: exact on kqueue, epoll and
+         *        Windows, "requested" on io_uring.
+         */
+        bool cancelTimer(std::coroutine_handle<> h, bool resume = true) noexcept;
+
+        /**
+         * @brief Deregister @p fd: every coroutine parked on it, in either
+         *        direction, is removed and resumed on the Yarn pool, where
+         *        its next syscall reports the closed / bad descriptor.
+         *        Call it from the code that owns the fd, just before
+         *        @c close(fd): the kernel drops a closed fd from its
+         *        interest set silently, so without this a waiter would stay
+         *        parked forever (and could be woken by an unrelated fd that
+         *        later reuses the number).
+         *
+         * @return Number of waiters resumed (a lower bound on io_uring).
+         *
+         * Registering a wait on an fd number that still has waiters whose
+         * descriptor was closed without this call is detected on kqueue (the
+         * knote is gone): those stale waiters are resumed first, so a reused
+         * number never inherits or strands them.
+         */
+        std::size_t cancelFd(SocketHandle fd) noexcept;
+
+        /**
          * @brief Cooperative stop. Wakes the event loop thread, which
          *        exits once it observes @c running == false. Idempotent.
          */
@@ -129,8 +251,8 @@ namespace YarnBall {
 
 #if defined(_WIN32)
         /**
-         * @brief Associate @p fd (a Windows @c SOCKET held in an @c int)
-         *        with the Reactor's IOCP. Required before issuing any
+         * @brief Associate @p fd (a Windows @c SOCKET) with the Reactor's
+         *        IOCP. Required before issuing any
          *        proactor-style overlapped operation through Soccer.
          *
          * Idempotent: re-associating an already-associated socket is a
@@ -142,7 +264,7 @@ namespace YarnBall {
          *
          * @return @c true on success.
          */
-        bool associateIocp(int fd) noexcept;
+        bool associateIocp(SocketHandle fd) noexcept;
 
         /**
          * @brief Raw IOCP HANDLE, exposed for code in the same TU as
@@ -157,6 +279,12 @@ namespace YarnBall {
     private:
         Reactor();
         ~Reactor();
+
+        /**
+         * @brief Stop and join the loop thread at process exit (the Reactor
+         *        object itself is never destroyed).
+         */
+        void retire() noexcept;
 
         /**
          * @brief Event loop body; runs on @ref thread.
@@ -183,6 +311,17 @@ namespace YarnBall {
          * @brief kqueue descriptor.
          */
         int kq = -1;
+
+        /**
+         * @brief Waiters per fd. kqueue keeps one knote per (fd, filter), so
+         *        a second waiter in the same direction would overwrite the
+         *        first one's udata; the handles live here instead and the
+         *        knote only signals readiness. Guarded by @ref fdMu.
+         */
+        std::unordered_map<int, detail::FdWaiters> fdWaiters;
+        std::mutex fdMu;
+
+        void registerFd(int fd, std::coroutine_handle<> h, bool writable) noexcept;
 #elif defined(__linux__) && defined(YARN_USE_IO_URING)
         /**
          * @brief liburing ring handle. Allocated in the constructor;
@@ -203,6 +342,32 @@ namespace YarnBall {
          *        register_* call.
          */
         std::mutex sqMu;
+
+        /**
+         * @brief Handles whose pending poll/timeout was cancelled with
+         *        resume == false; the completion of such an operation is
+         *        swallowed instead of resuming the (destroyed) coroutine.
+         *        Guarded by @ref sqMu.
+         */
+        std::vector<void *> droppedHandles;
+
+        /**
+         * @brief Fast-path guard for @ref droppedHandles so the completion
+         *        loop only takes @ref sqMu when a drop is outstanding.
+         */
+        std::atomic<int> droppedPending{0};
+
+        /**
+         * @brief Wake the loop so it submits SQEs left queued by a failed
+         *        io_uring_submit.
+         */
+        void pokeLoop() noexcept;
+
+        /**
+         * @brief Ask the kernel to cancel the poll (or timeout when
+         *        @p timer) whose user_data is @p key.
+         */
+        bool cancelByHandle(void *key, bool resume, bool timer) noexcept;
 #elif defined(__linux__)
         /**
          * @brief epoll descriptor.
@@ -233,26 +398,29 @@ namespace YarnBall {
         std::mutex timerSetMu;
 
         /**
-         * @brief What is waiting on one fd. epoll keeps ONE interest set per fd (EPOLL_CTL_MOD replaces it), so a reader
-         *        and a writer waiting on the same socket cannot be registered independently: the second registration
-         *        would silently drop the first and its coroutine would never be resumed (kqueue keeps the two filters
-         *        apart, which is why this only bit on Linux). Both handles live here and the armed mask is their union.
+         * @brief Fallback for when a timerfd cannot be created (fd exhaustion with many concurrent sleeps): deadline-ordered
+         *        handles serviced by the run loop through the epoll_wait timeout. Guarded by @ref timerSetMu.
          */
-        struct FdWaiters {
-            void *readH = nullptr;
-            void *writeH = nullptr;
-        };
+        std::multimap<std::chrono::steady_clock::time_point, void *> softTimers;
 
         /**
          * @brief Waiters per fd. Guarded by @ref fdMu.
          */
-        std::unordered_map<int, FdWaiters> fdWaiters;
+        std::unordered_map<int, detail::FdWaiters> fdWaiters;
         std::mutex fdMu;
+
+        /**
+         * @brief Timer entries removed by @ref cancelTimer whose memory is
+         *        released by the run loop once the current event batch (which
+         *        may still name them) has been processed. Guarded by
+         *        @ref timerSetMu.
+         */
+        std::vector<void *> deadTimers;
 
         /**
          * @brief (Re)arm @p fd for the directions in @p w, one-shot. Returns false when epoll refuses the fd. fdMu held.
          */
-        bool armFdLocked(int fd, const FdWaiters &w) noexcept;
+        bool armFdLocked(int fd, const detail::FdWaiters &w) noexcept;
 
         /**
          * @brief Add a waiter in one direction and arm the union. Falls back to scheduling @p h at once when epoll

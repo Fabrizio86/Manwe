@@ -122,7 +122,12 @@ WebSocket protocol with one verb per operation:
   `\r\n\r\n` are captured in `preBuf` and drained on the next frame
   read — this matters when a server packs its 101 response and the
   first data frame into one TCP segment.
-- `WsConnection::connect(host, port, path)` is the client mirror.
+- `wsServe(listener, handler, WsOptions, stop)` is the ready-made accept loop: it
+  runs the handshake on every connection and applies `maxConnections`, the handshake
+  timeout and the Origin policy (`allowedOrigins` / `originCheck`), then calls
+  `handler(WsConnection)`. Prefer it to a hand-written `accept` loop.
+- `WsConnection::connect(host, port, path)` is the client mirror
+  (`WsOptions::connectTimeout` bounds resolve + TCP connect).
 - `receive()` returns the next data message. **Multi-frame messages
   are reassembled** per RFC 6455 §5.4: a leading TEXT/BINARY frame
   with FIN=0 plus zero or more CONTINUATION frames with FIN=0 ending

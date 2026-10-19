@@ -17,6 +17,9 @@
 #ifndef SOCCER_TCP_SERVER_H
 #define SOCCER_TCP_SERVER_H
 
+#include <cerrno>
+#include <chrono>
+#include <cstddef>
 #include <cstring>
 #include <functional>
 #include <stop_token>
@@ -32,11 +35,14 @@
 #include <ws2tcpip.h>
 #endif
 
+#include "ConnectionLimiter.h"
 #include "Coroutines.h"
 #include "PlatformNet.h"
 #include "SocketException.h"
 #include "TcpListener.h"
+#include "NetUtil.h"
 #include "TcpStream.h"
+#include "Timers.h"
 #include "YarnBall.hpp"
 
 namespace Soccer {
@@ -60,6 +66,10 @@ namespace Soccer {
      *                  suspended accept on macOS); the loop then
      *                  observes @c stop_requested() and returns.
      *
+     * @param maxConnections Cap on concurrently running handlers; zero means
+     *                  unlimited. A connection accepted while the cap is reached
+     *                  is closed immediately without invoking @p handler.
+     *
      * @note In-flight handlers are NOT cancelled when @p stop fires --
      *       C++ coroutines have no forced cancellation. If you want
      *       handlers to shorten, plumb @p stop through to them and
@@ -76,10 +86,31 @@ namespace Soccer {
      *       bump a counter) before its first read, expect exactly one
      *       such event per graceful shutdown.
      */
+    inline bool isTransientAcceptError(int err) noexcept {
+#ifndef _WIN32
+        return err == EMFILE || err == ENFILE || err == ENOBUFS || err == ENOMEM ||
+               err == ECONNABORTED || err == EPROTO || err == EINTR;
+#else
+        return err == WSAEMFILE || err == WSAECONNRESET || err == WSAENOBUFS;
+#endif
+    }
+
+    namespace detail {
+        /// Runs @p task and keeps @p slot (a live-connection count) until it ends.
+        inline YarnBall::Task<void> heldConnection(YarnBall::Task<void> task,
+                                                   ConnectionLimiter::Slot slot) {
+            (void) slot;
+            co_await std::move(task);
+            co_return;
+        }
+    }
+
     inline YarnBall::Task<void>
     tcpServe(TcpListener listener,
               std::function<YarnBall::Task<void>(TcpStream)> handler,
-              std::stop_token stop = {}) {
+              std::stop_token stop = {},
+              std::size_t maxConnections = 0) {
+        ConnectionLimiter limiter(maxConnections);
         // Unblock a pending accept on stop: closing or shutting down
         // the listener fd does NOT reliably wake a kqueue-suspended
         // accept on macOS (the kernel drops the filter silently
@@ -115,21 +146,31 @@ namespace Soccer {
                 }
             }
 
-            const int probe = static_cast<int>(::socket(local.family(),
-                                                          SOCK_STREAM, 0));
+            const int probe = detail::openSocket(local.family(), SOCK_STREAM, 0);
             if (probe < 0) return;
             (void) ::connect(probe,
                               reinterpret_cast<sockaddr *>(&dest), destLen);
             (void) YarnBall::closeSocket(probe);
         });
         while (!stop.stop_requested()) {
+            bool backoff = false;
             try {
                 TcpStream client = co_await listener.accept();
-                YarnBall::coSpawn(handler(std::move(client)));
-            } catch (const SocketException &) {
+                if (maxConnections == 0) {
+                    YarnBall::coSpawn(handler(std::move(client)));
+                } else if (auto slot = limiter.tryAcquire()) {
+                    YarnBall::coSpawn(detail::heldConnection(handler(std::move(client)),
+                                                             std::move(slot)));
+                } // else: over the cap -- `client` is closed on scope exit
+            } catch (const SocketException &e) {
                 if (stop.stop_requested()) co_return;
-                throw;
+                // Transient accept failures (fd exhaustion, a peer that
+                // reset before accept) must not end the accept loop:
+                // back off briefly and keep serving.
+                if (!isTransientAcceptError(e.errorCode())) throw;
+                backoff = true;
             }
+            if (backoff) co_await YarnBall::sleepFor(std::chrono::milliseconds{10});
         }
         co_return;
     }

@@ -7,6 +7,8 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
+#include <exception>
 #include <new>
 #include <optional>
 #include <stdexcept>
@@ -214,6 +216,24 @@ namespace YarnBall {
          */
         template<typename U>
         bool emplace_impl(U &&item) {
+            if constexpr (std::is_nothrow_constructible_v<T, U &&>) {
+                return claim_and_construct(std::forward<U>(item));
+            } else {
+                // A slot is claimed (head advanced) before T is constructed; if the constructor then threw, the
+                // slot's sequence would never be published and every consumer would stall on it forever. Build the
+                // element first, so a throwing copy/convert propagates to the caller with the queue untouched.
+                T tmp(std::forward<U>(item));
+                return claim_and_construct(std::move(tmp));
+            }
+        }
+
+        /**
+         * @brief Claim a slot and construct the element in it. A throw from
+         *        the constructor after the claim cannot be undone and would
+         *        wedge the queue, so it terminates instead of stalling.
+         */
+        template<typename U>
+        bool claim_and_construct(U &&item) {
             size_t pos = head.load(std::memory_order_relaxed);
             while (true) {
                 Cell<T> &cell = buffer[pos & mask];
@@ -222,7 +242,11 @@ namespace YarnBall {
 
                 if (diff == 0) {
                     if (head.compare_exchange_weak(pos, pos + 1, std::memory_order_relaxed)) {
-                        ::new (static_cast<void *>(&cell.storage)) T(std::forward<U>(item));
+                        try {
+                            ::new (static_cast<void *>(&cell.storage)) T(std::forward<U>(item));
+                        } catch (...) {
+                            std::terminate();
+                        }
                         cell.sequence.store(pos + 1, std::memory_order_release);
                         return true;
                     }

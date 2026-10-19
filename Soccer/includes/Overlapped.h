@@ -73,7 +73,7 @@ namespace Soccer {
 
             bool await_ready() noexcept { return false; }
 
-            void await_suspend(std::coroutine_handle<> h) noexcept {
+            bool await_suspend(std::coroutine_handle<> h) noexcept {
                 this->oc.handle = h;
                 DWORD bytes = 0;
                 DWORD flags = 0;
@@ -87,16 +87,18 @@ namespace Soccer {
                     // completion (notifications are not skipped unless
                     // SetFileCompletionNotificationModes opted in), so we
                     // simply wait for the IOCP path to deliver @c bytes.
-                    return;
+                    return true;
                 }
                 const int err = ::WSAGetLastError();
-                if (err == WSA_IO_PENDING) return; // expected async path
-                // Hard failure pre-suspend: capture the error and resume
-                // immediately on the calling worker.
+                if (err == WSA_IO_PENDING) return true; // expected async path
+                // Hard failure pre-suspend: capture the error and do not
+                // suspend, so await_resume reports it. (Resuming the handle
+                // from inside await_suspend would re-enter a coroutine that
+                // has not finished suspending.)
                 this->oc.err = err;
                 this->sync_err = err;
                 this->sync_done = true;
-                h.resume();
+                return false;
             }
 
             std::size_t await_resume() {
@@ -128,7 +130,7 @@ namespace Soccer {
 
             bool await_ready() noexcept { return false; }
 
-            void await_suspend(std::coroutine_handle<> h) noexcept {
+            bool await_suspend(std::coroutine_handle<> h) noexcept {
                 this->oc.handle = h;
                 DWORD bytes = 0;
                 int rc = ::WSASend(static_cast<SOCKET>(static_cast<unsigned>(this->fd)),
@@ -136,11 +138,11 @@ namespace Soccer {
                                    &bytes, /*flags=*/0,
                                    static_cast<OVERLAPPED *>(&this->oc),
                                    /*lpCompletionRoutine=*/nullptr);
-                if (rc == 0) return;
+                if (rc == 0) return true;
                 const int err = ::WSAGetLastError();
-                if (err == WSA_IO_PENDING) return;
+                if (err == WSA_IO_PENDING) return true;
                 this->oc.err = err;
-                h.resume();
+                return false;
             }
 
             std::size_t await_resume() {

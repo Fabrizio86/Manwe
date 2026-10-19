@@ -4,7 +4,16 @@
 
 #include "UdpSocket.h"
 
+#include <algorithm>
+
+#ifndef _WIN32
+#include <sys/socket.h>
+#include <sys/uio.h>
+#endif
+
 #include "IoAwaiters.h"
+#include "Reactor.h"
+#include "NetUtil.h"
 #include "PlatformNet.h"
 #include "SocketException.h"
 
@@ -22,7 +31,7 @@ namespace Soccer {
         YarnBall::ensureWsaStarted();
         const auto addr = SocketAddress::resolve(host, port);
 
-        const int fd = static_cast<int>(::socket(addr.family(), SOCK_DGRAM, IPPROTO_UDP));
+        const int fd = detail::openSocket(addr.family(), SOCK_DGRAM, IPPROTO_UDP);
         if (fd < 0) throw SocketException("socket", YarnBall::lastSocketError());
 
         if (::bind(fd, addr.data(), addr.length()) < 0) {
@@ -42,26 +51,60 @@ namespace Soccer {
     }
 
     YarnBall::Task<std::size_t> UdpSocket::recvFrom(std::span<std::byte> buf,
-                                                    SocketAddress *sender) {
+                                                    SocketAddress *sender,
+                                                    bool *truncated) {
         if (this->sock < 0) {
             throw SocketException("recvFrom on closed UdpSocket");
         }
+        if (truncated) *truncated = false;
         while (true) {
+            // Re-checked on every pass: close() wakes a parked receiver, which must then fail.
+            if (this->sock < 0) {
+                throw SocketException("recvFrom on closed UdpSocket");
+            }
             sockaddr_storage from{};
             socklen_t fromlen = sizeof(from);
+            bool cut = false;
 
             ::ssize_t n;
+#ifndef _WIN32
+            // recvmsg, not recvfrom: only msg_flags reports MSG_TRUNC, i.e. that
+            // the datagram was longer than the buffer and the tail was discarded.
+            iovec iov{};
+            iov.iov_base = buf.data();
+            iov.iov_len = buf.size();
+            msghdr msg{};
+            msg.msg_name = &from;
+            msg.msg_namelen = sizeof(from);
+            msg.msg_iov = &iov;
+            msg.msg_iovlen = 1;
+            do {
+                msg.msg_namelen = sizeof(from);
+                n = ::recvmsg(this->sock, &msg, 0);
+            } while (n < 0 && YarnBall::isEintr(YarnBall::lastSocketError()));
+            if (n >= 0) {
+                fromlen = msg.msg_namelen;
+                cut = (msg.msg_flags & MSG_TRUNC) != 0;
+            }
+#else
             do {
                 n = ::recvfrom(this->sock,
                                reinterpret_cast<char *>(buf.data()),
-                               static_cast<int>(buf.size()), 0,
+                               static_cast<int>(std::min<std::size_t>(buf.size(), 0x7fffffffu)), 0,
                                reinterpret_cast<sockaddr *>(&from), &fromlen);
             } while (n < 0 && YarnBall::isEintr(YarnBall::lastSocketError()));
+            // WinSock fails an oversized datagram with WSAEMSGSIZE but still fills the buffer.
+            if (n < 0 && YarnBall::lastSocketError() == WSAEMSGSIZE) {
+                n = static_cast<::ssize_t>(std::min<std::size_t>(buf.size(), 0x7fffffffu));
+                cut = true;
+            }
+#endif
 
             if (n >= 0) {
                 if (sender) {
                     *sender = SocketAddress(reinterpret_cast<sockaddr *>(&from), fromlen);
                 }
+                if (truncated) *truncated = cut;
                 co_return static_cast<std::size_t>(n);
             }
             const int err = YarnBall::lastSocketError();
@@ -79,11 +122,14 @@ namespace Soccer {
             throw SocketException("sendTo on closed UdpSocket");
         }
         while (true) {
+            if (this->sock < 0) {
+                throw SocketException("sendTo on closed UdpSocket");
+            }
             ::ssize_t n;
             do {
                 n = ::sendto(this->sock,
                              reinterpret_cast<const char *>(buf.data()),
-                             static_cast<int>(buf.size()), 0,
+                             static_cast<int>(std::min<std::size_t>(buf.size(), 0x7fffffffu)), 0,
                              destination.data(), destination.length());
             } while (n < 0 && YarnBall::isEintr(YarnBall::lastSocketError()));
 
@@ -248,9 +294,16 @@ namespace Soccer {
     }
 
     void UdpSocket::close() noexcept {
-        if (this->sock >= 0) {
-            (void) YarnBall::closeSocket(this->sock);
+        const int fd = this->sock;
+        if (fd >= 0) {
+            // Closed first, so a woken recvFrom / sendTo re-checks `sock` and fails
+            // rather than using a descriptor number that is about to be reused.
             this->sock = -1;
+#ifndef _WIN32
+            // Wake any coroutine still parked on this fd before it is closed (and the number reused).
+            (void) YarnBall::Reactor::instance()->cancelFd(fd);
+#endif
+            (void) YarnBall::closeSocket(fd);
         }
     }
 

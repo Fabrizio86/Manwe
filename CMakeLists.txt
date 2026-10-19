@@ -1,13 +1,22 @@
-cmake_minimum_required(VERSION 3.19)
+cmake_minimum_required(VERSION 3.20)
 project(Manwe VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Default to an optimised build so benchmarks are meaningful.
+if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif ()
+
 # ---- Build outputs go to bin/ (tracked) ----------------------------------
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/bin")
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/bin")
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/bin")
+# Only when Manwe is the top-level project; as a subdirectory it must not
+# override the consumer's output layout or write into its own source tree.
+if (CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/bin")
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/bin")
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/bin")
+endif ()
 
 # ---- LIB_PATH propagated to subdirectory CMakeLists for include lookups --
 set(LIB_PATH ${PROJECT_SOURCE_DIR})
@@ -20,6 +29,7 @@ option(MANWE_BUILD_TESTS "Build YarnTests" ON)
 option(MANWE_BUILD_EXAMPLES "Build the examples/ executables" ON)
 option(MANWE_BUILD_BENCHMARKS "Build the benchmarks/ executables" ON)
 
+enable_testing()
 add_subdirectory(Yarn)
 add_subdirectory(Wire)
 add_subdirectory(Soccer)

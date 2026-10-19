@@ -11,9 +11,11 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <utility>
 #include <vector>
 
+#include "Cancellation.h"
 #include "Coroutines.h"
 
 namespace YarnBall {
@@ -70,6 +72,14 @@ namespace YarnBall {
              */
             std::coroutine_handle<> waiter{};
 
+            /**
+             * @brief Cancellation scope handed to the subtasks when whenAll
+             *        itself runs inside one (see Cancellation.h); stopped
+             *        when that outer scope is. Unused (no allocation) otherwise.
+             */
+            std::stop_source stop{std::nostopstate};
+            bool scoped = false;
+
             explicit WhenAllState(size_t n) : results(n), remaining(n + 1) {
             }
 
@@ -113,6 +123,8 @@ namespace YarnBall {
             std::mutex ex_mu;
             std::atomic<size_t> remaining{0};
             std::coroutine_handle<> waiter{};
+            std::stop_source stop{std::nostopstate};
+            bool scoped = false;
 
             explicit WhenAllVoidState(size_t n) : remaining(n + 1) {
             }
@@ -142,6 +154,11 @@ namespace YarnBall {
         Task<> whenAllRunner(std::shared_ptr<WhenAllState<T>> state,
                                    size_t idx,
                                    Task<T> task) {
+            std::stop_token scope;
+            if (state->scoped) {
+                scope = state->stop.get_token();
+                co_await InstallScopeAwaiter{&scope};
+            }
             try {
                 auto value = co_await std::move(task);
                 state->results[idx].emplace(std::move(value));
@@ -160,6 +177,11 @@ namespace YarnBall {
          */
         inline Task<> whenAllRunnerVoid(std::shared_ptr<WhenAllVoidState> state,
                                                Task<> task) {
+            std::stop_token scope;
+            if (state->scoped) {
+                scope = state->stop.get_token();
+                co_await InstallScopeAwaiter{&scope};
+            }
             try {
                 co_await std::move(task);
             } catch (...) {
@@ -221,6 +243,9 @@ namespace YarnBall {
      * Each subtask is dispatched via @c coSpawn, so the pool is free to
      * distribute them across workers. The aggregating coroutine itself
      * suspends on a latch and resumes once the last subtask reports in.
+     * If the caller is inside a cancellation scope (see Cancellation.h),
+     * every subtask runs in a scope that follows it, so stopping the outer
+     * scope cancels their parked awaits.
      *
      * @tparam T Per-subtask result type (must not be @c void; see the
      *           dedicated overload below).
@@ -228,6 +253,13 @@ namespace YarnBall {
     template<typename T>
     Task<std::vector<T>> whenAll(std::vector<Task<T>> tasks) {
         auto state = std::make_shared<detail::WhenAllState<T>>(tasks.size());
+        detail::TaskPromiseCore *outer = co_await detail::CurrentScopeAwaiter{};
+        detail::ScopeLink link;
+        if (outer) {
+            state->stop = std::stop_source();
+            state->scoped = true;
+            link.follow(outer, state->stop);
+        }
 
         for (size_t i = 0; i < tasks.size(); ++i) {
             coSpawn(detail::whenAllRunner<T>(state, i, std::move(tasks[i])));
@@ -250,6 +282,13 @@ namespace YarnBall {
      */
     inline Task<> whenAll(std::vector<Task<>> tasks) {
         auto state = std::make_shared<detail::WhenAllVoidState>(tasks.size());
+        detail::TaskPromiseCore *outer = co_await detail::CurrentScopeAwaiter{};
+        detail::ScopeLink link;
+        if (outer) {
+            state->stop = std::stop_source();
+            state->scoped = true;
+            link.follow(outer, state->stop);
+        }
 
         for (auto &t : tasks) {
             coSpawn(detail::whenAllRunnerVoid(state, std::move(t)));

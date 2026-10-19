@@ -42,11 +42,15 @@ namespace Soccer {
         /**
          * @brief Bind a listening TLS socket on @p host:@p port using the
          *        certificate at @p certPath and private key at @p keyPath.
+         *        @p options adds ALPN protocols and/or required client
+         *        certificates (mutual TLS); the default matches the plain
+         *        server-auth-only behaviour.
          */
         static TlsListener bind(const std::string &host,
                                 std::uint16_t port,
                                 const std::string &certPath,
-                                const std::string &keyPath);
+                                const std::string &keyPath,
+                                const TlsServerOptions &options = {});
 
         /**
          * @brief Accept the next TCP connection and perform the server-side
@@ -100,11 +104,19 @@ namespace Soccer {
          */
         SocketAddress localAddress() const;
 
+        /**
+         * @brief Close the socket and release the certificate. Safe to call while
+         *        an @ref accept / @ref acceptPending is in flight (the pending
+         *        accept then fails with a SocketException).
+         */
         void close() noexcept;
 
     private:
         struct Impl;
-        std::unique_ptr<Impl> impl;
+        static YarnBall::Task<PendingHandshake> acceptPendingOn(std::shared_ptr<Impl> im);
+        // Shared with in-flight accepts so a close() or move-assignment can never
+        // pull the state out from under one.
+        std::shared_ptr<Impl> impl;
     };
 
 }

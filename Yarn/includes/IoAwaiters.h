@@ -5,63 +5,140 @@
 #ifndef YARN_IO_AWAITERS_H
 #define YARN_IO_AWAITERS_H
 
+#include <atomic>
 #include <coroutine>
+#include <stop_token>
 
+#include "Cancellation.h"
 #include "Coroutines.h"
 #include "Reactor.h"
 
 #ifndef _WIN32
     #include <cerrno>
     #include <cstddef>
+    #include <sys/socket.h>
     #include <sys/types.h>
     #include <unistd.h>
 #endif
 
 namespace YarnBall::io {
 
+    namespace impl {
+
+        /**
+         * @brief Shared implementation of the fd-readiness awaiters. Outside
+         *        a cancellation scope it is a plain Reactor registration;
+         *        inside one, a stop request takes the coroutine out of the
+         *        Reactor and wakes it with @c CancelledException. A frame
+         *        destroyed while parked is forgotten by the Reactor.
+         */
+        template<bool Writable>
+        struct FdWaitAwaiter {
+            SocketHandle fd;
+
+            FdWaitAwaiter(const FdWaitAwaiter &) = delete;
+            FdWaitAwaiter &operator=(const FdWaitAwaiter &) = delete;
+
+            explicit FdWaitAwaiter(SocketHandle f) noexcept : fd(f) {}
+
+            ~FdWaitAwaiter() {
+                this->bind.disarm();
+                // Frame destroyed while parked: the Reactor may or may not still hold the proxy. Marking it dead first
+                // makes whichever resume reaches it (ours below, or one already in flight) a no-op.
+                if (this->armed && !this->resumed && this->proxy.kill()) {
+                    (void) Reactor::instance()->cancelWait(this->fd, this->handle);
+                }
+                this->proxy.drop();
+            }
+
+            bool await_ready() const noexcept { return false; }
+
+            template<typename Promise>
+            bool await_suspend(std::coroutine_handle<Promise> h) noexcept {
+                YarnBall::detail::TaskPromiseCore *core = YarnBall::detail::CancelBinding::ambient(h);
+                if (!core) {
+                    this->armed = true;
+                    this->handle = this->proxy.publish(h);
+                    this->registerWait(this->handle);
+                    return true;
+                }
+                if (core->isCancellationRequested()) {
+                    this->cancelled.store(true, std::memory_order_relaxed);
+                    return false;
+                }
+                this->handle = this->proxy.publish(h);
+                const auto watch = this->bind.armWatched(core, &FdWaitAwaiter::onCancel, this);
+                if (this->cancelled.load(std::memory_order_relaxed)) {
+                    // Stopped while arming: nothing is registered yet, so the proxy was never visible to anyone.
+                    this->bind.disarm();
+                    this->proxy.reclaim();
+                    return false;
+                }
+                const auto proxyHandle = this->handle;
+                const SocketHandle waitFd = this->fd;
+                this->armed = true;
+                this->registerWait(proxyHandle);
+                // A stop that landed before the registration found nothing to cancel: redo it now. Only locals from
+                // here on: the wait may already have completed (and destroyed) this awaiter.
+                if (watch->load(std::memory_order_acquire)) (void) Reactor::instance()->cancelWait(waitFd, proxyHandle);
+                return true;
+            }
+
+            void await_resume() {
+                this->resumed = true;
+                if (this->cancelled.load(std::memory_order_relaxed)) throw CancelledException{};
+            }
+
+        private:
+            void registerWait(std::coroutine_handle<> h) noexcept {
+                if constexpr (Writable) {
+                    Reactor::instance()->registerWritable(this->fd, h);
+                } else {
+                    Reactor::instance()->registerReadable(this->fd, h);
+                }
+            }
+
+            static void onCancel(void *p) noexcept {
+                auto *self = static_cast<FdWaitAwaiter *>(p);
+                self->cancelled.store(true, std::memory_order_relaxed);
+                (void) Reactor::instance()->cancelWait(self->fd, self->handle);
+            }
+
+            std::coroutine_handle<> handle{}; // the proxy, once published
+            std::atomic<bool> cancelled{false};
+            bool armed = false;
+            bool resumed = false;
+            YarnBall::detail::WaitProxy proxy;
+            YarnBall::detail::CancelBinding bind;
+        };
+
+    } // namespace impl
+
     /**
      * @struct WaitReadableAwaiter
      * @brief Awaiter that suspends the current coroutine until the given fd
-     *        becomes readable. Resumption lands on a Yarn worker.
+     *        becomes readable. Resumption lands on a Yarn worker. Cancellable
+     *        (see Cancellation.h).
      */
-    struct WaitReadableAwaiter {
-        int fd;
-
-        bool await_ready() const noexcept { return false; }
-
-        void await_suspend(std::coroutine_handle<> h) noexcept {
-            Reactor::instance()->registerReadable(this->fd, h);
-        }
-
-        void await_resume() const noexcept {}
-    };
+    using WaitReadableAwaiter = impl::FdWaitAwaiter<false>;
 
     /**
      * @struct WaitWritableAwaiter
      * @brief Awaiter that suspends the current coroutine until the given fd
-     *        becomes writable. Resumption lands on a Yarn worker.
+     *        becomes writable. Resumption lands on a Yarn worker. Cancellable
+     *        (see Cancellation.h).
      */
-    struct WaitWritableAwaiter {
-        int fd;
-
-        bool await_ready() const noexcept { return false; }
-
-        void await_suspend(std::coroutine_handle<> h) noexcept {
-            Reactor::instance()->registerWritable(this->fd, h);
-        }
-
-        void await_resume() const noexcept {}
-    };
+    using WaitWritableAwaiter = impl::FdWaitAwaiter<true>;
 
     /**
      * @brief Convenience factory: @c co_await waitReadable(fd).
      */
-    inline WaitReadableAwaiter waitReadable(int fd) noexcept { return {fd}; }
+    inline WaitReadableAwaiter waitReadable(SocketHandle fd) noexcept { return WaitReadableAwaiter{fd}; }
 
     /**
      * @brief Convenience factory: @c co_await waitWritable(fd).
      */
-    inline WaitWritableAwaiter waitWritable(int fd) noexcept { return {fd}; }
+    inline WaitWritableAwaiter waitWritable(SocketHandle fd) noexcept { return WaitWritableAwaiter{fd}; }
 
 #ifndef _WIN32
 
@@ -74,12 +151,16 @@ namespace YarnBall::io {
      *         the syscall).
      */
     inline Task<ssize_t> asyncRead(int fd, void *buf, std::size_t len) {
-        co_await waitReadable(fd);
-        ssize_t n;
-        do {
-            n = ::read(fd, buf, len);
-        } while (n < 0 && errno == EINTR);
-        co_return n;
+        while (true) {
+            co_await waitReadable(fd);
+            ssize_t n;
+            do {
+                n = ::read(fd, buf, len);
+            } while (n < 0 && errno == EINTR);
+            // Spurious wake / another reader won the data: wait again.
+            if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+            co_return n;
+        }
     }
 
     /**
@@ -91,10 +172,29 @@ namespace YarnBall::io {
     inline Task<ssize_t> asyncWrite(int fd, const void *buf, std::size_t len) {
         std::size_t total = 0;
         const auto *p = static_cast<const unsigned char *>(buf);
+        // A peer that hung up must surface as EPIPE, not kill the process with SIGPIPE: send(MSG_NOSIGNAL) where it
+        // exists, SO_NOSIGPIPE elsewhere. Non-sockets (pipes, files) fall back to plain write.
+        bool useSend = true;
+#if !defined(MSG_NOSIGNAL) && defined(SO_NOSIGPIPE)
+        {
+            const int one = 1;
+            (void) ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+        }
+#endif
         while (total < len) {
             ssize_t n;
             do {
+#ifdef MSG_NOSIGNAL
+                n = useSend ? ::send(fd, p + total, len - total, MSG_NOSIGNAL)
+                            : ::write(fd, p + total, len - total);
+                if (n < 0 && errno == ENOTSOCK) {
+                    useSend = false;
+                    n = ::write(fd, p + total, len - total);
+                }
+#else
+                (void) useSend;
                 n = ::write(fd, p + total, len - total);
+#endif
             } while (n < 0 && errno == EINTR);
             if (n < 0) {
                 if (errno == EAGAIN || errno == EWOULDBLOCK) {

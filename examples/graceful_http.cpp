@@ -83,13 +83,25 @@ YarnBall::Task<void> runServer(std::uint16_t port) {
     co_await server.serve();
 #endif
 
-    std::cerr << "graceful_http: drained, exiting\n";
+    std::cerr << "graceful_http: accept loop stopped, exiting\n";
     co_return;
+}
+
+/// Parse a TCP port (0-65535); exits with a message on bad input instead
+/// of silently truncating through a narrowing cast.
+static std::uint16_t parsePort(const char *text) {
+    char *end = nullptr;
+    const long v = std::strtol(text, &end, 10);
+    if (end == text || *end != '\0' || v < 0 || v > 65535) {
+        std::cerr << "invalid port: " << text << "\n";
+        std::exit(1);
+    }
+    return static_cast<std::uint16_t>(v);
 }
 
 int main(int argc, char **argv) {
     const std::uint16_t port = (argc > 1)
-        ? static_cast<std::uint16_t>(std::atoi(argv[1]))
+        ? parsePort(argv[1])
         : kDefaultPort;
     YarnBall::syncWait(runServer(port));
     return 0;

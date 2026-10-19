@@ -48,6 +48,7 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace YarnBall::metrics {
@@ -137,8 +138,10 @@ namespace YarnBall::metrics {
     public:
         /**
          * @brief Construct with the given finite bucket boundaries.
-         *        Must be sorted ascending. The implicit @c +Inf bucket
-         *        is appended automatically.
+         *        Must be strictly ascending and finite. The implicit
+         *        @c +Inf bucket is appended automatically.
+         * @throws std::invalid_argument if the bounds are not strictly
+         *         ascending finite numbers.
          */
         Histogram(std::vector<double> bucketBounds, std::string help = {});
 
@@ -171,6 +174,12 @@ namespace YarnBall::metrics {
         std::vector<std::pair<double, std::uint64_t>> snapshot() const;
 
         const std::string &help() const noexcept { return this->helpText; }
+
+        /**
+         * @brief The finite upper bounds this histogram was built with
+         *        (the implicit @c +Inf bucket is not included).
+         */
+        const std::vector<double> &bucketBounds() const noexcept { return this->bounds; }
 
     private:
         std::vector<double> bounds; // finite, sorted ascending
@@ -238,6 +247,11 @@ namespace YarnBall::metrics {
          */
         Counter &counter(const std::string &name, const std::string &help = {});
         Gauge &gauge(const std::string &name, const std::string &help = {});
+        /**
+         * @note Asking again for an existing histogram with different
+         *       bucket bounds throws @c std::logic_error rather than
+         *       silently returning a histogram with other buckets.
+         */
         Histogram &histogram(const std::string &name,
                               std::vector<double> buckets,
                               const std::string &help = {});

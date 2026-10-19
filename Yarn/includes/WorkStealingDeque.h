@@ -9,6 +9,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <stdexcept>
+#include <type_traits>
+#include <type_traits>
 #include <vector>
 
 namespace YarnBall {
@@ -86,7 +88,7 @@ namespace YarnBall {
             if (b - t >= static_cast<int64_t>(this->buffer.size())) {
                 return false;
             }
-            this->buffer[b & this->mask] = item;
+            this->buffer[b & this->mask].store(item, std::memory_order_relaxed);
             std::atomic_thread_fence(std::memory_order_release);
             this->bottom.store(b + 1, std::memory_order_relaxed);
             return true;
@@ -109,7 +111,7 @@ namespace YarnBall {
             int64_t t = this->top.load(std::memory_order_relaxed);
 
             if (t <= b) {
-                T item = this->buffer[b & this->mask];
+                T item = this->buffer[b & this->mask].load(std::memory_order_relaxed);
                 if (t == b) {
                     // Only one element left: race the stealers for it.
                     if (!this->top.compare_exchange_strong(
@@ -147,7 +149,7 @@ namespace YarnBall {
             int64_t b = this->bottom.load(std::memory_order_acquire);
 
             if (t < b) {
-                T item = this->buffer[t & this->mask];
+                T item = this->buffer[t & this->mask].load(std::memory_order_relaxed);
                 if (!this->top.compare_exchange_strong(
                         t, t + 1,
                         std::memory_order_seq_cst,
@@ -196,7 +198,7 @@ namespace YarnBall {
          *        by the release/seq_cst fences in push/pop/steal rather than by
          *        per-slot atomics.
          */
-        std::vector<T> buffer;
+        std::vector<std::atomic<T>> buffer;
 
         /**
          * @brief Top index, owned by stealers (and pop's contended branch).

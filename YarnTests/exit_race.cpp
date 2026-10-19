@@ -3,6 +3,7 @@
 // "mutex lock failed: Invalid argument" (about 1 in 600 runs under CPU load). Run it in a loop with busy processes competing:
 //   for i in $(seq 3000); do ./exit_race 8 >/dev/null || echo BAD; done
 #include "Coroutines.h"
+#include "Reactor.h"
 #include "Timers.h"
 #include "Yarn.hpp"
 #include <atomic>
@@ -10,7 +11,7 @@
 #include <cstdio>
 #include <thread>
 static YarnBall::Task<void> ticker(std::atomic<int>& n) {
-    for (;;) { co_await YarnBall::sleepFor(std::chrono::milliseconds(1)); n++; }
+    for (;;) { co_await YarnBall::sleepFor(std::chrono::milliseconds(1)); n++; YarnBall::Reactor::instance()->cancelFd(0); /* keeps touching the Reactor after main returns */ }
 }
 static std::atomic<int> g_n{0};
 int main(int argc, char** argv) {

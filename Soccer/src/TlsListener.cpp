@@ -17,7 +17,7 @@
 
 #include "Coroutines.h"
 #include "IoAwaiters.h"
-#include "Timers.h"
+#include "IoDeadline.h"
 #include "SocketAddress.h"
 #include "SocketException.h"
 #include "TcpListener.h"
@@ -33,15 +33,27 @@ namespace Soccer {
      */
     struct TlsListener::Impl {
         TcpListener tcp;
+        /// Guards server_ctx and cfg. close() frees them, tls_accept_socket uses
+        /// them, and the two can run on different threads (a certificate reload
+        /// closes the listener while an accept loop is parked or just resumed).
+        /// Every use of server_ctx happens under this lock, together with a check
+        /// that it is still set.
+        std::mutex mu;
         ::tls *server_ctx = nullptr;
         ::tls_config *cfg = nullptr;
     };
 
-    TlsListener::TlsListener() : impl(std::make_unique<Impl>()) {
+    TlsListener::TlsListener() : impl(std::make_shared<Impl>()) {
     }
 
     TlsListener::TlsListener(TlsListener &&) noexcept = default;
-    TlsListener &TlsListener::operator=(TlsListener &&) noexcept = default;
+    TlsListener &TlsListener::operator=(TlsListener &&other) noexcept {
+        if (this != &other) {
+            this->close(); // release the context, config and socket this listener still owns
+            this->impl = std::move(other.impl);
+        }
+        return *this;
+    }
 
     TlsListener::~TlsListener() {
         this->close();
@@ -55,23 +67,28 @@ namespace Soccer {
     }
 
     void TlsListener::close() noexcept {
-        if (!this->impl) return;
-        if (this->impl->server_ctx) {
-            ::tls_close(this->impl->server_ctx);
-            ::tls_free(this->impl->server_ctx);
-            this->impl->server_ctx = nullptr;
+        const std::shared_ptr<Impl> im = this->impl;
+        if (!im) return;
+        {
+            std::lock_guard<std::mutex> lk(im->mu);
+            if (im->server_ctx) {
+                ::tls_close(im->server_ctx);
+                ::tls_free(im->server_ctx);
+                im->server_ctx = nullptr;
+            }
+            if (im->cfg) {
+                ::tls_config_free(im->cfg);
+                im->cfg = nullptr;
+            }
         }
-        if (this->impl->cfg) {
-            ::tls_config_free(this->impl->cfg);
-            this->impl->cfg = nullptr;
-        }
-        this->impl->tcp.close();
+        im->tcp.close();
     }
 
     TlsListener TlsListener::bind(const std::string &host,
                                   std::uint16_t port,
                                   const std::string &certPath,
-                                  const std::string &keyPath) {
+                                  const std::string &keyPath,
+                                  const TlsServerOptions &options) {
         TlsListener l;
         l.impl->tcp = TcpListener::bind(host, port);
 
@@ -88,6 +105,21 @@ namespace Soccer {
             const std::string err =
                 ::tls_config_error(l.impl->cfg) ? ::tls_config_error(l.impl->cfg) : "tls_config_set_key_file";
             throw SocketException(err);
+        }
+
+        if (!options.alpnProtocols.empty() &&
+            ::tls_config_set_alpn(l.impl->cfg, options.alpnProtocols.c_str()) != 0) {
+            const std::string err =
+                ::tls_config_error(l.impl->cfg) ? ::tls_config_error(l.impl->cfg) : "tls_config_set_alpn";
+            throw SocketException(err);
+        }
+        if (!options.clientCaFile.empty()) {
+            if (::tls_config_set_ca_file(l.impl->cfg, options.clientCaFile.c_str()) != 0) {
+                const std::string err =
+                    ::tls_config_error(l.impl->cfg) ? ::tls_config_error(l.impl->cfg) : "tls_config_set_ca_file";
+                throw SocketException(err);
+            }
+            ::tls_config_verify_client(l.impl->cfg); // require a certificate signed by that CA
         }
 
         l.impl->server_ctx = ::tls_server();
@@ -121,54 +153,49 @@ namespace Soccer {
         if (ctx) ::tls_free(ctx);
     }
 
-    namespace {
-        /// Shared between a handshake and its watchdog. The mutex orders "the handshake is over, the fd may be closed or
-        /// reused" against "the watchdog is about to shut the fd down", so a late watchdog never touches someone else's fd.
-        struct HandshakeGuard {
-            std::mutex mu;
-            bool over = false;
-        };
-
-        YarnBall::Task<void> handshakeWatchdog(std::shared_ptr<HandshakeGuard> g, int fd,
-                                               std::chrono::milliseconds limit) {
-            co_await YarnBall::sleepFor(limit);
-            std::lock_guard lock(g->mu);
-            if (!g->over) (void) ::shutdown(fd, SHUT_RDWR); // wakes the parked wait; the handshake then fails
+    YarnBall::Task<TlsListener::PendingHandshake> TlsListener::acceptPendingOn(
+        std::shared_ptr<Impl> im) {
+        if (!im) throw SocketException("accept on closed TlsListener");
+        {
+            std::lock_guard<std::mutex> lk(im->mu);
+            if (!im->server_ctx) throw SocketException("accept on closed TlsListener");
         }
-    }
-
-    YarnBall::Task<TlsListener::PendingHandshake> TlsListener::acceptPending() {
-        if (!this->impl || !this->impl->server_ctx) {
+        TlsListener::PendingHandshake p;
+        p.tcp = co_await im->tcp.accept();
+        // The listener may have been closed (certificate reload) while parked in accept().
+        // close() frees server_ctx under the same lock, so this either sees it
+        // still set and finishes with it before close() can proceed, or sees it gone.
+        std::lock_guard<std::mutex> lk(im->mu);
+        if (!im->server_ctx) {
             throw SocketException("accept on closed TlsListener");
         }
-        PendingHandshake p;
-        p.tcp = co_await this->impl->tcp.accept();
         // Hand the fd to libtls; the handshake is driven later by completeHandshake.
-        if (::tls_accept_socket(this->impl->server_ctx, &p.ctx, p.tcp.fd()) != 0) {
+        if (::tls_accept_socket(im->server_ctx, &p.ctx, p.tcp.fd()) != 0) {
             p.ctx = nullptr;
             const std::string err =
-                ::tls_error(this->impl->server_ctx)
-                    ? ::tls_error(this->impl->server_ctx)
+                ::tls_error(im->server_ctx)
+                    ? ::tls_error(im->server_ctx)
                     : "tls_accept_socket";
             throw SocketException(err);
         }
         co_return p;
     }
 
+    YarnBall::Task<TlsListener::PendingHandshake> TlsListener::acceptPending() {
+        // Not a coroutine itself: the shared state is captured here, on the
+        // caller's thread, so the accept does not depend on `this` surviving.
+        return acceptPendingOn(this->impl);
+    }
+
     YarnBall::Task<TlsStream> TlsListener::completeHandshake(PendingHandshake p, std::chrono::milliseconds timeout) {
         ::tls *client_ctx = p.ctx;
         const int client_fd = p.tcp.fd();
-        std::shared_ptr<HandshakeGuard> guard;
-        if (timeout.count() > 0) {
-            guard = std::make_shared<HandshakeGuard>();
-            YarnBall::coSpawn(handshakeWatchdog(guard, client_fd, timeout));
-        }
-        const auto over = [&guard] {
-            if (guard) { std::lock_guard lock(guard->mu); guard->over = true; }
-        };
+        // A peer that stalls mid-handshake is cut off when the deadline passes. Declared
+        // after `p` (a parameter), so it is disarmed before the fd is closed or reused.
+        IoDeadline deadline(client_fd, timeout);
         while (true) {
             int hs = ::tls_handshake(client_ctx);
-            if (hs == 0) { over(); break; }
+            if (hs == 0) break;
             if (hs == TLS_WANT_POLLIN) {
                 co_await YarnBall::io::waitReadable(client_fd);
                 continue;
@@ -177,13 +204,15 @@ namespace Soccer {
                 co_await YarnBall::io::waitWritable(client_fd);
                 continue;
             }
+            if (deadline.expired()) throw SocketException("TLS handshake timed out");
             const std::string err =
                 ::tls_error(client_ctx) ? ::tls_error(client_ctx) : "tls_handshake";
-            over();
             throw SocketException(err); // p still owns ctx and the socket: both are released with it
         }
 
-        // Transfer ownership of the context and the fd to the TlsStream.
+        // Transfer ownership of the context and the fd to the TlsStream. The deadline is
+        // disarmed first so a late timer cannot shut down an fd that is no longer ours.
+        deadline.disarm();
         p.ctx = nullptr;
         const int adopted_fd = p.tcp.release();
         co_return TlsStream(client_ctx, /*cfg=*/nullptr, adopted_fd);
@@ -191,9 +220,8 @@ namespace Soccer {
 
     YarnBall::Task<TlsStream> TlsListener::accept() {
         PendingHandshake p = co_await this->acceptPending();
-        co_return co_await completeHandshake(std::move(p), std::chrono::milliseconds{0});
+        co_return co_await completeHandshake(std::move(p), std::chrono::seconds{10});
     }
-
 
 }
 

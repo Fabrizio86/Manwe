@@ -5,9 +5,12 @@
 #ifndef YARN_TIMERS_H
 #define YARN_TIMERS_H
 
+#include <atomic>
 #include <chrono>
 #include <coroutine>
+#include <stop_token>
 
+#include "Cancellation.h"
 #include "Coroutines.h"
 #include "Reactor.h"
 
@@ -29,6 +32,21 @@ namespace YarnBall {
     struct SleepAwaiter {
         std::chrono::nanoseconds duration;
 
+        SleepAwaiter(const SleepAwaiter &) = delete;
+        SleepAwaiter &operator=(const SleepAwaiter &) = delete;
+
+        explicit SleepAwaiter(std::chrono::nanoseconds d) noexcept : duration(d) {}
+
+        ~SleepAwaiter() {
+            this->bind.disarm();
+            // Frame destroyed while the timer is armed: the Reactor may or may not still hold the proxy. Marking it dead
+            // first makes whichever resume reaches it (ours below, or one already in flight) a no-op.
+            if (this->armed && !this->resumed && this->proxy.kill()) {
+                (void) Reactor::instance()->cancelTimer(this->handle);
+            }
+            this->proxy.drop();
+        }
+
         /**
          * @brief Skip the suspend entirely for non-positive durations.
          */
@@ -36,11 +54,60 @@ namespace YarnBall {
             return this->duration.count() <= 0;
         }
 
-        void await_suspend(std::coroutine_handle<> h) noexcept {
-            Reactor::instance()->registerTimer(this->duration, h);
+        /**
+         * @brief Inside a cancellation scope (see Cancellation.h) a stop
+         *        request, or Task::requestCancel on the chain, cancels the
+         *        timer and wakes the coroutine with @c CancelledException
+         *        instead of letting it sleep out the full duration.
+         */
+        template<typename Promise>
+        bool await_suspend(std::coroutine_handle<Promise> h) noexcept {
+            detail::TaskPromiseCore *core = detail::CancelBinding::ambient(h);
+            if (!core) {
+                this->armed = true;
+                this->handle = this->proxy.publish(h);
+                Reactor::instance()->registerTimer(this->duration, this->handle);
+                return true;
+            }
+            if (core->isCancellationRequested()) {
+                this->cancelled.store(true, std::memory_order_relaxed);
+                return false;
+            }
+            this->handle = this->proxy.publish(h);
+            const auto watch = this->bind.armWatched(core, &SleepAwaiter::onCancel, this);
+            if (this->cancelled.load(std::memory_order_relaxed)) {
+                // Stopped while arming: nothing is registered yet, so the proxy was never visible to anyone.
+                this->bind.disarm();
+                this->proxy.reclaim();
+                return false;
+            }
+            const auto proxyHandle = this->handle;
+            this->armed = true;
+            Reactor::instance()->registerTimer(this->duration, proxyHandle);
+            // A stop that landed before the timer was registered found nothing to cancel: redo it now. Only locals from
+            // here on: the timer may already have resumed (and destroyed) this awaiter.
+            if (watch->load(std::memory_order_acquire)) (void) Reactor::instance()->cancelTimer(proxyHandle);
+            return true;
         }
 
-        void await_resume() const noexcept {}
+        void await_resume() {
+            this->resumed = true;
+            if (this->cancelled.load(std::memory_order_relaxed)) throw CancelledException{};
+        }
+
+    private:
+        static void onCancel(void *p) noexcept {
+            auto *self = static_cast<SleepAwaiter *>(p);
+            self->cancelled.store(true, std::memory_order_relaxed);
+            (void) Reactor::instance()->cancelTimer(self->handle);
+        }
+
+        std::coroutine_handle<> handle{}; // the proxy, once published
+        std::atomic<bool> cancelled{false};
+        bool armed = false;
+        bool resumed = false;
+        detail::WaitProxy proxy;
+        detail::CancelBinding bind;
     };
 
     /**

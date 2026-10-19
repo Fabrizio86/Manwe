@@ -86,10 +86,9 @@ namespace YarnBall {
     static constexpr int kTempIdleTicksBeforeRetire = 4;
 
     /**
-     * @brief Maximum time a worker stays parked on the CV without an explicit
-     *        wake. Short enough that peer-stealable work nobody notified us
-     *        about still gets noticed; long enough that idle workers don't
-     *        wake repeatedly.
+     * @brief Maximum time a temp worker stays parked without an explicit
+     *        wake before it re-evaluates (and, once idle long enough, retires).
+     *        Permanent workers park until poked.
      */
     static constexpr auto kParkWaitTimeout = std::chrono::milliseconds(5);
 
@@ -194,8 +193,18 @@ namespace YarnBall {
         // when the worker is currently parked, sparing the kernel call
         // in the steady state.
         this->parkSignal.fetch_add(1, std::memory_order_release);
+        // Store-load handshake with park(): either we see parked == true, or park()'s re-check sees our enqueue.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
         if (this->parked.load(std::memory_order_acquire)) {
             this->parkSignal.notify_one();
+        } else if (this->wakeOneIdle) {
+            // Target is busy: let an idle peer know it can steal from the inbox.
+            this->wakeOneIdle();
+        }
+        // A retiring fiber may have run its final inbox drain between our running check and the enqueue: forward
+        // whatever is left so the task is not stranded in a fiber nobody will run again.
+        if (!this->running.load(std::memory_order_acquire) && this->pushPending) {
+            this->drainInboxToPending();
         }
         return true;
     }
@@ -203,6 +212,9 @@ namespace YarnBall {
     TaskPtr Fiber::stealOne() {
         TaskPtr t = nullptr;
         if (this->deque->steal(t)) return t;
+        // The inbox is MPMC, so a peer may take from it too; otherwise work routed to a busy worker's inbox
+        // would wait for that worker even while the rest of the pool is idle.
+        if (this->inbox->dequeue(t)) return t;
         return nullptr;
     }
 
@@ -229,6 +241,7 @@ namespace YarnBall {
     void Fiber::poke() {
         // Fast skip when the worker isn't parked; spares a notify syscall
         // in the common busy-worker case.
+        std::atomic_thread_fence(std::memory_order_seq_cst); // pairs with the one in park()
         if (!this->parked.load(std::memory_order_acquire)) return;
         this->parkSignal.fetch_add(1, std::memory_order_release);
         this->parkSignal.notify_one();
@@ -350,6 +363,9 @@ namespace YarnBall {
         // wakeOneParked when nobody is asleep.
         this->parked.store(true, std::memory_order_release);
         Yarn::instance()->noteParked(+1);
+        // Publish "parked" before looking for work: a producer that enqueued before this point and then read
+        // parked == false must be seen by the re-check below (store-load needs a full fence).
+        std::atomic_thread_fence(std::memory_order_seq_cst);
 
         // Re-check sources under the parked=true post-condition. This
         // closes the race where a producer enqueued + poked between our
@@ -365,9 +381,20 @@ namespace YarnBall {
         };
 
         if (!haveWork()) {
-            // Wait on the futex. Returns when parkSignal != expected (a
-            // poke happened) or on a spurious wake.
-            this->parkSignal.wait(expected, std::memory_order_acquire);
+            if (this->temp) {
+                // A temp fiber must be able to notice sustained idleness and retire (see process()), but futex waits
+                // have no timeout: poll the signal until kParkWaitTimeout expires. Only temp fibers pay for this;
+                // permanent workers keep the untimed futex wait below.
+                const auto deadline = std::chrono::steady_clock::now() + kParkWaitTimeout;
+                while (this->parkSignal.load(std::memory_order_acquire) == expected && !haveWork()
+                       && std::chrono::steady_clock::now() < deadline) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(500));
+                }
+            } else {
+                // Wait on the futex. Returns when parkSignal != expected (a
+                // poke happened) or on a spurious wake.
+                this->parkSignal.wait(expected, std::memory_order_acquire);
+            }
         }
 
         this->parked.store(false, std::memory_order_release);
@@ -385,11 +412,7 @@ namespace YarnBall {
         return this->tryStealFromPeers(this->fiberId);
     }
 
-    void Fiber::drainToPending() {
-        // Drain the inbox first. Producers may have pushed moments
-        // before we decided to retire; forwarding the tasks to the
-        // injection queue ensures they still run on a peer instead of
-        // being silently freed by ~Fiber.
+    void Fiber::drainInboxToPending() {
         TaskPtr stranded = nullptr;
         while (this->inbox->dequeue(stranded)) {
             if (this->pushPending) {
@@ -401,6 +424,14 @@ namespace YarnBall {
                 delete stranded;
             }
         }
+    }
+
+    void Fiber::drainToPending() {
+        // Drain the inbox first. Producers may have pushed moments
+        // before we decided to retire; forwarding the tasks to the
+        // injection queue ensures they still run on a peer instead of
+        // being silently freed by ~Fiber.
+        this->drainInboxToPending();
 
         TaskPtr leftover = nullptr;
         while (this->deque->pop(leftover)) {

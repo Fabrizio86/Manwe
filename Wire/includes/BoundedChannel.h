@@ -15,6 +15,8 @@
 #ifndef WIRE_BOUNDED_CHANNEL_H
 #define WIRE_BOUNDED_CHANNEL_H
 
+#include <algorithm>
+#include <atomic>
 #include <coroutine>
 #include <cstddef>
 #include <deque>
@@ -23,6 +25,7 @@
 #include <optional>
 #include <utility>
 
+#include "Cancellation.h"
 #include "Coroutines.h"
 
 namespace Telegraph {
@@ -39,6 +42,13 @@ namespace Telegraph {
      * Strict FIFO ordering on both sides: the oldest waiting sender
      * and the oldest waiting receiver are paired, never overtaken by
      * later arrivals.
+     *
+     * Parked @c send and @c receive calls are cancellable (see
+     * @c Cancellation.h): inside a stopped cancellation scope they leave
+     * their queue and throw @c YarnBall::CancelledException (a cancelled
+     * send's value is dropped), and a frame destroyed while parked also
+     * leaves its queue (a value already handed to it goes back to the channel). @ref pushFront returns a value to the head of the
+     * channel (see @c channelSelect).
      *
      * @tparam T Value type. Must be move-constructible.
      */
@@ -78,15 +88,15 @@ namespace Telegraph {
                     std::lock_guard<std::mutex> lk(this->mu);
                     if (this->closedFlag) co_return false;
                     if (!this->receivers.empty()) {
-                        receiver = std::move(this->receivers.front());
-                        this->receivers.pop_front();
+                        receiver = this->popReceiverLocked();
+                        // Under the lock, so a receiver destroyed before the wake runs can take the value back.
+                        receiver->slot.emplace(std::move(value));
                     } else if (this->buffer.size() < this->capacityVal) {
                         this->buffer.push_back(std::move(value));
                         co_return true;
                     }
                 }
                 if (receiver) {
-                    receiver->slot.emplace(std::move(value));
                     dispatch(receiver->handle);
                     co_return true;
                 }
@@ -108,37 +118,69 @@ namespace Telegraph {
          *         closed and is now drained.
          */
         YarnBall::Task<std::optional<T>> receive() {
-            // Fast path: buffer non-empty, or channel already closed.
+            // Fast path: buffer non-empty, a sender is parked, or channel already closed.
+            std::optional<T> got;
+            std::coroutine_handle<> wake{};
+            bool drainedClosed = false;
             {
-                std::shared_ptr<SendWaiter> wakeSender;
                 std::lock_guard<std::mutex> lk(this->mu);
                 if (!this->buffer.empty()) {
-                    T value = std::move(this->buffer.front());
+                    got.emplace(std::move(this->buffer.front()));
                     this->buffer.pop_front();
                     // Pull one parked sender into the now-empty slot if
                     // there is one queued. The sender's value goes into
-                    // the buffer; the sender wakes on next iteration.
+                    // the buffer; the sender is woken after the unlock.
                     if (!this->senders.empty()) {
-                        wakeSender = std::move(this->senders.front());
-                        this->senders.pop_front();
-                        this->buffer.push_back(std::move(*wakeSender->value));
+                        auto sender = this->popSenderLocked();
+                        this->buffer.push_back(std::move(*sender->value));
+                        sender->ok = true;
+                        wake = sender->handle;
                     }
-                    if (wakeSender) {
-                        wakeSender->ok = true;
-                        dispatch(wakeSender->handle);
-                    }
-                    co_return std::optional<T>(std::move(value));
-                }
-                if (this->closedFlag) {
-                    co_return std::nullopt;
+                } else if (!this->senders.empty()) {
+                    // Rendezvous (capacity 0): a parked sender hands its value
+                    // straight to us, since the buffer can never hold it.
+                    auto sender = this->popSenderLocked();
+                    got.emplace(std::move(*sender->value));
+                    sender->ok = true;
+                    wake = sender->handle;
+                } else if (this->closedFlag) {
+                    drainedClosed = true;
                 }
             }
+            // Never resume a coroutine under the channel mutex: dispatch() may fall back to an inline resume.
+            if (wake) dispatch(wake);
+            if (got) co_return std::move(got);
+            if (drainedClosed) co_return std::nullopt;
 
             // Slow path: buffer empty, no sender waiting.
             auto receiver = std::make_shared<RecvWaiter>();
             co_await ReceiveAwaiter{this, receiver};
             if (!receiver->slot.has_value()) co_return std::nullopt;
             co_return std::move(*receiver->slot);
+        }
+
+        /**
+         * @brief Put @p value back at the head of the channel, ahead of
+         *        anything buffered (it may briefly exceed the capacity by
+         *        one): it goes straight to the oldest parked receiver if
+         *        there is one. Returns @c false (dropping the value) if the
+         *        channel is closed.
+         */
+        bool pushFront(T value) {
+            std::shared_ptr<RecvWaiter> receiver;
+            {
+                std::lock_guard<std::mutex> lk(this->mu);
+                if (this->closedFlag) return false;
+                if (!this->receivers.empty()) {
+                    receiver = this->popReceiverLocked();
+                    receiver->slot.emplace(std::move(value));
+                } else {
+                    this->buffer.push_front(std::move(value));
+                    return true;
+                }
+            }
+            dispatch(receiver->handle);
+            return true;
         }
 
         /**
@@ -157,6 +199,8 @@ namespace Telegraph {
                 this->receivers.clear();
                 wakeSend = std::move(this->senders);
                 this->senders.clear();
+                for (auto &r : wakeRecv) r->queued.store(false, std::memory_order_release);
+                for (auto &w : wakeSend) w->queued.store(false, std::memory_order_release);
             }
             for (auto &r : wakeRecv) dispatch(r->handle);
             for (auto &s : wakeSend) {
@@ -181,6 +225,7 @@ namespace Telegraph {
         struct RecvWaiter {
             std::coroutine_handle<> handle{};
             std::optional<T> slot;
+            std::atomic<bool> queued{false};
         };
 
         struct SendWaiter {
@@ -196,67 +241,230 @@ namespace Telegraph {
             // matching the promised contract exactly.
             std::optional<T> value;
             bool ok = false;
+            std::atomic<bool> queued{false};
         };
 
-        struct ReceiveAwaiter {
+        std::shared_ptr<RecvWaiter> popReceiverLocked() {
+            auto r = std::move(this->receivers.front());
+            this->receivers.pop_front();
+            r->queued.store(false, std::memory_order_release);
+            return r;
+        }
+
+        std::shared_ptr<SendWaiter> popSenderLocked() {
+            auto w = std::move(this->senders.front());
+            this->senders.pop_front();
+            w->queued.store(false, std::memory_order_release);
+            return w;
+        }
+
+        /**
+         * @brief Common cancel/destroy handling for a parked waiter of
+         *        either kind (cancel protocol as in
+         *        @c YarnBall::detail::ParkBase). @p Queue is the member
+         *        deque the waiter sits in.
+         */
+        template<typename Waiter, typename Queue, typename Self>
+        struct ParkedWait {
             BoundedChannel *ch;
-            std::shared_ptr<RecvWaiter> waiter;
+            std::shared_ptr<Waiter> waiter;
+            Queue BoundedChannel::*queue;
+            bool earlyCancel = false; // guarded by ch->mu
+            bool cancelled = false;
+            YarnBall::detail::WaitProxy proxy;
+            YarnBall::detail::CancelBinding bind;
+
+            ParkedWait(BoundedChannel *c, std::shared_ptr<Waiter> w, Queue BoundedChannel::*q) noexcept
+                : ch(c), waiter(std::move(w)), queue(q) {
+            }
+            ParkedWait(const ParkedWait &) = delete;
+            ParkedWait &operator=(const ParkedWait &) = delete;
+
+            void abandon() noexcept {
+                this->bind.disarm();
+                if (!this->proxy) return;
+                bool removed = false;
+                if (this->waiter->queued.load(std::memory_order_acquire)) {
+                    std::lock_guard<std::mutex> lk(this->ch->mu);
+                    if (this->waiter->queued.load(std::memory_order_relaxed)) {
+                        this->unlinkLocked();
+                        removed = true;
+                    }
+                }
+                // A wake already in flight is dropped; a value it carried goes with the destroyed waiter.
+                this->proxy.retire(removed);
+            }
+
+            void unlinkLocked() noexcept {
+                auto &q = this->ch->*(this->queue);
+                auto it = std::find(q.begin(), q.end(), this->waiter);
+                if (it != q.end()) q.erase(it);
+                this->waiter->queued.store(false, std::memory_order_release);
+            }
+
+            void park(std::coroutine_handle<> h) {
+                this->waiter->handle = this->proxy.publish(h);
+                this->waiter->queued.store(true, std::memory_order_release);
+                (this->ch->*(this->queue)).push_back(this->waiter);
+            }
+
+            static void cancelThunk(void *p) noexcept {
+                auto *self = static_cast<Self *>(p);
+                std::coroutine_handle<> h{};
+                {
+                    std::lock_guard<std::mutex> lk(self->ch->mu);
+                    if (self->waiter->queued.load(std::memory_order_relaxed)) {
+                        h = self->waiter->handle;
+                        self->unlinkLocked();
+                        self->cancelled = true;
+                    } else {
+                        self->earlyCancel = true;
+                    }
+                }
+                if (h) dispatch(h);
+            }
+
+            void throwIfCancelled() const {
+                if (this->cancelled) throw YarnBall::CancelledException{};
+            }
+        };
+
+        struct ReceiveAwaiter : ParkedWait<RecvWaiter, std::deque<std::shared_ptr<RecvWaiter>>, ReceiveAwaiter> {
+            using Base = ParkedWait<RecvWaiter, std::deque<std::shared_ptr<RecvWaiter>>, ReceiveAwaiter>;
+
+            ReceiveAwaiter(BoundedChannel *c, std::shared_ptr<RecvWaiter> w) noexcept
+                : Base(c, std::move(w), &BoundedChannel::receivers) {
+            }
+            ~ReceiveAwaiter() {
+                this->bind.disarm();
+                if (!this->proxy) return;
+                std::optional<T> orphan;
+                {
+                    std::lock_guard<std::mutex> lk(this->ch->mu);
+                    bool removed = false;
+                    if (this->waiter->queued.load(std::memory_order_relaxed)) {
+                        this->unlinkLocked();
+                        removed = true;
+                    }
+                    // A wake that was handed this receiver but never ran (the frame is being destroyed): the value it
+                    // carried is put back instead of dying with the receiver. It was stored under this lock.
+                    if (this->proxy.retire(removed) && this->waiter->slot.has_value()) {
+                        orphan.emplace(std::move(*this->waiter->slot));
+                        this->waiter->slot.reset();
+                    }
+                }
+                if (orphan) this->ch->pushFront(std::move(*orphan));
+            }
 
             bool await_ready() const noexcept { return false; }
 
-            bool await_suspend(std::coroutine_handle<> h) {
-                std::lock_guard<std::mutex> lk(ch->mu);
-                // Recheck under the lock to close the race window.
-                if (!ch->buffer.empty()) {
-                    waiter->slot.emplace(std::move(ch->buffer.front()));
-                    ch->buffer.pop_front();
-                    return false;
+            template<typename Promise>
+            bool await_suspend(std::coroutine_handle<Promise> h) {
+                YarnBall::detail::TaskPromiseCore *core = YarnBall::detail::CancelBinding::ambient(h);
+                bool armed = false;
+                for (;;) {
+                    std::coroutine_handle<> wake{};
+                    {
+                        std::lock_guard<std::mutex> lk(this->ch->mu);
+                        if (this->earlyCancel) {
+                            this->cancelled = true;
+                            return false;
+                        }
+                        // Recheck under the lock to close the race window.
+                        if (!this->ch->buffer.empty()) {
+                            this->waiter->slot.emplace(std::move(this->ch->buffer.front()));
+                            this->ch->buffer.pop_front();
+                            if (!this->ch->senders.empty()) {
+                                auto sender = this->ch->popSenderLocked();
+                                this->ch->buffer.push_back(std::move(*sender->value));
+                                sender->ok = true;
+                                wake = sender->handle;
+                            }
+                        } else if (!this->ch->senders.empty()) {
+                            auto sender = this->ch->popSenderLocked();
+                            this->waiter->slot.emplace(std::move(*sender->value));
+                            sender->ok = true;
+                            wake = sender->handle;
+                        } else if (this->ch->closedFlag) {
+                            return false;
+                        } else if (!core || armed) {
+                            this->park(h);
+                            return true;
+                        } else if (core->isCancellationRequested()) {
+                            this->cancelled = true;
+                            return false;
+                        }
+                    }
+                    if (wake) {
+                        dispatch(wake);
+                        return false;
+                    }
+                    if (this->waiter->slot.has_value()) return false;
+                    this->bind.arm(core, &Base::cancelThunk, this);
+                    armed = true;
                 }
-                if (ch->closedFlag) return false;
-                waiter->handle = h;
-                ch->receivers.push_back(waiter);
-                return true;
             }
 
-            void await_resume() noexcept {
-            }
+            void await_resume() { this->throwIfCancelled(); }
         };
 
-        struct SendAwaiter {
-            BoundedChannel *ch;
-            std::shared_ptr<SendWaiter> waiter;
+        struct SendAwaiter : ParkedWait<SendWaiter, std::deque<std::shared_ptr<SendWaiter>>, SendAwaiter> {
+            using Base = ParkedWait<SendWaiter, std::deque<std::shared_ptr<SendWaiter>>, SendAwaiter>;
+
+            SendAwaiter(BoundedChannel *c, std::shared_ptr<SendWaiter> w) noexcept
+                : Base(c, std::move(w), &BoundedChannel::senders) {
+            }
+            ~SendAwaiter() { this->abandon(); }
 
             bool await_ready() const noexcept { return false; }
 
-            bool await_suspend(std::coroutine_handle<> h) {
-                std::lock_guard<std::mutex> lk(ch->mu);
-                if (ch->closedFlag) {
-                    waiter->ok = false;
-                    return false;
+            template<typename Promise>
+            bool await_suspend(std::coroutine_handle<Promise> h) {
+                YarnBall::detail::TaskPromiseCore *core = YarnBall::detail::CancelBinding::ambient(h);
+                bool armed = false;
+                for (;;) {
+                    std::coroutine_handle<> wake{};
+                    bool delivered = false;
+                    {
+                        std::lock_guard<std::mutex> lk(this->ch->mu);
+                        if (this->earlyCancel) {
+                            this->cancelled = true;
+                            return false;
+                        }
+                        if (this->ch->closedFlag) {
+                            this->waiter->ok = false;
+                            return false;
+                        }
+                        // Race close: maybe a slot freed since the fast path
+                        // gave up. Take it if so; this also handles the zero-
+                        // capacity rendezvous case.
+                        if (!this->ch->receivers.empty()) {
+                            auto receiver = this->ch->popReceiverLocked();
+                            receiver->slot.emplace(std::move(*this->waiter->value));
+                            wake = receiver->handle;
+                            delivered = true;
+                        } else if (this->ch->buffer.size() < this->ch->capacityVal) {
+                            this->ch->buffer.push_back(std::move(*this->waiter->value));
+                            delivered = true;
+                        } else if (!core || armed) {
+                            this->park(h);
+                            return true;
+                        } else if (core->isCancellationRequested()) {
+                            this->cancelled = true;
+                            return false;
+                        }
+                    }
+                    if (delivered) {
+                        this->waiter->ok = true;
+                        if (wake) dispatch(wake);
+                        return false;
+                    }
+                    this->bind.arm(core, &Base::cancelThunk, this);
+                    armed = true;
                 }
-                // Race close: maybe a slot freed since the fast path
-                // gave up. Take it if so; this also handles the zero-
-                // capacity rendezvous case.
-                if (!ch->receivers.empty()) {
-                    auto receiver = std::move(ch->receivers.front());
-                    ch->receivers.pop_front();
-                    receiver->slot.emplace(std::move(*waiter->value));
-                    dispatch(receiver->handle);
-                    waiter->ok = true;
-                    return false;
-                }
-                if (ch->buffer.size() < ch->capacityVal) {
-                    ch->buffer.push_back(std::move(*waiter->value));
-                    waiter->ok = true;
-                    return false;
-                }
-                waiter->handle = h;
-                ch->senders.push_back(waiter);
-                return true;
             }
 
-            void await_resume() noexcept {
-            }
+            void await_resume() { this->throwIfCancelled(); }
         };
 
         /**

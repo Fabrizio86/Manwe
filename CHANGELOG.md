@@ -6,7 +6,63 @@ to [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Cancellable awaits** (`Yarn/includes/Cancellation.h`) — `withCancellation(token, task)`
+  runs a task in a cancellation scope; `sleepFor`, `io::waitReadable/Writable`,
+  `AsyncMutex/Semaphore/Notify/Event/Barrier/RwLock/Once`, `JoinHandle::join` and the
+  Telegraph channels leave their queue / the Reactor when the scope is stopped and throw
+  `CancelledException`. `whenAny`, `withTimeout` and `channelSelect` now cancel their
+  losing branches. A coroutine frame destroyed while parked also unlinks itself.
+- **`Task::requestCancel` wakes parked awaits** — it is no longer polling-only: every
+  cancellable await also registers with the `co_await` chain it sits in, so requestCancel on
+  any `Task` of the chain wakes it with `CancelledException`; `whenAny`, `whenAll`,
+  `channelSelect` and `withCancellation` forward the request to their branches.
+- **`SocketHandle` / `kInvalidSocket` / `isValidSocket`** (`Yarn/includes/SocketHandle.h`) —
+  the platform socket handle type (`int` on POSIX, a full-width `SOCKET` on Windows).
+  `closeSocket`, `setSocketNonblocking`, `io::waitReadable/Writable` and the `Reactor`
+  fd entry points (`registerReadable/Writable`, `cancelWait`, `cancelFd`, `associateIocp`)
+  take it instead of `int`.
+- **`Reactor::cancelFd / cancelWait / cancelTimer`** — deregister parked waiters
+  (resuming or dropping them); `SignalSet`, `SerialPort` and `GpioLine` call `cancelFd`
+  before closing their fd.
+- **`setUnhandledExceptionHandler`** — exceptions escaping a detached (`coSpawn`) task are
+  reported (default: `log::error`) instead of being dropped.
+
+- **Connect timeouts** — `tcpConnect(host, port, timeout)`, `TlsClientOptions::connectTimeout`,
+  `WsOptions::connectTimeout`, `Http2Connection::connectPlain(..., connectTimeout)` and
+  `HttpClient::setConnectTimeout` bound name resolution plus the TCP handshake (default 10 s).
+  The attempt runs in a cancellation scope that the deadline stops, so a socket still waiting
+  for its SYN-ACK is abandoned and closed (`shutdown()` does not wake it on macOS).
+- **`Soccer::wsServe(listener, handler, WsOptions, stop)`** — WebSocket accept loop that applies
+  `WsOptions::maxConnections` (slot held from accept, so half-open handshakes count), the
+  handshake timeout and the Origin policy; `examples/ws_echo_server.cpp` uses it.
+
 ### Fixed
+- Wake vs cancel vs frame destruction is now race-free: parked awaits publish a `WaitProxy`
+  handle, so a frame destroyed while a wake (release, notify, send, timer, readiness,
+  cancel) is already in flight is never resumed afterwards; a lock / permit that had been
+  handed to such a frame is given back.
+- Reactor: `cancelWait` / `cancelTimer` return value is the same ownership signal on every
+  backend where it can be exact (`true` = this call took the registration); the Windows
+  `cancelWait` no longer reports `true` for a request that took nothing. kqueue: a new
+  registration on an fd number that still has waiters whose descriptor was closed
+  (knote gone) resumes those stale waiters instead of leaving them parked.
+- `AsyncBarrier`: the releasing arrival now dispatches the other waiters before it continues,
+  so they no longer depend on its frame outliving the `co_await`.
+- Soccer: `TcpStream` / `TcpListener` / `UdpSocket` / `RawSocket` / `TlsStream` mark themselves
+  closed before `Reactor::cancelFd`, and every read / write / accept / recv loop re-checks that
+  state after a wake, so a waiter woken by `close()` fails with a `SocketException` instead of
+  using a descriptor number that may already belong to another connection. `RawSocket::close`
+  now wakes parked waiters too.
+- Reactor: several waiters on the same fd and direction no longer overwrite each other
+  (kqueue/epoll); io_uring no longer resumes a coroutine twice after a failed submit.
+- Idle temp workers now actually retire (`kParkWaitTimeout` was unused).
+- `channelSelect` no longer swallows a value delivered to a losing receive; `BoundedChannel`
+  never resumes a waiter while holding its mutex.
+- `MPMCQueue` no longer wedges if an element's construction throws; `SmallObjectPool`
+  returns a thread's cached blocks when the thread exits; `Stream` accepts `co_yield` of a
+  const lvalue; `asyncWrite` avoids SIGPIPE; Prometheus HELP text is escaped and
+  mismatched histogram buckets are rejected.
 - **CI consumer-check stale version pin** — the `install-consumer` job's
   `find_package(Manwe 0.3 REQUIRED)` predated the 1.1.0 version bump;
   `SameMinorVersion` compatibility rejected it outright, failing the job

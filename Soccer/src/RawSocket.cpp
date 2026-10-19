@@ -4,7 +4,11 @@
 
 #include "RawSocket.h"
 
+#include <algorithm>
+
 #include "IoAwaiters.h"
+#include "Reactor.h"
+#include "NetUtil.h"
 #include "PlatformNet.h"
 #include "SocketException.h"
 
@@ -13,15 +17,18 @@ namespace Soccer {
     RawSocket RawSocket::open(int family, int ip_protocol) {
         YarnBall::ensureWsaStarted();
 
-        const int fd = static_cast<int>(::socket(family, SOCK_RAW, ip_protocol));
+        const int fd = detail::openSocket(family, SOCK_RAW, ip_protocol);
         if (fd < 0) {
             throw SocketException("socket(SOCK_RAW)", YarnBall::lastSocketError());
         }
 
-        // Best-effort non-blocking; we ignore failures here because the
-        // raw-socket recv path tolerates a blocking syscall on the worker
-        // (an awaiter retry will arrive via waitReadable).
-        (void) YarnBall::setSocketNonblocking(fd);
+        // A blocking raw socket would stall a Yarn worker inside recv,
+        // so a failure here is fatal.
+        if (YarnBall::setSocketNonblocking(fd) != 0) {
+            const int e = YarnBall::lastSocketError();
+            (void) YarnBall::closeSocket(fd);
+            throw SocketException("set_nonblocking", e);
+        }
         return RawSocket(fd);
     }
 
@@ -31,6 +38,10 @@ namespace Soccer {
             throw SocketException("recv on closed RawSocket");
         }
         while (true) {
+            // Re-checked on every pass: close() wakes a parked receiver, which must then fail.
+            if (this->sock < 0) {
+                throw SocketException("recv on closed RawSocket");
+            }
             sockaddr_storage from{};
             socklen_t fromlen = sizeof(from);
 
@@ -38,7 +49,7 @@ namespace Soccer {
             do {
                 n = ::recvfrom(this->sock,
                                reinterpret_cast<char *>(buf.data()),
-                               static_cast<int>(buf.size()), 0,
+                               static_cast<int>(std::min<std::size_t>(buf.size(), 0x7fffffffu)), 0,
                                reinterpret_cast<sockaddr *>(&from), &fromlen);
             } while (n < 0 && YarnBall::isEintr(YarnBall::lastSocketError()));
 
@@ -63,11 +74,14 @@ namespace Soccer {
             throw SocketException("sendTo on closed RawSocket");
         }
         while (true) {
+            if (this->sock < 0) {
+                throw SocketException("sendTo on closed RawSocket");
+            }
             ::ssize_t n;
             do {
                 n = ::sendto(this->sock,
                              reinterpret_cast<const char *>(buf.data()),
-                             static_cast<int>(buf.size()), 0,
+                             static_cast<int>(std::min<std::size_t>(buf.size(), 0x7fffffffu)), 0,
                              destination.data(), destination.length());
             } while (n < 0 && YarnBall::isEintr(YarnBall::lastSocketError()));
 
@@ -82,9 +96,16 @@ namespace Soccer {
     }
 
     void RawSocket::close() noexcept {
-        if (this->sock >= 0) {
-            (void) YarnBall::closeSocket(this->sock);
+        const int fd = this->sock;
+        if (fd >= 0) {
+            // Closed first, so a woken recv / sendTo re-checks `sock` and fails
+            // rather than using a descriptor number that is about to be reused.
             this->sock = -1;
+#ifndef _WIN32
+            // Wake any coroutine still parked on this fd before it is closed (and the number reused).
+            (void) YarnBall::Reactor::instance()->cancelFd(fd);
+#endif
+            (void) YarnBall::closeSocket(fd);
         }
     }
 

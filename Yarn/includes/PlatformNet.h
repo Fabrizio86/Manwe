@@ -22,6 +22,8 @@
 #ifndef YARN_PLATFORM_NET_H
 #define YARN_PLATFORM_NET_H
 
+#include "SocketHandle.h"
+
 #ifdef _WIN32
     #ifndef WIN32_LEAN_AND_MEAN
         #define WIN32_LEAN_AND_MEAN
@@ -138,20 +140,34 @@ namespace YarnBall {
     /**
      * @brief Close a socket. @c close on POSIX, @c closesocket on Windows.
      *
-     * @p fd is taken as @c int for consistency with the rest of the API,
-     * which keeps file/socket descriptors as ints across platforms. The
-     * cast to @c SOCKET on Windows is safe in practice because WinSock
-     * SOCKET handles allocated by user code fit in the 32-bit positive
-     * range; this matches how mio and other portable runtimes plumb
-     * sockets internally.
+     * Takes the platform handle (@ref SocketHandle): an @c int descriptor on
+     * POSIX, a full-width @c SOCKET on Windows. Code that keeps sockets in
+     * @c int variables loses the upper bits of a Windows handle and must
+     * hold a @ref SocketHandle instead. @ref kInvalidSocket fails cleanly
+     * (@c WSAENOTSOCK on Windows, @c EBADF from the kernel on POSIX).
      */
-    inline int closeSocket(int fd) noexcept {
+    inline int closeSocket(SocketHandle fd) noexcept {
 #ifdef _WIN32
-        return ::closesocket(static_cast<SOCKET>(static_cast<unsigned>(fd)));
+        if (fd == kInvalidSocket) {
+            ::WSASetLastError(WSAENOTSOCK);
+            return SOCKET_ERROR;
+        }
+        return ::closesocket(static_cast<SOCKET>(fd));
 #else
         return ::close(fd);
 #endif
     }
+
+#ifdef _WIN32
+    static_assert(sizeof(SocketHandle) == sizeof(SOCKET), "SocketHandle must be able to hold a SOCKET");
+
+    /**
+     * @brief Same as @ref closeSocket; kept for source compatibility.
+     */
+    inline int closeNativeSocket(SOCKET s) noexcept {
+        return closeSocket(static_cast<SocketHandle>(s));
+    }
+#endif
 
     /**
      * @brief Put @p fd into non-blocking mode.
@@ -162,11 +178,10 @@ namespace YarnBall {
      * @return 0 on success; -1 on failure (with the platform error code
      *         retrievable via @ref lastSocketError).
      */
-    inline int setSocketNonblocking(int fd) noexcept {
+    inline int setSocketNonblocking(SocketHandle fd) noexcept {
 #ifdef _WIN32
         u_long mode = 1;
-        return ::ioctlsocket(static_cast<SOCKET>(static_cast<unsigned>(fd)),
-                             FIONBIO, &mode) == 0 ? 0 : -1;
+        return ::ioctlsocket(static_cast<SOCKET>(fd), FIONBIO, &mode) == 0 ? 0 : -1;
 #else
         const int flags = ::fcntl(fd, F_GETFL, 0);
         if (flags < 0) return -1;

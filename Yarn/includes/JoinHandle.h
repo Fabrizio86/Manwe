@@ -39,6 +39,7 @@
 #include <type_traits>
 #include <utility>
 
+#include "Cancellation.h"
 #include "Coroutines.h"
 
 namespace YarnBall {
@@ -152,27 +153,74 @@ namespace YarnBall {
         struct JoinAwaiter {
             std::shared_ptr<JoinState<T>> state;
 
+            explicit JoinAwaiter(std::shared_ptr<JoinState<T>> s) noexcept : state(std::move(s)) {}
+            JoinAwaiter(const JoinAwaiter &) = delete;
+            JoinAwaiter &operator=(const JoinAwaiter &) = delete;
+
+            ~JoinAwaiter() {
+                this->bind.disarm();
+                if (!this->proxy) return;
+                // Frame destroyed while parked: try to take the proxy back out of the latch word; failing that, the
+                // runner (or a cancel) already took it and its resume is in flight, so make that resume a no-op.
+                // Harmless when the result was published and the wake already ran.
+                bool removed = false;
+                if (const auto enc = this->encoded.load(std::memory_order_relaxed); enc != 0) {
+                    std::uintptr_t expected = enc;
+                    removed = this->state->state.compare_exchange_strong(expected, 0, std::memory_order_acq_rel);
+                }
+                this->proxy.retire(removed);
+            }
+
             bool await_ready() const noexcept {
                 return state->state.load(std::memory_order_acquire) == kJoinReadyBit;
             }
 
-            std::coroutine_handle<> await_suspend(std::coroutine_handle<> h) noexcept {
+            /**
+             * @brief Inside a cancellation scope (see Cancellation.h) a stop
+             *        request unparks the joiner and wakes it with
+             *        @c CancelledException; the spawned task keeps running
+             *        and can still be joined later.
+             */
+            template<typename Promise>
+            std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) noexcept {
+                TaskPromiseCore *core = CancelBinding::ambient(h);
+                if (core && core->isCancellationRequested()) {
+                    this->cancelled = true;
+                    return h;
+                }
+                const auto proxyHandle = this->proxy.publish(h);
+                const auto enc = reinterpret_cast<std::uintptr_t>(proxyHandle.address());
+                this->encoded.store(enc, std::memory_order_relaxed);
+                std::shared_ptr<std::atomic<bool>> watch;
+                if (core) watch = this->bind.armWatched(core, &JoinAwaiter::onCancel, this);
                 std::uintptr_t expected = 0;
-                const auto encoded =
-                    reinterpret_cast<std::uintptr_t>(h.address());
                 if (state->state.compare_exchange_strong(
-                        expected, encoded,
+                        expected, enc,
                         std::memory_order_acq_rel,
                         std::memory_order_acquire)) {
+                    // Parked: from here only locals may be touched, unless the unpark below wins.
+                    if (watch && watch->load(std::memory_order_acquire)) {
+                        expected = enc;
+                        if (state->state.compare_exchange_strong(
+                                expected, 0, std::memory_order_acq_rel)) {
+                            this->cancelled = true;
+                            this->proxy.reclaim();
+                            return h;
+                        }
+                    }
                     return std::noop_coroutine();
                 }
                 // CAS failed: the only other value the runner ever
                 // writes is kJoinReadyBit. Result is ready, resume
                 // inline.
+                this->bind.disarm();
+                this->encoded.store(0, std::memory_order_relaxed);
+                this->proxy.reclaim();
                 return h;
             }
 
             auto await_resume() {
+                if (this->cancelled) throw CancelledException{};
                 if (state->exception) {
                     std::rethrow_exception(state->exception);
                 }
@@ -180,6 +228,21 @@ namespace YarnBall {
                     return std::move(*state->value);
                 }
             }
+
+        private:
+            static void onCancel(void *p) noexcept {
+                auto *self = static_cast<JoinAwaiter *>(p);
+                std::uintptr_t expected = self->encoded.load(std::memory_order_relaxed);
+                if (expected != 0 && self->state->state.compare_exchange_strong(expected, 0, std::memory_order_acq_rel)) {
+                    self->cancelled = true;
+                    resumeOnPool(std::coroutine_handle<>::from_address(reinterpret_cast<void *>(expected)));
+                }
+            }
+
+            std::atomic<std::uintptr_t> encoded{0};
+            bool cancelled = false;
+            WaitProxy proxy;
+            CancelBinding bind;
         };
 
     } // namespace detail
@@ -218,14 +281,7 @@ namespace YarnBall {
          *        completes, with its result (or its exception).
          */
         Task<T> join() {
-            detail::JoinAwaiter<T> aw{state};
-            if constexpr (std::is_void_v<T>) {
-                co_await aw;
-                co_return;
-            } else {
-                T value = co_await aw;
-                co_return value;
-            }
+            return joinImpl(state);
         }
 
         /**
@@ -238,6 +294,18 @@ namespace YarnBall {
         }
 
     private:
+        // Takes the state by value so the frame does not depend on this handle outliving the (lazy) Task.
+        static Task<T> joinImpl(std::shared_ptr<detail::JoinState<T>> st) {
+            detail::JoinAwaiter<T> aw{std::move(st)};
+            if constexpr (std::is_void_v<T>) {
+                co_await aw;
+                co_return;
+            } else {
+                T value = co_await aw;
+                co_return value;
+            }
+        }
+
         std::shared_ptr<detail::JoinState<T>> state;
     };
 

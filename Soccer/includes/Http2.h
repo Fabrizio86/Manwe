@@ -32,6 +32,8 @@
 #define SOCCER_HTTP2_H
 
 #include <atomic>
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -86,6 +88,39 @@ namespace Soccer {
      */
     using Http2Response = HttpResponse;
 
+    /**
+     * @struct Http2ServerOptions
+     * @brief Resource limits for @ref Http2Server. Durations and sizes treat zero
+     *        as "unlimited".
+     */
+    struct Http2ServerOptions {
+        /// A request (headers and body) must be complete within this long of its first
+        /// byte, and a connection with an unfinished request must keep making progress
+        /// at least this often. Cuts off slow-header / slow-body (slowloris) peers.
+        std::chrono::milliseconds requestTimeout{30000};
+        /// A connection with nothing in flight and no bytes arriving is closed after this long.
+        std::chrono::milliseconds idleTimeout{120000};
+        /// Connections served at once; further ones are closed on accept.
+        std::size_t maxConnections{0};
+        /// Open streams per connection (advertised as SETTINGS_MAX_CONCURRENT_STREAMS and
+        /// enforced: extra streams are refused with REFUSED_STREAM).
+        std::size_t maxConcurrentStreams{100};
+        /// Decoded request header list, per request (advertised as SETTINGS_MAX_HEADER_LIST_SIZE;
+        /// the stream is reset beyond it).
+        std::size_t maxHeaderListBytes{64 * 1024};
+        /// Header fields per request.
+        std::size_t maxHeaderCount{100};
+        /// One request body.
+        std::size_t maxBodyBytes{16 * 1024 * 1024};
+        /// Request bodies buffered across all of one connection's streams at once;
+        /// beyond it the connection is closed with GOAWAY(ENHANCE_YOUR_CALM).
+        std::size_t maxConnectionBodyBytes{64 * 1024 * 1024};
+        /// Client-sent RST_STREAM frames tolerated per second before the connection
+        /// is closed with GOAWAY(ENHANCE_YOUR_CALM) -- the "rapid reset" attack opens and
+        /// cancels streams as fast as it can.
+        std::size_t maxResetsPerSecond{200};
+    };
+
 #ifdef SOCCER_HAS_HTTP2
 
     namespace detail {
@@ -114,6 +149,18 @@ namespace Soccer {
             // this and throws rather than returning a body that was
             // truncated mid-stream.
             bool bodyRejected{false};
+            // Response header accounting (client side): bytes seen so far,
+            // number of 1xx interim responses, and the parse state that tells
+            // an interim response and trailers apart from the real headers.
+            std::size_t headerBytes{0};
+            int interimCount{0};
+            bool finalSeen{false};
+            bool informational{false};
+            bool statusInBlock{false};
+            // Latched when the response headers exceed the cap; the stream is reset.
+            bool headersRejected{false};
+            // Set when the connection ended before the stream completed.
+            bool connectionLost{false};
         };
     } // namespace detail
 
@@ -151,10 +198,14 @@ namespace Soccer {
         /**
          * @brief Open a plaintext h2c connection. For cluster-internal
          *        traffic where TLS termination happens upstream.
+         *        @p connectTimeout bounds name resolution plus the TCP
+         *        handshake (zero: no limit); the TLS variant takes it from
+         *        @c TlsClientOptions::connectTimeout.
          */
         static YarnBall::Task<Http2Connection> connectPlain(
             std::string host,
-            std::uint16_t port);
+            std::uint16_t port,
+            std::chrono::milliseconds connectTimeout = std::chrono::milliseconds{10000});
 
         /**
          * @brief Issue one HTTP/2 request on a fresh stream. Suspends
@@ -169,10 +220,17 @@ namespace Soccer {
 
         /**
          * @brief Send a GOAWAY frame and close the connection. Pending
-         *        per-stream awaiters are resolved with a connection-
-         *        level error. Idempotent.
+         *        per-stream awaiters are failed right away with a connection-
+         *        level error (they do not wait for the peer), and the reader
+         *        coroutine parked on the socket is woken so it exits. Idempotent.
          */
         void close() noexcept;
+
+        /**
+         * @return @c true once the connection is closed or unusable
+         *         (explicit close, peer GOAWAY / EOF, or transport error).
+         */
+        bool isClosed() const noexcept;
 
         Http2Connection(const Http2Connection &) = delete;
         Http2Connection &operator=(const Http2Connection &) = delete;
@@ -226,7 +284,7 @@ namespace Soccer {
          *        Pass @c port == 0 to let the kernel assign one; read
          *        it back via @c localAddress().
          */
-        Http2Server(const std::string &host, std::uint16_t port);
+        Http2Server(const std::string &host, std::uint16_t port, Http2ServerOptions options = {});
 
         Http2Server(const Http2Server &) = delete;
         Http2Server &operator=(const Http2Server &) = delete;
@@ -354,7 +412,9 @@ namespace Soccer {
             co_return Http2Connection{};
         }
 #endif
-        static YarnBall::Task<Http2Connection> connectPlain(std::string, std::uint16_t) {
+        static YarnBall::Task<Http2Connection> connectPlain(
+            std::string, std::uint16_t,
+            std::chrono::milliseconds = std::chrono::milliseconds{10000}) {
             throw Http2NotImplemented{};
             co_return Http2Connection{};
         }
@@ -378,7 +438,7 @@ namespace Soccer {
      */
     class Http2Server final {
     public:
-        Http2Server(const std::string &, std::uint16_t) {
+        Http2Server(const std::string &, std::uint16_t, Http2ServerOptions = {}) {
             throw Http2NotImplemented{};
         }
         void route(std::string, std::string, HttpRouteHandler) {}

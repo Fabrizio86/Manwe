@@ -16,8 +16,11 @@
 #include <tls.h>
 
 #include "IoAwaiters.h"
+#include "Reactor.h"
+#include "IoDeadline.h"
 #include "SocketAddress.h"
 #include "SocketException.h"
+#include "TcpStream.h"
 
 namespace Soccer {
 
@@ -48,7 +51,13 @@ namespace Soccer {
     }
 
     TlsStream::TlsStream(TlsStream &&) noexcept = default;
-    TlsStream &TlsStream::operator=(TlsStream &&) noexcept = default;
+    TlsStream &TlsStream::operator=(TlsStream &&other) noexcept {
+        if (this != &other) {
+            this->close(); // release the context and fd this stream still owns
+            this->impl = std::move(other.impl);
+        }
+        return *this;
+    }
 
     TlsStream::~TlsStream() {
         this->close();
@@ -56,6 +65,9 @@ namespace Soccer {
 
     void TlsStream::close() noexcept {
         if (!this->impl) return;
+        // Serialise with in-flight tls_read / tls_write calls so the
+        // context is never freed underneath them.
+        std::lock_guard<std::mutex> lk(this->impl->callMu);
         if (this->impl->ctx) {
             ::tls_close(this->impl->ctx);
             ::tls_free(this->impl->ctx);
@@ -66,9 +78,20 @@ namespace Soccer {
             this->impl->cfg = nullptr;
         }
         if (this->impl->fd >= 0) {
-            ::close(this->impl->fd);
+            // Wake readers / writers parked on the fd before it is closed (and the number
+            // reused). They re-take callMu, find ctx gone and fail without touching the fd.
+            const int fd = this->impl->fd;
             this->impl->fd = -1;
+            (void) YarnBall::Reactor::instance()->cancelFd(fd);
+            ::close(fd);
         }
+    }
+
+    std::string TlsStream::alpnSelected() const {
+        if (!this->impl || !this->impl->ctx) return {};
+        std::lock_guard<std::mutex> lk(this->impl->callMu);
+        const char *p = ::tls_conn_alpn_selected(this->impl->ctx);
+        return p ? std::string(p) : std::string();
     }
 
     int TlsStream::fd() const noexcept {
@@ -76,116 +99,81 @@ namespace Soccer {
     }
 
 
+    namespace {
+        /// Frees the libtls objects of a half-built client on any exit path
+        /// (error, or the coroutine being destroyed while parked).
+        struct ClientParts {
+            ::tls *ctx = nullptr;
+            ::tls_config *cfg = nullptr;
+            ClientParts() = default;
+            ClientParts(const ClientParts &) = delete;
+            ClientParts &operator=(const ClientParts &) = delete;
+            ~ClientParts() {
+                if (ctx) ::tls_free(ctx);
+                if (cfg) ::tls_config_free(cfg);
+            }
+        };
+    }
+
     YarnBall::Task<TlsStream> TlsStream::connect(std::string host,
                                                  std::uint16_t port,
                                                  TlsClientOptions opts) {
-        // Resolve and create a non-blocking TCP socket.
-        auto addr = SocketAddress::resolve(host, port);
-        const int fd = ::socket(addr.family(), SOCK_STREAM, 0);
-        if (fd < 0) throw SocketException("socket", errno);
-
-        int flags = ::fcntl(fd, F_GETFL, 0);
-        if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
-            int e = errno;
-            ::close(fd);
-            throw SocketException("fcntl(O_NONBLOCK)", e);
-        }
-
-        // Initiate the TCP connect.
-        int rc = ::connect(fd, addr.data(), addr.length());
-        if (rc < 0 && errno != EINPROGRESS) {
-            int e = errno;
-            ::close(fd);
-            throw SocketException("connect", e);
-        }
-        if (rc < 0) {
-            co_await YarnBall::io::waitWritable(fd);
-            int sockerr = 0;
-            socklen_t errlen = sizeof(sockerr);
-            if (::getsockopt(fd, SOL_SOCKET, SO_ERROR, &sockerr, &errlen) < 0 || sockerr != 0) {
-                ::close(fd);
-                throw SocketException("connect (async)", sockerr ? sockerr : errno);
-            }
-        }
+        // Resolve (trying every address) and connect; the socket comes back
+        // non-blocking and close-on-exec, and is closed again if anything below throws.
+        TcpStream tcp = co_await tcpConnect(host, port, opts.connectTimeout);
+        const int fd = tcp.fd();
 
         // Set up the TLS client side.
-        ::tls *ctx = ::tls_client();
-        if (!ctx) {
-            ::close(fd);
+        ClientParts parts;
+        parts.ctx = ::tls_client();
+        if (!parts.ctx) {
             throw SocketException("tls_client failed");
         }
-        ::tls_config *cfg = ::tls_config_new();
-        if (!cfg) {
-            ::tls_free(ctx);
-            ::close(fd);
+        parts.cfg = ::tls_config_new();
+        if (!parts.cfg) {
             throw SocketException("tls_config_new failed");
         }
+        auto configError = [&parts](const char *what) {
+            const char *e = ::tls_config_error(parts.cfg);
+            return SocketException(e ? e : what);
+        };
         if (opts.insecure_no_verify_cert) {
-            ::tls_config_insecure_noverifycert(cfg);
+            ::tls_config_insecure_noverifycert(parts.cfg);
         }
         if (opts.insecure_no_verify_name) {
-            ::tls_config_insecure_noverifyname(cfg);
+            ::tls_config_insecure_noverifyname(parts.cfg);
         }
         // Optional production-grade verification config.
-        if (!opts.caBundleFile.empty()) {
-            if (::tls_config_set_ca_file(cfg, opts.caBundleFile.c_str()) != 0) {
-                const std::string err = ::tls_config_error(cfg)
-                    ? ::tls_config_error(cfg) : "tls_config_set_ca_file";
-                ::tls_config_free(cfg);
-                ::tls_free(ctx);
-                ::close(fd);
-                throw SocketException(err);
-            }
+        if (!opts.caBundleFile.empty() &&
+            ::tls_config_set_ca_file(parts.cfg, opts.caBundleFile.c_str()) != 0) {
+            throw configError("tls_config_set_ca_file");
         }
-        if (!opts.caBundleDir.empty()) {
-            if (::tls_config_set_ca_path(cfg, opts.caBundleDir.c_str()) != 0) {
-                const std::string err = ::tls_config_error(cfg)
-                    ? ::tls_config_error(cfg) : "tls_config_set_ca_path";
-                ::tls_config_free(cfg);
-                ::tls_free(ctx);
-                ::close(fd);
-                throw SocketException(err);
-            }
+        if (!opts.caBundleDir.empty() &&
+            ::tls_config_set_ca_path(parts.cfg, opts.caBundleDir.c_str()) != 0) {
+            throw configError("tls_config_set_ca_path");
         }
-        if (!opts.clientCertFile.empty()) {
-            if (::tls_config_set_cert_file(cfg, opts.clientCertFile.c_str()) != 0 ||
-                ::tls_config_set_key_file(cfg, opts.clientKeyFile.c_str()) != 0) {
-                const std::string err = ::tls_config_error(cfg)
-                    ? ::tls_config_error(cfg) : "tls_config_set_(cert|key)_file";
-                ::tls_config_free(cfg);
-                ::tls_free(ctx);
-                ::close(fd);
-                throw SocketException(err);
-            }
+        if (!opts.clientCertFile.empty() &&
+            (::tls_config_set_cert_file(parts.cfg, opts.clientCertFile.c_str()) != 0 ||
+             ::tls_config_set_key_file(parts.cfg, opts.clientKeyFile.c_str()) != 0)) {
+            throw configError("tls_config_set_(cert|key)_file");
         }
-        if (!opts.alpnProtocols.empty()) {
-            if (::tls_config_set_alpn(cfg, opts.alpnProtocols.c_str()) != 0) {
-                const std::string err = ::tls_config_error(cfg)
-                    ? ::tls_config_error(cfg) : "tls_config_set_alpn";
-                ::tls_config_free(cfg);
-                ::tls_free(ctx);
-                ::close(fd);
-                throw SocketException(err);
-            }
+        if (!opts.alpnProtocols.empty() &&
+            ::tls_config_set_alpn(parts.cfg, opts.alpnProtocols.c_str()) != 0) {
+            throw configError("tls_config_set_alpn");
         }
-        if (::tls_configure(ctx, cfg) != 0) {
-            const std::string err = ::tls_error(ctx) ? ::tls_error(ctx) : "tls_configure";
-            ::tls_config_free(cfg);
-            ::tls_free(ctx);
-            ::close(fd);
-            throw SocketException(err);
+        if (::tls_configure(parts.ctx, parts.cfg) != 0) {
+            throw SocketException(::tls_error(parts.ctx) ? ::tls_error(parts.ctx) : "tls_configure");
         }
-        if (::tls_connect_socket(ctx, fd, host.c_str()) != 0) {
-            const std::string err = ::tls_error(ctx) ? ::tls_error(ctx) : "tls_connect_socket";
-            ::tls_config_free(cfg);
-            ::tls_free(ctx);
-            ::close(fd);
-            throw SocketException(err);
+        if (::tls_connect_socket(parts.ctx, fd, host.c_str()) != 0) {
+            throw SocketException(::tls_error(parts.ctx) ? ::tls_error(parts.ctx) : "tls_connect_socket");
         }
 
-        // Drive the handshake to completion.
+        // Drive the handshake to completion, but not forever: a server that
+        // accepts the connection and then never answers would park this forever.
+        // (The TCP connect above has its own limit, opts.connectTimeout.)
+        IoDeadline deadline(fd, opts.handshakeTimeout);
         while (true) {
-            int hs = ::tls_handshake(ctx);
+            int hs = ::tls_handshake(parts.ctx);
             if (hs == 0) break;
             if (hs == TLS_WANT_POLLIN) {
                 co_await YarnBall::io::waitReadable(fd);
@@ -195,14 +183,15 @@ namespace Soccer {
                 co_await YarnBall::io::waitWritable(fd);
                 continue;
             }
-            const std::string err = ::tls_error(ctx) ? ::tls_error(ctx) : "tls_handshake";
-            ::tls_config_free(cfg);
-            ::tls_free(ctx);
-            ::close(fd);
-            throw SocketException(err);
+            if (deadline.expired()) throw SocketException("TLS handshake timed out");
+            throw SocketException(::tls_error(parts.ctx) ? ::tls_error(parts.ctx) : "tls_handshake");
         }
+        deadline.disarm(); // before the fd changes hands
 
-        co_return TlsStream(ctx, cfg, fd);
+        TlsStream out(parts.ctx, parts.cfg, tcp.release());
+        parts.ctx = nullptr;
+        parts.cfg = nullptr;
+        co_return out;
     }
 
     YarnBall::Task<std::size_t> TlsStream::read(std::span<std::byte> buf) {
@@ -212,8 +201,11 @@ namespace Soccer {
         while (true) {
             ssize_t n;
             std::string err;
+            int fd;
             {
                 std::lock_guard<std::mutex> lk(this->impl->callMu);
+                if (!this->impl->ctx) throw SocketException("read on closed TlsStream");
+                fd = this->impl->fd; // close() changes it under this lock; waits below use this copy
                 n = ::tls_read(this->impl->ctx, buf.data(), buf.size());
                 if (n < 0 && n != TLS_WANT_POLLIN && n != TLS_WANT_POLLOUT) {
                     err = ::tls_error(this->impl->ctx) ? ::tls_error(this->impl->ctx) : "tls_read";
@@ -221,11 +213,11 @@ namespace Soccer {
             }
             if (n >= 0) co_return static_cast<std::size_t>(n);
             if (n == TLS_WANT_POLLIN) {
-                co_await YarnBall::io::waitReadable(this->impl->fd);
+                co_await YarnBall::io::waitReadable(fd);
                 continue;
             }
             if (n == TLS_WANT_POLLOUT) {
-                co_await YarnBall::io::waitWritable(this->impl->fd);
+                co_await YarnBall::io::waitWritable(fd);
                 continue;
             }
             throw SocketException(err);
@@ -240,8 +232,11 @@ namespace Soccer {
         while (total < buf.size()) {
             ssize_t n;
             std::string err;
+            int fd;
             {
                 std::lock_guard<std::mutex> lk(this->impl->callMu);
+                if (!this->impl->ctx) throw SocketException("write on closed TlsStream");
+                fd = this->impl->fd; // close() changes it under this lock; waits below use this copy
                 n = ::tls_write(this->impl->ctx, buf.data() + total, buf.size() - total);
                 if (n < 0 && n != TLS_WANT_POLLIN && n != TLS_WANT_POLLOUT) {
                     err = ::tls_error(this->impl->ctx) ? ::tls_error(this->impl->ctx) : "tls_write";
@@ -253,11 +248,11 @@ namespace Soccer {
                 continue;
             }
             if (n == TLS_WANT_POLLIN) {
-                co_await YarnBall::io::waitReadable(this->impl->fd);
+                co_await YarnBall::io::waitReadable(fd);
                 continue;
             }
             if (n == TLS_WANT_POLLOUT) {
-                co_await YarnBall::io::waitWritable(this->impl->fd);
+                co_await YarnBall::io::waitWritable(fd);
                 continue;
             }
             throw SocketException(err);

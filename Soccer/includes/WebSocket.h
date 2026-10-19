@@ -14,22 +14,30 @@
 //  - No extensions (permessage-deflate etc.)
 //  - No subprotocols
 //
-// API: one verb per operation. No callbacks, no on_message handler
-// slot, no options structs. Receive returns the next message;
+// API: one verb per operation. Receive returns the next message;
 // internal control frames (Ping/Close) are handled transparently so
-// user code only sees data frames.
+// user code only sees data frames. The only configuration is the optional
+// WsOptions (timeouts, size caps, Origin policy).
 //
 
 #ifndef SOCCER_WEBSOCKET_H
 #define SOCCER_WEBSOCKET_H
 
+#include <chrono>
+#include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <span>
+#include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "Coroutines.h"
+#include "TcpListener.h"
 #include "TcpStream.h"
 
 namespace Soccer {
@@ -72,6 +80,45 @@ namespace Soccer {
     };
 
     /**
+     * @struct WsOptions
+     * @brief Limits and policy for a WebSocket endpoint. Durations and sizes
+     *        treat zero as "unlimited".
+     */
+    struct WsOptions {
+        /// Client: time allowed to resolve the host and establish the TCP connection.
+        std::chrono::milliseconds connectTimeout{10000};
+        /// Time allowed for the opening handshake (request in, 101 out; or on the client, request out, 101 in).
+        std::chrono::milliseconds handshakeTimeout{10000};
+        /// Once a frame has started arriving (and between the fragments of one
+        /// message), time allowed for the rest of it. Cuts off a peer that sends
+        /// half a frame and stalls.
+        std::chrono::milliseconds frameTimeout{30000};
+        /// Time allowed between messages with nothing arriving. Off by default, as a
+        /// quiet connection is normal for WebSocket; set it (and have peers ping) to reap dead ones.
+        std::chrono::milliseconds idleTimeout{0};
+        /// Time allowed for one frame write to drain (a peer that stops reading).
+        std::chrono::milliseconds writeTimeout{30000};
+        /// Handshake request/response size, headers included.
+        std::size_t maxHandshakeBytes{16 * 1024};
+        /// One message, reassembled from its fragments (close code 1009 beyond).
+        std::size_t maxMessageBytes{16 * 1024 * 1024};
+
+        /// Server (@ref wsServe): connections served at once, handshake included; a
+        /// connection accepted beyond it is closed at once. Zero means unlimited.
+        std::size_t maxConnections{0};
+
+        /// Server: Origin header values (exact, case-insensitive) a browser may connect from,
+        /// e.g. "https://app.example.com". Empty means no allow-list.
+        std::vector<std::string> allowedOrigins;
+        /// Server: optional extra policy, called with the Origin header value when one is
+        /// present. Return false to refuse. Applied in addition to @ref allowedOrigins.
+        std::function<bool(std::string_view origin)> originCheck;
+        /// Server: whether a handshake with no Origin header (non-browser clients) is accepted
+        /// when an allow-list or @ref originCheck is configured.
+        bool allowMissingOrigin{true};
+    };
+
+    /**
      * @class WsConnection
      * @brief Coroutine-driven WebSocket endpoint. Move-only.
      *
@@ -102,10 +149,15 @@ namespace Soccer {
          * GUID and base64-encoded to produce @c Sec-WebSocket-Accept,
          * per RFC 6455 section 4.2.2.
          *
+         * A refused handshake (bad request, wrong version, Origin not
+         * allowed by @p options) is answered with a bodyless 400 / 426 / 403 on a
+         * best-effort basis before the exception is thrown.
+         *
          * @throws WsException on malformed request, missing headers,
-         *         wrong protocol version, or socket failure.
+         *         wrong protocol version, refused Origin, handshake timeout, or
+         *         socket failure.
          */
-        static YarnBall::Task<WsConnection> serverHandshake(TcpStream stream);
+        static YarnBall::Task<WsConnection> serverHandshake(TcpStream stream, WsOptions options = {});
 
         /**
          * @brief Connect to @c ws://@p host:@p port@p path and
@@ -121,13 +173,14 @@ namespace Soccer {
          */
         static YarnBall::Task<WsConnection> connect(std::string host,
                                                      std::uint16_t port,
-                                                     std::string path);
+                                                     std::string path,
+                                                     WsOptions options = {});
 
         WsConnection(const WsConnection &) = delete;
         WsConnection &operator=(const WsConnection &) = delete;
         WsConnection(WsConnection &&) noexcept = default;
-        WsConnection &operator=(WsConnection &&) noexcept = default;
-        ~WsConnection() = default;
+        WsConnection &operator=(WsConnection &&other) noexcept;
+        ~WsConnection();
 
         /**
          * @brief Receive the next data message. Suspends until a Text
@@ -136,10 +189,18 @@ namespace Soccer {
          *        cause the connection to be marked closed (the next
          *        call throws).
          *
+         * A protocol violation fails the connection: a Close frame with the
+         * matching code (1002, 1007 invalid UTF-8, 1009 too big) is sent best-effort
+         * and the connection is marked closed.
+         *
+         * Concurrent senders are safe: every write goes through one per-connection
+         * lock, so a Pong produced here never interleaves with a @ref sendText.
+         * Only one @c receive may be in flight at a time.
+         *
          * @throws WsException if the connection has already been
          *         closed, on protocol violations (continuation
-         *         frames, reserved bits set), or on peer-initiated
-         *         close (after the close handshake completes).
+         *         frames, reserved bits set), on a frame/idle timeout, or on
+         *         peer-initiated close (after the close handshake completes).
          */
         YarnBall::Task<WsMessage> receive();
 
@@ -193,30 +254,53 @@ namespace Soccer {
          *         @c false by a peer Close, a local @ref close, or a
          *         protocol error.
          */
-        bool isOpen() const noexcept { return this->open; }
+        bool isOpen() const noexcept;
+
+        /**
+         * @brief Heap state of a connection (defined in WebSocket.cpp). It lives
+         *        on the heap, shared with every operation in flight, so moving
+         *        the move-only handle never invalidates a running @c receive or
+         *        send. Public only so the .cpp's file-scope helpers can name it.
+         */
+        struct Impl;
 
     private:
-        WsConnection(TcpStream s, bool isServer,
-                       std::vector<std::byte> initialPrebuf = {}) noexcept
-            : stream(std::move(s)),
-              preBuf(std::move(initialPrebuf)),
-              serverSide(isServer) {
+        explicit WsConnection(std::shared_ptr<Impl> state) noexcept : impl(std::move(state)) {
         }
 
-        TcpStream stream;
-        /**
-         * @brief Bytes that the handshake reader over-consumed past
-         *        the @c "\r\n\r\n" header terminator. Frame reads
-         *        drain this first before issuing a kernel @c read.
-         *        Necessary because a server can legitimately send the
-         *        first frame in the same TCP segment as its 101
-         *        response.
-         */
-        std::vector<std::byte> preBuf;
-        std::size_t preOffset{0};
-        bool serverSide{true};
-        bool open{true};
+        std::shared_ptr<Impl> impl;
     };
+
+    /**
+     * @brief Per-connection callback of @ref wsServe: runs once the opening
+     *        handshake has succeeded and owns the connection until it returns.
+     */
+    using WsHandler = std::function<YarnBall::Task<void>(WsConnection)>;
+
+    /**
+     * @brief WebSocket server loop: accept connections on @p listener, perform the
+     *        server handshake on each, and run @p handler with the resulting
+     *        @ref WsConnection on the Yarn pool.
+     *
+     * Applies the whole of @p options so a hand-written accept loop need not:
+     *  - @c maxConnections caps the connections served at once (the slot is held
+     *    from accept, so half-open handshakes count); one beyond it is closed
+     *    without a reply. Backed by @ref ConnectionLimiter.
+     *  - @c handshakeTimeout cuts off a peer that never completes the upgrade.
+     *  - @c allowedOrigins / @c originCheck / @c allowMissingOrigin refuse a
+     *    browser Origin the server does not serve (403).
+     *  - the remaining fields (frame / idle / write timeouts, size caps) become the
+     *    connection's own limits.
+     *
+     * A connection whose handshake fails is dropped; an exception escaping
+     * @p handler is swallowed (the connection is closed with the handler's frame).
+     * The loop ends when @p stop is requested (in-flight connections keep running)
+     * or the listener fails with a non-transient error.
+     */
+    YarnBall::Task<void> wsServe(TcpListener listener,
+                                 WsHandler handler,
+                                 WsOptions options = {},
+                                 std::stop_token stop = {});
 
 }
 

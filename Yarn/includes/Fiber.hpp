@@ -191,6 +191,11 @@ namespace YarnBall {
         void drainToPending();
 
         /**
+         * @brief Forward everything in the inbox (MPMC, safe from any thread) to the injection path.
+         */
+        void drainInboxToPending();
+
+        /**
          * @brief Pop a task from the local deque if any.
          */
         TaskPtr popLocal();

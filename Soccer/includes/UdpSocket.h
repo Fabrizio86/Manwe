@@ -23,7 +23,7 @@ namespace Soccer {
      * Each @c recvFrom / @c sendTo does exactly one syscall after the
      * kernel reports readiness. Datagram semantics: every receive returns
      * one whole datagram (truncated to the caller's buffer if the wire
-     * datagram is larger).
+     * datagram is larger; pass @c truncated to @c recvFrom to learn of it).
      *
      * Move-only.
      */
@@ -59,10 +59,16 @@ namespace Soccer {
         /**
          * @brief Receive one datagram, suspending until readable. Writes
          *        the sender's address into @p sender.
-         * @return Number of bytes received (may be 0 for a zero-length
-         *         datagram).
+         * @param truncated Optional. Set to @c true when the datagram was
+         *        longer than @p buf and its tail was discarded (the kernel
+         *        reports this via @c MSG_TRUNC; on Windows via
+         *        @c WSAEMSGSIZE), @c false otherwise. Pass it if a silently
+         *        shortened datagram would corrupt your protocol.
+         * @return Number of bytes received into @p buf (may be 0 for a
+         *         zero-length datagram).
          */
-        YarnBall::Task<std::size_t> recvFrom(std::span<std::byte> buf, SocketAddress *sender);
+        YarnBall::Task<std::size_t> recvFrom(std::span<std::byte> buf, SocketAddress *sender,
+                                             bool *truncated = nullptr);
 
         /**
          * @brief Send one datagram to @p destination, suspending on

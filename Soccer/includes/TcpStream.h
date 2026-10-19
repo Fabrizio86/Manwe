@@ -5,6 +5,7 @@
 #ifndef SOCCER_TCPSTREAM_H
 #define SOCCER_TCPSTREAM_H
 
+#include <chrono>
 #include <cstddef>
 #include <span>
 #include <string>
@@ -105,9 +106,18 @@ namespace Soccer {
      * suspends on writability until the kernel reports the handshake done
      * (or surfaces an error via @c SO_ERROR).
      *
-     * @throws SocketException on resolution / socket / connect failures.
+     * @param timeout Longest the whole attempt (resolution plus every candidate
+     *        address) may take; zero or negative means no limit beyond the
+     *        kernel's own connect timeout. The connect runs inside a
+     *        cancellation scope (see Cancellation.h) that the deadline stops, so
+     *        a socket still in the middle of its SYN is abandoned and closed --
+     *        shutting it down would not wake it on every platform.
+     *
+     * @throws SocketException on resolution / socket / connect failures, and
+     *         with a message containing "timed out" when @p timeout elapses.
      */
-    YarnBall::Task<TcpStream> tcpConnect(std::string host, std::uint16_t port);
+    YarnBall::Task<TcpStream> tcpConnect(std::string host, std::uint16_t port,
+                                         std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
 
     /**
      * @brief Connect to a Unix-domain stream listener at @p socketPath.

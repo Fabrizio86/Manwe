@@ -7,6 +7,8 @@
 #include <bit>
 #include <cmath>
 #include <cstring>
+#include <limits>
+#include <locale>
 #include <sstream>
 #include <stdexcept>
 #include <utility>
@@ -21,9 +23,19 @@ namespace YarnBall::metrics {
         : bounds(std::move(bucketBounds)),
           bucketCounts(this->bounds.size() + 1),
           helpText(std::move(help)) {
+        for (std::size_t i = 0; i < this->bounds.size(); ++i) {
+            const double b = this->bounds[i];
+            // observe() and the exposition format assume finite, strictly increasing upper bounds.
+            if (!std::isfinite(b) || (i > 0 && !(b > this->bounds[i - 1]))) {
+                throw std::invalid_argument(
+                    "metrics::Histogram: bucket bounds must be finite and strictly ascending");
+            }
+        }
     }
 
     void Histogram::observe(double x) noexcept {
+        // A NaN would poison the running sum permanently; drop it.
+        if (std::isnan(x)) return;
         // Linear scan -- bounds.size() is small (typically <= 16).
         // Binary search would barely pay back the branch prediction
         // win at this scale.
@@ -133,7 +145,14 @@ namespace YarnBall::metrics {
                                       const std::string &help) {
         std::lock_guard<std::mutex> lk(this->mu);
         auto it = this->histograms.find(name);
-        if (it != this->histograms.end()) return *it->second;
+        if (it != this->histograms.end()) {
+            if (it->second->bucketBounds() != buckets) {
+                throw std::logic_error(
+                    "metrics::Registry: histogram \"" + name +
+                    "\" already registered with different bucket bounds");
+            }
+            return *it->second;
+        }
         if (this->counters.count(name) || this->gauges.count(name)) {
             throwNameCollision(name);
         }
@@ -154,32 +173,54 @@ namespace YarnBall::metrics {
             if (std::isinf(x)) return x > 0 ? "+Inf" : "-Inf";
             if (std::isnan(x)) return "NaN";
             std::ostringstream os;
+            os.imbue(std::locale::classic());
+            os.precision(15);
             os << x;
             return os.str();
+        }
+    }
+
+    namespace {
+        /**
+         * @brief Escape a HELP docstring per the Prometheus text format:
+         *        backslash and line feed are the only escaped characters,
+         *        and an unescaped newline would end the comment line and
+         *        turn the rest of the text into a bogus sample.
+         */
+        std::string escapeHelp(const std::string &s) {
+            std::string out;
+            out.reserve(s.size());
+            for (char c : s) {
+                if (c == '\\') out += "\\\\";
+                else if (c == '\n') out += "\\n";
+                else out += c;
+            }
+            return out;
         }
     }
 
     std::string Registry::scrape() const {
         std::lock_guard<std::mutex> lk(this->mu);
         std::ostringstream os;
+        os.imbue(std::locale::classic());
         for (const auto &name : this->registrationOrder) {
             if (auto it = this->counters.find(name); it != this->counters.end()) {
                 const auto &c = *it->second;
-                if (!c.help().empty()) os << "# HELP " << name << " " << c.help() << "\n";
+                if (!c.help().empty()) os << "# HELP " << name << " " << escapeHelp(c.help()) << "\n";
                 os << "# TYPE " << name << " counter\n";
                 os << name << " " << c.value() << "\n";
                 continue;
             }
             if (auto it = this->gauges.find(name); it != this->gauges.end()) {
                 const auto &g = *it->second;
-                if (!g.help().empty()) os << "# HELP " << name << " " << g.help() << "\n";
+                if (!g.help().empty()) os << "# HELP " << name << " " << escapeHelp(g.help()) << "\n";
                 os << "# TYPE " << name << " gauge\n";
                 os << name << " " << fmtDouble(g.value()) << "\n";
                 continue;
             }
             if (auto it = this->histograms.find(name); it != this->histograms.end()) {
                 const auto &h = *it->second;
-                if (!h.help().empty()) os << "# HELP " << name << " " << h.help() << "\n";
+                if (!h.help().empty()) os << "# HELP " << name << " " << escapeHelp(h.help()) << "\n";
                 os << "# TYPE " << name << " histogram\n";
                 auto snap = h.snapshot();
                 for (const auto &[bound, count] : snap) {

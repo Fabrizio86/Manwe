@@ -52,6 +52,7 @@ namespace Embedded {
         if (this->chipFd < 0) {
             throw GpioError("requestOutput on closed GpioChip");
         }
+        if (pin < 0) throw GpioError("requestOutput: negative pin");
         struct gpiohandle_request req{};
         req.lineoffsets[0] = static_cast<std::uint32_t>(pin);
         req.flags = GPIOHANDLE_REQUEST_OUTPUT;
@@ -70,6 +71,7 @@ namespace Embedded {
         if (this->chipFd < 0) {
             throw GpioError("requestInputEdge on closed GpioChip");
         }
+        if (pin < 0) throw GpioError("requestInputEdge: negative pin");
         struct gpioevent_request req{};
         req.lineoffset = static_cast<std::uint32_t>(pin);
         req.handleflags = GPIOHANDLE_REQUEST_INPUT;
@@ -113,15 +115,21 @@ namespace Embedded {
             throw GpioError("waitForEvent called on output-configured GpioLine");
         }
         co_await YarnBall::io::waitReadable(this->lineFd);
+        if (this->lineFd < 0) {
+            throw GpioError("GpioLine closed while waiting for an event");
+        }
 
         struct gpioevent_data raw{};
         ::ssize_t n;
         do {
             n = ::read(this->lineFd, &raw, sizeof(raw));
         } while (n < 0 && errno == EINTR);
-        if (n < static_cast<::ssize_t>(sizeof(raw))) {
+        if (n < 0) {
             throw GpioError(std::string("read(gpioevent_data): ") +
                              std::strerror(errno));
+        }
+        if (n < static_cast<::ssize_t>(sizeof(raw))) {
+            throw GpioError("read(gpioevent_data): short read");
         }
         GpioEvent ev{};
         ev.timestampNs = raw.timestamp;
@@ -132,6 +140,8 @@ namespace Embedded {
 
     void GpioLine::close() noexcept {
         if (this->lineFd >= 0) {
+            // Wake a waitForEvent() parked on this line; it reports the closed line instead of hanging.
+            YarnBall::Reactor::instance()->cancelFd(this->lineFd);
             (void) ::close(this->lineFd);
             this->lineFd = -1;
         }

@@ -20,7 +20,11 @@ namespace YarnBall::trace {
          *        thread on first call.
          */
         std::mt19937_64 &rng() {
-            static thread_local std::mt19937_64 gen(std::random_device{}());
+            static thread_local std::mt19937_64 gen = []() {
+                std::random_device rd;
+                std::seed_seq seq{rd(), rd(), rd(), rd(), rd(), rd(), rd(), rd()};
+                return std::mt19937_64(seq);
+            }();
             return gen;
         }
 

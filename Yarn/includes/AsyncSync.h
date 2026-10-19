@@ -12,6 +12,15 @@
 // std::mutex would either deadlock (if held across an await and the
 // same worker tried to re-acquire) or block a Yarn worker thread.
 //
+// Every parked wait is cancellable (see Cancellation.h): inside a cancellation
+// scope (withCancellation / whenAny / withTimeout) a stopped scope removes the
+// waiter from the queue and the co_await throws CancelledException, leaving
+// the primitive's state as if the wait had never started (a cancelled
+// barrier arrival is withdrawn, a cancelled AsyncOnce runner lets another
+// caller run the callable). A coroutine frame destroyed while parked also
+// leaves its queue, so no queue ever holds a dangling handle.
+//
+
 
 #ifndef YARN_ASYNC_SYNC_H
 #define YARN_ASYNC_SYNC_H
@@ -24,11 +33,189 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
+#include <vector>
 #include <utility>
 
+#include "Cancellation.h"
 #include "Coroutines.h"
 
 namespace YarnBall {
+
+    namespace detail {
+
+        /**
+         * @brief One parked coroutine in a primitive's FIFO. Lives inside the
+         *        suspended awaiter (i.e. in the coroutine frame), so queueing
+         *        never allocates and a waiter can be unlinked in O(1).
+         *        @c queued is only written under the owning primitive's
+         *        mutex; the atomic lets an awaiter's destructor skip the lock
+         *        on the normal (already woken) path.
+         */
+        struct WaitNode {
+            std::coroutine_handle<> h{};
+            WaitNode *prev = nullptr;
+            WaitNode *next = nullptr;
+            std::atomic<bool> queued{false};
+            bool isWriter = false;
+        };
+
+        /**
+         * @brief Intrusive FIFO of @ref WaitNode. Not synchronised: the
+         *        owning primitive's mutex guards every call.
+         */
+        class WaitList {
+        public:
+            bool empty() const noexcept { return this->head == nullptr; }
+            std::size_t size() const noexcept { return this->count; }
+            WaitNode *front() const noexcept { return this->head; }
+
+            void push_back(WaitNode *n) noexcept {
+                n->prev = this->tail;
+                n->next = nullptr;
+                if (this->tail) this->tail->next = n; else this->head = n;
+                this->tail = n;
+                ++this->count;
+                n->queued.store(true, std::memory_order_release);
+            }
+
+            void remove(WaitNode *n) noexcept {
+                if (n->prev) n->prev->next = n->next; else this->head = n->next;
+                if (n->next) n->next->prev = n->prev; else this->tail = n->prev;
+                n->prev = n->next = nullptr;
+                --this->count;
+                n->queued.store(false, std::memory_order_release);
+            }
+
+            /// Unlink the head and return its handle (read before the node is released).
+            std::coroutine_handle<> popFront() noexcept {
+                WaitNode *n = this->head;
+                const auto h = n->h;
+                this->remove(n);
+                return h;
+            }
+
+            void takeAll(std::vector<std::coroutine_handle<>> &out) {
+                while (this->head) out.push_back(this->popFront());
+            }
+
+        private:
+            WaitNode *head = nullptr;
+            WaitNode *tail = nullptr;
+            std::size_t count = 0;
+        };
+
+        /**
+         * @brief Shared machinery of the queue-parking awaiters (CRTP over
+         *        the concrete awaiter @p D, which supplies the fast path and,
+         *        optionally, @c fixupLocked to repair primitive state when a
+         *        waiter leaves the queue without being served, and
+         *        @c revokeGrant to give back what a wake handed over when the
+         *        frame died before it could use it).
+         *
+         * Cancellation protocol: the cancel callback is armed before the node
+         * is queued; if it fires while the node is not queued yet it only
+         * leaves a note (@c earlyCancel) that @ref park honours under the
+         * lock, so a cancellation can neither be lost nor race the enqueue.
+         * The queue holds a WaitProxy handle, not the coroutine's (see
+         * Cancellation.h), so a wake still in flight when the frame is
+         * destroyed resumes nothing.
+         */
+        template<typename D>
+        struct ParkBase {
+            ParkBase(std::mutex &m, WaitList &l) noexcept : mu(&m), list(&l) {}
+            ParkBase(const ParkBase &) = delete;
+            ParkBase &operator=(const ParkBase &) = delete;
+            ~ParkBase() { this->bind.disarm(); }
+
+            std::mutex *mu;
+            WaitList *list;
+            WaitNode node;
+            WaitProxy proxy;
+            bool earlyCancel = false; // guarded by *mu
+            bool cancelled = false;   // written under *mu while queued; read after the wake
+            CancelBinding bind;       // declared last: destroyed (and waited for) first
+
+            void fixupLocked(std::vector<std::coroutine_handle<>> &) noexcept {}
+            void revokeGrant() noexcept {}
+
+            /**
+             * @brief Take the resource through @p tryNow (called under the
+             *        lock; @c true = got it, resume at once) or park.
+             */
+            template<typename Promise, typename TryNow>
+            std::coroutine_handle<> park(std::coroutine_handle<Promise> h, TryNow &&tryNow) {
+                TaskPromiseCore *core = CancelBinding::ambient(h);
+                bool armed = false;
+                for (;;) {
+                    {
+                        std::lock_guard<std::mutex> lk(*this->mu);
+                        if (this->earlyCancel) {
+                            this->cancelled = true;
+                            return h;
+                        }
+                        if (tryNow()) return h;
+                        if (!core || armed) {
+                            this->node.h = this->proxy.publish(h);
+                            this->list->push_back(&this->node);
+                            return std::noop_coroutine();
+                        }
+                        if (core->isCancellationRequested()) {
+                            this->cancelled = true;
+                            return h;
+                        }
+                    }
+                    this->bind.arm(core, &ParkBase::cancelThunk, this);
+                    armed = true;
+                }
+            }
+
+            static void cancelThunk(void *p) noexcept {
+                auto *self = static_cast<D *>(p);
+                std::vector<std::coroutine_handle<>> wake;
+                std::coroutine_handle<> h{};
+                bool withdrew = false;
+                {
+                    std::lock_guard<std::mutex> lk(*self->mu);
+                    if (self->node.queued.load(std::memory_order_relaxed)) {
+                        h = self->node.h;
+                        self->list->remove(&self->node);
+                        self->fixupLocked(wake);
+                        self->cancelled = true;
+                        withdrew = true;
+                    } else {
+                        self->earlyCancel = true;
+                    }
+                }
+                for (auto w : wake) resumeOnPool(w);
+                if (withdrew) resumeOnPool(h);
+            }
+
+            /// Awaiter going away (normally, or because the frame is destroyed while parked or being woken).
+            void abandon() noexcept {
+                this->bind.disarm();
+                if (!this->proxy) return;
+                std::vector<std::coroutine_handle<>> wake;
+                bool removed = false;
+                if (this->node.queued.load(std::memory_order_acquire)) {
+                    std::lock_guard<std::mutex> lk(*this->mu);
+                    if (this->node.queued.load(std::memory_order_relaxed)) {
+                        this->list->remove(&this->node);
+                        static_cast<D *>(this)->fixupLocked(wake);
+                        removed = true;
+                    }
+                }
+                // A wake that was handed this waiter but never ran: a cancel wake owes nothing, a grant is given back.
+                if (this->proxy.retire(removed) && !this->cancelled) static_cast<D *>(this)->revokeGrant();
+                for (auto w : wake) resumeOnPool(w);
+            }
+
+            void throwIfCancelled() const {
+                if (this->cancelled) throw CancelledException{};
+            }
+        };
+
+    } // namespace detail
 
     class AsyncMutex;
 
@@ -132,7 +319,7 @@ namespace YarnBall {
          */
         bool held = false;
 
-        std::deque<std::coroutine_handle<>> waiters;
+        detail::WaitList waiters;
     };
 
     inline AsyncMutexGuard &AsyncMutexGuard::operator=(AsyncMutexGuard &&other) noexcept {
@@ -209,7 +396,7 @@ namespace YarnBall {
 
         mutable std::mutex mu;
         std::size_t count;
-        std::deque<std::coroutine_handle<>> waiters;
+        detail::WaitList waiters;
     };
 
 
@@ -286,7 +473,7 @@ namespace YarnBall {
         friend struct AsyncNotifyAwaiter;
 
         mutable std::mutex mu;
-        std::deque<std::coroutine_handle<>> waiters;
+        detail::WaitList waiters;
     };
 
 
@@ -415,10 +602,13 @@ namespace YarnBall {
          */
         void releaseWriter() noexcept;
 
-        struct Waiter {
-            std::coroutine_handle<> handle;
-            bool isWriter;
-        };
+        /**
+         * @brief Move every waiter that can run now (a writer at the head if
+         *        the lock is free, otherwise the leading batch of readers if
+         *        no writer holds it) out of the queue, taking the lock on its
+         *        behalf, and append their handles to @p wake. mu held.
+         */
+        void promoteLocked(std::vector<std::coroutine_handle<>> &wake);
 
         std::mutex mu;
 
@@ -429,7 +619,7 @@ namespace YarnBall {
          */
         int state = 0;
 
-        std::deque<Waiter> waiters;
+        detail::WaitList waiters;
     };
 
     // ------------- AsyncReadGuard / AsyncWriteGuard inlines ----------
@@ -517,7 +707,7 @@ namespace YarnBall {
 
         std::atomic<bool> latched{false};
         std::mutex mu;
-        std::deque<std::coroutine_handle<>> waiters;
+        detail::WaitList waiters;
     };
 
 
@@ -553,6 +743,10 @@ namespace YarnBall {
          *        others park until the first completes, then return.
          *
          * @p fn returns a @c Task<void>; it may itself co_await.
+         *
+         * If the runner is cancelled (@c CancelledException out of @p fn)
+         * the AsyncOnce goes back to idle and one of the parked callers
+         * runs @p fn again, so a cancelled initialiser does not poison it.
          */
         Task<> callOnce(std::function<Task<>()> fn);
 
@@ -576,7 +770,7 @@ namespace YarnBall {
         std::atomic<bool> done{false};
         std::mutex mu;
         State state = State::Idle;
-        std::deque<std::coroutine_handle<>> waiters;
+        detail::WaitList waiters;
         std::exception_ptr exception{};
     };
 
@@ -603,8 +797,11 @@ namespace YarnBall {
          *        immediately complete and is rejected here to fail
          *        loud rather than silently passing through).
          */
-        explicit AsyncBarrier(std::size_t n) noexcept
+        explicit AsyncBarrier(std::size_t n)
             : initial(n), countdown(n) {
+            if (n == 0) {
+                throw std::invalid_argument("AsyncBarrier: n must be >= 1");
+            }
         }
 
         AsyncBarrier(const AsyncBarrier &) = delete;
@@ -635,7 +832,7 @@ namespace YarnBall {
         const std::size_t initial;
         mutable std::mutex mu;
         std::size_t countdown;
-        std::deque<std::coroutine_handle<>> waiters;
+        detail::WaitList waiters;
     };
 
 }

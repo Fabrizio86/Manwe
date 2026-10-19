@@ -11,7 +11,8 @@
 // case-insensitive header lookup, exact method+path routing (no DSL).
 // Chunked transfer encoding is not supported (matches HttpClient).
 // Keep-alive is not supported either -- every response carries
-// Connection: close. Production HTTP servers want keep-alive + chunked
+// Connection: close, so there is no idle keep-alive phase to time out;
+// the limits in HttpServerOptions bound every phase of the one request. Production HTTP servers want keep-alive + chunked
 // + a routing DSL; this is the minimal "fast path to a working REST
 // endpoint" tier.
 //
@@ -21,6 +22,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -34,8 +36,10 @@
 #include <vector>
 
 #include "BufferedReader.h"
+#include "ConnectionLimiter.h"
 #include "Coroutines.h"
 #include "HttpClient.h"
+#include "IoDeadline.h"
 #include "SocketException.h"
 #include "TcpListener.h"
 #include "TcpServer.h"
@@ -57,6 +61,15 @@ namespace Soccer {
         std::string body;
 
         /**
+         * @brief Fires when the request is no longer wanted. Set by the HTTP/2
+         *        server when the client resets the stream or the connection
+         *        goes away before the handler has answered; a long-running
+         *        handler can poll it (or register a @c std::stop_callback) and
+         *        stop early. Default-constructed (never fires) for HTTP/1.
+         */
+        std::stop_token cancel;
+
+        /**
          * @brief Case-insensitive header lookup. Returns empty string
          *        if @p name is not present.
          */
@@ -66,6 +79,48 @@ namespace Soccer {
             }
             return {};
         }
+    };
+
+    /**
+     * @struct HttpServerOptions
+     * @brief Resource limits for @ref HttpServer. Every duration and size here
+     *        treats zero as "unlimited".
+     *
+     * The timeouts are slowloris defences: a peer that connects and then trickles
+     * (or never sends) bytes is cut off instead of holding a connection and its
+     * memory forever.
+     */
+    struct HttpServerOptions {
+        /// From accept until the request line and all headers have arrived.
+        std::chrono::milliseconds headerTimeout{10000};
+        /// For the request body, once the headers are in.
+        std::chrono::milliseconds bodyTimeout{30000};
+        /// For writing the response (a client that never reads it).
+        std::chrono::milliseconds writeTimeout{30000};
+        /// Connections served at once; further ones get a 503 and are closed.
+        std::size_t maxConnections{0};
+        /// Request line plus header block, in bytes (431 beyond).
+        std::size_t maxHeaderBytes{detail::kHttpMaxHeaderBytes};
+        /// Header fields per request (431 beyond).
+        std::size_t maxHeaderCount{100};
+        /// Request body, judged from Content-Length before any body byte is read (413 beyond).
+        std::size_t maxBodyBytes{detail::kHttpMaxBodyBytes};
+    };
+
+    /**
+     * @class HttpProtocolError
+     * @brief A request the server refuses; carries the HTTP status to answer with.
+     */
+    class HttpProtocolError : public SocketException {
+    public:
+        HttpProtocolError(int status, const std::string &message)
+            : SocketException(message), httpStatus(status) {
+        }
+
+        int status() const noexcept { return this->httpStatus; }
+
+    private:
+        int httpStatus;
     };
 
     /**
@@ -93,8 +148,8 @@ namespace Soccer {
          *        the kernel pick; read the bound port back from
          *        @ref localAddress.
          */
-        HttpServer(const std::string &host, std::uint16_t port)
-            : listener(TcpListener::bind(host, port)) {
+        HttpServer(const std::string &host, std::uint16_t port, HttpServerOptions options = {})
+            : listener(TcpListener::bind(host, port)), opts(options) {
         }
 
         HttpServer(const HttpServer &) = delete;
@@ -114,6 +169,13 @@ namespace Soccer {
                    HttpRouteHandler handler) {
             this->routes[routeKey(method, path)] = std::move(handler);
         }
+
+        /**
+         * @brief Replace the resource limits. Takes effect for the next
+         *        @ref serve call; a running accept loop keeps the limits it
+         *        started with.
+         */
+        void setOptions(const HttpServerOptions &options) { this->opts = options; }
 
         /**
          * @brief Run the accept loop. Per-connection: parse one
@@ -151,7 +213,7 @@ namespace Soccer {
             // however much later or on whichever thread it actually
             // gets resumed.
             auto routesPtr = std::make_shared<RouteTable>(this->routes);
-            return serveHttp(std::move(routesPtr), std::move(this->listener), stop);
+            return serveHttp(std::move(routesPtr), std::move(this->listener), stop, this->opts);
         }
 
         /**
@@ -199,9 +261,11 @@ namespace Soccer {
         static YarnBall::Task<void> serveHttp(
             std::shared_ptr<RouteTable> routesPtr,
             TcpListener listener,
-            std::stop_token stop) {
-            auto factory = [routesPtr](TcpStream client) -> YarnBall::Task<void> {
-                return handleOne(routesPtr, std::move(client));
+            std::stop_token stop,
+            HttpServerOptions options) {
+            auto limiter = std::make_shared<ConnectionLimiter>(options.maxConnections);
+            auto factory = [routesPtr, limiter, options](TcpStream client) -> YarnBall::Task<void> {
+                return handleOne(routesPtr, std::move(client), options, limiter->tryAcquire());
             };
             co_await tcpServe(std::move(listener), std::move(factory), stop);
             co_return;
@@ -214,10 +278,20 @@ namespace Soccer {
          */
         static YarnBall::Task<void> handleOne(
             std::shared_ptr<RouteTable> routes,
-            TcpStream client) {
+            TcpStream client,
+            HttpServerOptions options,
+            ConnectionLimiter::Slot slot) {
+            // Declared after `client` (a parameter, so it outlives locals) and
+            // therefore disarmed before the fd is closed.
+            IoDeadline deadline;
+            int errorStatus = 0;
             try {
+                if (!slot) {
+                    throw HttpProtocolError(503, "HttpServer: connection limit reached");
+                }
+                deadline.arm(client.fd(), options.headerTimeout);
                 BufferedReader<TcpStream> r(&client);
-                HttpRequest req = co_await parseRequest(r);
+                HttpRequest req = co_await parseRequest(r, options, deadline);
 
                 HttpResponse resp;
                 auto it = routes->find(routeKey(req.method, req.path));
@@ -229,12 +303,42 @@ namespace Soccer {
                     resp = co_await it->second(std::move(req));
                 }
 
+                deadline.arm(client.fd(), options.writeTimeout);
                 co_await writeResponse(client, resp);
+            } catch (const HttpProtocolError &e) {
+                errorStatus = e.status();
             } catch (...) {
                 // Swallow per-connection errors -- one bad client should
                 // never tear down the server. A real production server
                 // would log here.
             }
+            if (errorStatus != 0 && !deadline.expired()) {
+                try {
+                    deadline.arm(client.fd(), std::chrono::seconds{2});
+                    co_await writeError(client, errorStatus);
+                } catch (...) {
+                    // The peer is gone; nothing to tell it.
+                }
+            }
+            co_return;
+        }
+
+        /**
+         * @brief Best-effort bodyless error response for a refused request.
+         */
+        static YarnBall::Task<void> writeError(TcpStream &client, int status) {
+            const char *reason = "Bad Request";
+            switch (status) {
+                case 413: reason = "Content Too Large"; break;
+                case 431: reason = "Request Header Fields Too Large"; break;
+                case 501: reason = "Not Implemented"; break;
+                case 503: reason = "Service Unavailable"; break;
+                default: break;
+            }
+            const std::string head = "HTTP/1.1 " + std::to_string(status) + " " + reason +
+                                     "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            co_await client.write(std::span<const std::byte>(
+                reinterpret_cast<const std::byte *>(head.data()), head.size()));
             co_return;
         }
 
@@ -244,7 +348,9 @@ namespace Soccer {
          *        + parseHeaderLine but for the server side.
          */
         static YarnBall::Task<HttpRequest> parseRequest(
-            BufferedReader<TcpStream> &r) {
+            BufferedReader<TcpStream> &r,
+            const HttpServerOptions &options,
+            IoDeadline &deadline) {
             HttpRequest req;
 
             // -- Request line: "GET /path HTTP/1.1\r\n"
@@ -257,22 +363,43 @@ namespace Soccer {
                 ? std::string::npos
                 : line.find(' ', sp1 + 1);
             if (sp1 == std::string::npos || sp2 == std::string::npos) {
-                throw SocketException("HttpServer: malformed request line");
+                throw HttpProtocolError(400, "HttpServer: malformed request line");
             }
             req.method = line.substr(0, sp1);
             req.path = line.substr(sp1 + 1, sp2 - sp1 - 1);
+            if (req.method.empty() || req.path.empty() ||
+                line.compare(sp2 + 1, 7, "HTTP/1.") != 0) {
+                throw HttpProtocolError(400, "HttpServer: malformed request line");
+            }
 
             // -- Headers until blank line.
             std::size_t headerBytes = line.size();
+            if (options.maxHeaderBytes != 0 && headerBytes > options.maxHeaderBytes) {
+                throw HttpProtocolError(431, "HttpServer: header block too large");
+            }
             while (true) {
                 std::string h = co_await r.readLine();
                 headerBytes += h.size();
-                if (headerBytes > detail::kHttpMaxHeaderBytes) {
-                    throw SocketException("HttpServer: header block too large");
+                if (options.maxHeaderBytes != 0 && headerBytes > options.maxHeaderBytes) {
+                    throw HttpProtocolError(431, "HttpServer: header block too large");
                 }
-                if (h.empty() || h == "\r\n" || h == "\n") break;
+                if (h.empty()) {
+                    // EOF inside the header block: the request is truncated.
+                    throw SocketException("HttpServer: connection closed inside header block");
+                }
+                if (h == "\r\n" || h == "\n") break;
                 const std::size_t colon = h.find(':');
-                if (colon == std::string::npos) continue;
+                // No colon (or an obs-fold continuation / whitespace before
+                // the colon) is a malformed header; do not skip it, since
+                // a proxy might interpret it differently.
+                if (colon == std::string::npos || colon == 0 ||
+                    std::isspace(static_cast<unsigned char>(h[0])) ||
+                    std::isspace(static_cast<unsigned char>(h[colon - 1]))) {
+                    throw HttpProtocolError(400, "HttpServer: malformed header line");
+                }
+                if (options.maxHeaderCount != 0 && req.headers.size() >= options.maxHeaderCount) {
+                    throw HttpProtocolError(431, "HttpServer: too many header fields");
+                }
                 HttpHeader header;
                 header.name = h.substr(0, colon);
                 header.value = detail::trimAscii(h.substr(colon + 1));
@@ -298,19 +425,35 @@ namespace Soccer {
             // one check, without needing to detect the conflict case
             // specially.
             if (!req.header("Transfer-Encoding").empty()) {
-                throw SocketException("HttpServer: Transfer-Encoding not supported");
+                throw HttpProtocolError(501, "HttpServer: Transfer-Encoding not supported");
             }
-            const std::string clen = req.header("Content-Length");
-            if (!clen.empty()) {
-                const long long len = std::atoll(clen.c_str());
-                if (len < 0 ||
-                    static_cast<std::size_t>(len) > detail::kHttpMaxBodyBytes) {
-                    throw SocketException("HttpServer: invalid Content-Length");
+            std::size_t len = 0;
+            bool hasLen = false;
+            try {
+                // No library cap here: the operator's maxBodyBytes decides (and may be 0).
+                hasLen = detail::strictContentLength(req.headers, len, 0);
+            } catch (const std::runtime_error &e) {
+                throw HttpProtocolError(400, e.what());
+            }
+            if (hasLen && options.maxBodyBytes != 0 && len > options.maxBodyBytes) {
+                throw HttpProtocolError(413, "HttpServer: request body too large");
+            }
+            if (hasLen && len != 0) {
+                // The headers are in: from here on the body clock runs.
+                deadline.arm(r.raw()->fd(), options.bodyTimeout);
+                if (detail::iequalsAscii(req.header("Expect"), "100-continue")) {
+                    static constexpr char kContinue[] = "HTTP/1.1 100 Continue\r\n\r\n";
+                    co_await r.raw()->write(std::span<const std::byte>(
+                        reinterpret_cast<const std::byte *>(kContinue), sizeof(kContinue) - 1));
                 }
-                auto bytes = co_await r.readExact(static_cast<std::size_t>(len));
+                auto bytes = co_await r.readExact(len);
+                if (bytes.size() != len) {
+                    throw SocketException("HttpServer: truncated request body");
+                }
                 req.body.assign(reinterpret_cast<const char *>(bytes.data()),
                                 bytes.size());
             }
+            deadline.disarm();
             co_return req;
         }
 
@@ -329,6 +472,18 @@ namespace Soccer {
             // wire.
             const int status = (resp.status >= 100 && resp.status <= 599)
                 ? resp.status : 500;
+            // Reject CR/LF/NUL in anything written into the head, so a
+            // handler echoing untrusted data cannot split the response.
+            bool unsafe = detail::hasCtlLineBreak(resp.reason);
+            for (const auto &h : resp.headers) {
+                if (detail::hasCtlLineBreak(h.name) || detail::hasCtlLineBreak(h.value) ||
+                    h.name.find(':') != std::string::npos) {
+                    unsafe = true;
+                }
+            }
+            if (unsafe) {
+                throw SocketException("HttpServer: control characters in response head");
+            }
             std::string head =
                 "HTTP/1.1 " + std::to_string(status) + " " +
                 (resp.reason.empty() ? std::string("OK") : resp.reason) +
@@ -360,6 +515,7 @@ namespace Soccer {
 
         TcpListener listener;
         RouteTable routes;
+        HttpServerOptions opts;
     };
 
 }

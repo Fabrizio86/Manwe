@@ -61,6 +61,9 @@ set(SOCCER_HEADERS
         includes/RawSocket.h
         includes/IcmpEcho.h
         includes/BufferedReader.h
+        includes/ConnectionLimiter.h
+        includes/IoDeadline.h
+        includes/NetUtil.h
         includes/HttpClient.h
         includes/HttpServer.h
         includes/WebSocket.h
@@ -91,11 +94,21 @@ target_include_directories(Soccer PUBLIC
 # Soccer's awaiters live on top of Yarn (Coroutines, Reactor, IoAwaiters).
 target_link_libraries(Soccer PUBLIC Yarn)
 
+# The libraries are linked with absolute paths while building in-tree, but the
+# EXPORTED interface must not bake this machine's paths into an install: it names
+# them plainly (-ltls -lssl -lcrypto) and leaves it to the consumer's linker search
+# path, which is what keeps the installed package relocatable. The same goes for
+# the include directories: Soccer's public headers only forward-declare the
+# libtls / nghttp2 types, so those directories stay private to this target.
 if (LIBTLS_INCLUDE_DIR AND LIBTLS_LIBRARY)
     target_link_libraries(Soccer PUBLIC
-            ${LIBTLS_LIBRARY}
-            ${LIBSSL_LIBRARY}
-            ${LIBCRYPTO_LIBRARY})
+            $<BUILD_INTERFACE:${LIBTLS_LIBRARY}>
+            $<BUILD_INTERFACE:${LIBSSL_LIBRARY}>
+            $<BUILD_INTERFACE:${LIBCRYPTO_LIBRARY}>
+            $<INSTALL_INTERFACE:tls>
+            $<INSTALL_INTERFACE:ssl>
+            $<INSTALL_INTERFACE:crypto>)
+    target_include_directories(Soccer PRIVATE ${LIBTLS_INCLUDE_DIR})
     target_compile_definitions(Soccer PUBLIC SOCCER_HAS_TLS=1)
 else ()
     message(STATUS "Soccer: libtls not found; TLS support disabled. "
@@ -103,8 +116,10 @@ else ()
 endif ()
 
 if (LIBNGHTTP2_INCLUDE_DIR AND LIBNGHTTP2_LIBRARY)
-    target_link_libraries(Soccer PUBLIC ${LIBNGHTTP2_LIBRARY})
-    target_include_directories(Soccer PUBLIC ${LIBNGHTTP2_INCLUDE_DIR})
+    target_link_libraries(Soccer PUBLIC
+            $<BUILD_INTERFACE:${LIBNGHTTP2_LIBRARY}>
+            $<INSTALL_INTERFACE:nghttp2>)
+    target_include_directories(Soccer PRIVATE ${LIBNGHTTP2_INCLUDE_DIR})
     target_compile_definitions(Soccer PUBLIC SOCCER_HAS_HTTP2=1)
 else ()
     message(STATUS "Soccer: nghttp2 not found; HTTP/2 stays a stub. "

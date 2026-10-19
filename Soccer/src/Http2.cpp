@@ -31,11 +31,17 @@
 
 #include <nghttp2/nghttp2.h>
 
+#include <array>
+#include <chrono>
 #include <cstring>
+#include <stop_token>
 #include <utility>
 
+#include "ConnectionLimiter.h"
 #include "Coroutines.h"
 #include "IoAwaiters.h"
+#include "IoDeadline.h"
+#include "NetUtil.h"
 #include "SocketException.h"
 #include "TcpStream.h"
 
@@ -59,6 +65,41 @@ namespace Soccer {
          *        enforce elsewhere in Soccer.
          */
         inline constexpr std::size_t kHttp2MaxBodyBytes = 16ull * 1024ull * 1024ull;
+
+        /**
+         * @brief Cap on the response headers a client accepts per stream: the
+         *        accumulated size of every header field (name + value + 32 bytes of
+         *        overhead, as in RFC 7541), counting interim 1xx responses and
+         *        trailers too, and the number of 1xx interim responses.
+         */
+        inline constexpr std::size_t kHttp2MaxHeaderBytes = 64ull * 1024ull;
+        inline constexpr int kHttp2MaxInterimResponses = 8;
+
+        /// HTTP/2 header field names must be lowercase (RFC 9113 8.2.1); a peer treats an
+        /// uppercase name as a protocol error, so callers' HTTP/1-style names are folded.
+        std::string lowerAscii(std::string_view in) {
+            std::string out(in);
+            for (char &c : out) {
+                if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + ('a' - 'A'));
+            }
+            return out;
+        }
+
+        /**
+         * @brief Hand @p h to the Yarn pool instead of resuming it on the
+         *        caller's stack. Used wherever a waiter is woken from inside an
+         *        nghttp2 callback or from close().
+         */
+        void resumeOnYarn(std::coroutine_handle<> h) noexcept {
+            try {
+                // Spelled as unique_ptr<ITask> to disambiguate from the
+                // CallableITask template overload of Yarn::run.
+                std::unique_ptr<YarnBall::ITask> ct{new YarnBall::detail::CoroutineITask(h)};
+                YarnBall::Yarn::instance()->run(std::move(ct));
+            } catch (...) {
+                h.resume();
+            }
+        }
     }
 
     // -----------------------------------------------------------------
@@ -77,6 +118,11 @@ namespace Soccer {
         virtual YarnBall::Task<void> writeAll(std::span<const std::byte> buf) = 0;
         virtual int fd() const noexcept = 0;
         virtual void close() noexcept = 0;
+        /// Shut the socket down without closing it: wakes a coroutine parked reading it.
+        void shutdown() noexcept {
+            const int f = this->fd();
+            if (f >= 0) detail::shutdownSocket(f);
+        }
     };
 
     namespace {
@@ -138,7 +184,13 @@ namespace Soccer {
 
         /// Serialises writes to the underlying stream. Drains pulled
         /// out of the session under sessionMu are written outside it.
-        std::mutex writeMu;
+        /// Bytes drained from the session but not yet written, and whether
+        /// a writer coroutine is currently flushing them. Both are guarded
+        /// by sessionMu, so output order always equals nghttp2's emission
+        /// order (HPACK state depends on it) and no mutex is ever held
+        /// across a suspension point.
+        std::vector<std::uint8_t> outPending;
+        bool writing{false};
 
         /// In-flight streams.
         std::mutex mapMu;
@@ -178,13 +230,37 @@ namespace Soccer {
     // -----------------------------------------------------------------
 
     namespace {
+        detail::Http2Stream *findClientStream(Http2Connection::State *state, std::int32_t id) {
+            std::lock_guard<std::mutex> lk(state->mapMu);
+            auto it = state->streams.find(id);
+            return it == state->streams.end() ? nullptr : it->second.get();
+        }
+
+        /**
+         * @brief on_begin_headers_callback: a new header block starts on a stream
+         *        (response, interim response or trailers). Resets the per-block
+         *        flag that tells trailers from the real response headers.
+         */
+        int onBeginHeaders(::nghttp2_session * /*session*/,
+                             const ::nghttp2_frame *frame,
+                             void *user_data) noexcept {
+            auto *state = static_cast<Http2Connection::State *>(user_data);
+            if (frame->hd.type != NGHTTP2_HEADERS) return 0;
+            if (auto *st = findClientStream(state, frame->hd.stream_id)) st->statusInBlock = false;
+            return 0;
+        }
+
         /**
          * @brief on_header_callback: append the (name, value) pair to
          *        the response for the matching stream. Decodes
          *        @c :status into @c HttpResponse::status; drops other
-         *        pseudo-headers.
+         *        pseudo-headers. Headers of 1xx interim responses are
+         *        dropped (they are not part of the final response); a header
+         *        block that follows the final response is its trailers. The
+         *        total header size and the number of interim responses are
+         *        capped so a peer cannot make the client accumulate without limit.
          */
-        int onHeader(::nghttp2_session * /*session*/,
+        int onHeader(::nghttp2_session *session,
                        const ::nghttp2_frame *frame,
                        const std::uint8_t *name, std::size_t namelen,
                        const std::uint8_t *value, std::size_t valuelen,
@@ -195,27 +271,40 @@ namespace Soccer {
             std::string_view nm(reinterpret_cast<const char *>(name), namelen);
             std::string_view va(reinterpret_cast<const char *>(value), valuelen);
 
-            detail::Http2Stream *st = nullptr;
-            {
-                std::lock_guard<std::mutex> lk(state->mapMu);
-                auto it = state->streams.find(frame->hd.stream_id);
-                if (it != state->streams.end()) st = it->second.get();
-            }
-            if (!st) return 0;
+            detail::Http2Stream *st = findClientStream(state, frame->hd.stream_id);
+            if (!st || st->headersRejected) return 0;
 
-            // NGHTTP2_HCAT_HEADERS = post-response header block, i.e.
-            // trailers. The initial response uses HCAT_RESPONSE.
-            const bool isTrailer = frame->headers.cat == NGHTTP2_HCAT_HEADERS;
+            st->headerBytes += namelen + valuelen + 32;
+            bool reject = st->headerBytes > kHttp2MaxHeaderBytes;
 
             if (nm == ":status") {
-                st->response.status = std::atoi(std::string(va).c_str());
-                return 0;
+                const int status = std::atoi(std::string(va).c_str());
+                st->statusInBlock = true;
+                if (status >= 100 && status < 200) {
+                    st->informational = true;
+                    if (++st->interimCount > kHttp2MaxInterimResponses) reject = true;
+                } else {
+                    st->informational = false;
+                    st->finalSeen = true;
+                    st->response.status = status;
+                }
+            } else if (!(!nm.empty() && nm[0] == ':') && !reject && !st->informational) {
+                // A block with no :status that follows the final response is the trailers.
+                // (Decided from the stream's own state, not from the frame category, which
+                // nghttp2 also uses for a final response that follows an interim one.)
+                if (st->finalSeen && !st->statusInBlock) {
+                    st->response.trailers.push_back({std::string(nm), std::string(va)});
+                } else {
+                    st->response.headers.push_back({std::string(nm), std::string(va)});
+                }
             }
-            if (!nm.empty() && nm[0] == ':') return 0; // skip other pseudo-headers
-            if (isTrailer) {
-                st->response.trailers.push_back({std::string(nm), std::string(va)});
-            } else {
-                st->response.headers.push_back({std::string(nm), std::string(va)});
+
+            if (reject) {
+                st->headersRejected = true;
+                st->response.headers.clear();
+                st->response.trailers.clear();
+                ::nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                             frame->hd.stream_id, NGHTTP2_ENHANCE_YOUR_CALM);
             }
             return 0;
         }
@@ -283,19 +372,9 @@ namespace Soccer {
                 waiter = it->second->waiter;
                 it->second->waiter = {};
             }
-            if (waiter) {
-                // Resume via Yarn so we don't grow the recv stack
-                // (callbacks fire inside nghttp2_session_mem_recv).
-                // Spell as unique_ptr<ITask> to disambiguate from the
-                // CallableITask template overload of Yarn::run.
-                try {
-                    std::unique_ptr<YarnBall::ITask> ct{
-                        new YarnBall::detail::CoroutineITask(waiter)};
-                    YarnBall::Yarn::instance()->run(std::move(ct));
-                } catch (...) {
-                    waiter.resume();
-                }
-            }
+            // Resume via Yarn so we don't grow the recv stack
+            // (callbacks fire inside nghttp2_session_mem_recv).
+            if (waiter) resumeOnYarn(waiter);
             return 0;
         }
 
@@ -333,27 +412,87 @@ namespace Soccer {
          *        request() submits can also drain without serialising
          *        on the slow write syscall.
          */
-        YarnBall::Task<void> drainAndWrite(std::shared_ptr<Http2Connection::State> state) {
-            std::vector<std::uint8_t> outBuf;
-            {
-                std::lock_guard<std::mutex> lk(state->sessionMu);
-                while (true) {
-                    const std::uint8_t *data = nullptr;
-                    ::ssize_t n = ::nghttp2_session_mem_send(state->session, &data);
-                    if (n <= 0) break;
-                    outBuf.insert(outBuf.end(), data, data + n);
+        template<typename S>
+        YarnBall::Task<void> flushSession(std::shared_ptr<S> state) {
+            std::vector<std::uint8_t> chunk;
+            bool first = true;
+            while (true) {
+                {
+                    std::lock_guard<std::mutex> lk(state->sessionMu);
+                    while (true) {
+                        const std::uint8_t *data = nullptr;
+                        ::ssize_t n = ::nghttp2_session_mem_send(state->session, &data);
+                        if (n <= 0) break;
+                        state->outPending.insert(state->outPending.end(), data, data + n);
+                    }
+                    if (first && state->writing) co_return; // active writer will flush
+                    if (state->outPending.empty()) {
+                        state->writing = false;
+                        co_return;
+                    }
+                    state->writing = true;
+                    first = false;
+                    chunk.clear();
+                    chunk.swap(state->outPending);
+                }
+                try {
+                    co_await state->pipe->writeAll(std::span<const std::byte>(
+                        reinterpret_cast<const std::byte *>(chunk.data()),
+                        chunk.size()));
+                } catch (...) {
+                    std::lock_guard<std::mutex> lk(state->sessionMu);
+                    state->writing = false;
+                    state->outPending.clear();
+                    throw;
                 }
             }
-            if (outBuf.empty()) co_return;
-            std::lock_guard<std::mutex> lk(state->writeMu);
-            co_await state->pipe->writeAll(std::span<const std::byte>(
-                reinterpret_cast<const std::byte *>(outBuf.data()),
-                outBuf.size()));
+        }
+
+        YarnBall::Task<void> drainAndWrite(std::shared_ptr<Http2Connection::State> state) {
+            co_await flushSession(std::move(state));
             co_return;
         }
 
         /**
-         * @brief Best-effort GOAWAY drain + pipe teardown, run detached
+         * @brief Fail every request still waiting on this connection: mark its stream
+         *        done with a "connection lost" error and wake its awaiter. Safe to call
+         *        from any thread, any number of times (close(), the driver's exit,
+         *        a failed write); a stream is failed once. A request registered after
+         *        this ran sees @c closed set and refuses itself, see Http2Connection::request.
+         */
+        void failOutstandingStreams(Http2Connection::State &state) noexcept {
+            std::vector<std::coroutine_handle<>> orphans;
+            {
+                std::lock_guard<std::mutex> lk(state.mapMu);
+                for (auto &kv : state.streams) {
+                    if (!kv.second->done.load(std::memory_order_acquire)) {
+                        kv.second->errorCode = NGHTTP2_INTERNAL_ERROR;
+                        kv.second->connectionLost = true;
+                        kv.second->done.store(true, std::memory_order_release);
+                        if (kv.second->waiter) {
+                            orphans.push_back(kv.second->waiter);
+                            kv.second->waiter = {};
+                        }
+                    }
+                }
+            }
+            for (auto h : orphans) resumeOnYarn(h);
+        }
+
+        /**
+         * @brief Declare the connection unusable: refuse new requests, wake the
+         *        reader parked on the socket (shutdown makes its read return), and
+         *        fail the requests in flight. Does not close the fd -- that happens
+         *        when the last reference to the state goes away.
+         */
+        void abortConnection(Http2Connection::State &state) noexcept {
+            state.closed.store(true, std::memory_order_release);
+            state.pipe->shutdown();
+            failOutstandingStreams(state);
+        }
+
+        /**
+         * @brief Best-effort GOAWAY drain + socket shutdown, run detached
          *        via @c coSpawn instead of blocking the caller. Spelled
          *        as a free (non-lambda) coroutine, not an
          *        immediately-invoked lambda-coroutine, for the same
@@ -364,6 +503,12 @@ namespace Soccer {
          *        (shared_ptr), so it stays valid even if the
          *        @c Http2Connection that triggered the close has
          *        already been destroyed by the time this runs.
+         *
+         *        The socket is shut down, not closed: the driver coroutine may be
+         *        parked reading it, and closing an fd under a parked wait neither
+         *        wakes it reliably nor keeps the number from being reused. The
+         *        shutdown wakes the driver, which then exits; the fd is closed with
+         *        the state.
          */
         YarnBall::Task<void> closeConnectionAsync(
             std::shared_ptr<Http2Connection::State> state) {
@@ -371,9 +516,9 @@ namespace Soccer {
                 co_await drainAndWrite(state);
             } catch (...) {
                 // Peer already gone; nothing left to flush. Fall
-                // through to close the pipe regardless.
+                // through to shut the socket down regardless.
             }
-            state->pipe->close();
+            state->pipe->shutdown();
             co_return;
         }
 
@@ -381,56 +526,52 @@ namespace Soccer {
          * @brief Long-lived reader: pull bytes off the wire, feed
          *        nghttp2 (callbacks fire synchronously inside the
          *        feed call), then drain whatever nghttp2 produced in
-         *        response back onto the wire. Exits on EOF or peer
-         *        GOAWAY.
+         *        response back onto the wire. Exits on EOF, peer
+         *        GOAWAY, a transport error, or the connection being closed
+         *        locally (close() shuts the socket down to wake it).
          */
         YarnBall::Task<void> driver(std::shared_ptr<Http2Connection::State> state) {
             std::array<std::byte, 8192> buf{};
-            while (!state->closed.load(std::memory_order_acquire)) {
-                std::size_t n;
-                try {
-                    n = co_await state->pipe->readBytes(buf);
-                } catch (const SocketException &) {
-                    break;
-                }
-                if (n == 0) break;
-                {
-                    std::lock_guard<std::mutex> lk(state->sessionMu);
-                    const ::ssize_t fed = ::nghttp2_session_mem_recv(
-                        state->session,
-                        reinterpret_cast<const std::uint8_t *>(buf.data()),
-                        n);
-                    if (fed < 0) break;
-                }
-                co_await drainAndWrite(state);
-
-                // No-more-streams shutdown.
-                {
-                    std::lock_guard<std::mutex> lk(state->sessionMu);
-                    if (::nghttp2_session_want_read(state->session) == 0 &&
-                        ::nghttp2_session_want_write(state->session) == 0) {
+            try {
+                while (!state->closed.load(std::memory_order_acquire)) {
+                    std::size_t n;
+                    try {
+                        n = co_await state->pipe->readBytes(buf);
+                    } catch (const SocketException &) {
                         break;
                     }
-                }
-            }
-            state->closed.store(true, std::memory_order_release);
+                    if (n == 0) break;
+                    bool fatal = false;
+                    {
+                        std::lock_guard<std::mutex> lk(state->sessionMu);
+                        const ::ssize_t fed = ::nghttp2_session_mem_recv(
+                            state->session,
+                            reinterpret_cast<const std::uint8_t *>(buf.data()),
+                            n);
+                        fatal = fed < 0;
+                    }
+                    if (fatal) {
+                        // Flush the GOAWAY nghttp2 queued for the protocol error.
+                        try { co_await drainAndWrite(state); } catch (...) {}
+                        break;
+                    }
+                    co_await drainAndWrite(state);
 
-            // Resume any orphaned waiters with an error.
-            std::vector<std::coroutine_handle<>> orphans;
-            {
-                std::lock_guard<std::mutex> lk(state->mapMu);
-                for (auto &kv : state->streams) {
-                    if (!kv.second->done.load(std::memory_order_acquire)) {
-                        kv.second->errorCode = NGHTTP2_INTERNAL_ERROR;
-                        kv.second->done.store(true, std::memory_order_release);
-                        if (kv.second->waiter) {
-                            orphans.push_back(kv.second->waiter);
-                            kv.second->waiter = {};
+                    // No-more-streams shutdown.
+                    {
+                        std::lock_guard<std::mutex> lk(state->sessionMu);
+                        if (::nghttp2_session_want_read(state->session) == 0 &&
+                            ::nghttp2_session_want_write(state->session) == 0) {
+                            break;
                         }
                     }
                 }
+            } catch (...) {
+                // A failed write (or anything else unexpected) ends the connection;
+                // the waiters are failed below rather than left parked forever.
             }
-            for (auto h : orphans) h.resume();
+            state->closed.store(true, std::memory_order_release);
+            failOutstandingStreams(*state);
             co_return;
         }
 
@@ -442,6 +583,7 @@ namespace Soccer {
         ::nghttp2_session_callbacks *makeClientCallbacks() {
             ::nghttp2_session_callbacks *cb = nullptr;
             ::nghttp2_session_callbacks_new(&cb);
+            ::nghttp2_session_callbacks_set_on_begin_headers_callback(cb, &onBeginHeaders);
             ::nghttp2_session_callbacks_set_on_header_callback(cb, &onHeader);
             ::nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cb, &onDataChunk);
             ::nghttp2_session_callbacks_set_on_stream_close_callback(cb, &onStreamClose);
@@ -503,6 +645,14 @@ namespace Soccer {
                         "HTTP/2 response body exceeded the per-stream cap; "
                         "stream was reset");
                 }
+                if (st->headersRejected) {
+                    throw std::runtime_error(
+                        "HTTP/2 response headers exceeded the cap; stream was reset");
+                }
+                if (st->connectionLost) {
+                    throw std::runtime_error(
+                        "HTTP/2 connection closed before the response completed");
+                }
                 if (st->errorCode != 0) {
                     throw std::runtime_error("HTTP/2 stream error: nghttp2 code " +
                                               std::to_string(st->errorCode));
@@ -537,13 +687,18 @@ namespace Soccer {
             }
             ::nghttp2_session_callbacks_del(cb);
 
-            ::nghttp2_settings_entry iv[1] = {
+            // No server push (we never look at pushed streams, so refuse them up
+            // front), and a bound on the header list the server may send back.
+            ::nghttp2_settings_entry iv[3] = {
                 {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100},
+                {NGHTTP2_SETTINGS_ENABLE_PUSH, 0},
+                {NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE,
+                 static_cast<std::uint32_t>(kHttp2MaxHeaderBytes)},
             };
             {
                 std::lock_guard<std::mutex> lk(state->sessionMu);
                 ::nghttp2_submit_settings(state->session,
-                                           NGHTTP2_FLAG_NONE, iv, 1);
+                                           NGHTTP2_FLAG_NONE, iv, 3);
             }
             co_await drainAndWrite(state);
 
@@ -553,8 +708,8 @@ namespace Soccer {
     }
 
     YarnBall::Task<Http2Connection> Http2Connection::connectPlain(
-        std::string host, std::uint16_t port) {
-        TcpStream tcp = co_await tcpConnect(host, port);
+        std::string host, std::uint16_t port, std::chrono::milliseconds connectTimeout) {
+        TcpStream tcp = co_await tcpConnect(host, port, connectTimeout);
         std::string authority = host + ":" + std::to_string(port);
         auto pipe = std::make_unique<TcpPipe>(std::move(tcp));
         auto state = co_await finishHandshake(
@@ -577,6 +732,9 @@ namespace Soccer {
                     : (tlsOpts.alpnProtocols + ",h2");
         }
         TlsStream tls = co_await TlsStream::connect(host, port, tlsOpts);
+        if (tls.alpnSelected() != "h2") {
+            throw std::runtime_error("Http2Connection::connect: server did not negotiate h2 via ALPN");
+        }
         std::string authority = host + ":" + std::to_string(port);
         auto pipe = std::make_unique<TlsPipe>(std::move(tls));
         auto state = co_await finishHandshake(
@@ -615,7 +773,13 @@ namespace Soccer {
         add(":scheme", state->scheme);
         add(":authority", state->authority);
         add(":path", path);
-        for (const auto &h : headers) add(h.name, h.value);
+        // The nv entries point at these strings (no-copy), so they live in the frame.
+        std::vector<std::string> lowerNames;
+        lowerNames.reserve(headers.size());
+        for (const auto &h : headers) {
+            lowerNames.push_back(lowerAscii(h.name));
+            add(lowerNames.back(), h.value);
+        }
 
         // Create per-stream state, set body for the data provider.
         auto streamState = std::make_unique<detail::Http2Stream>();
@@ -631,6 +795,12 @@ namespace Soccer {
 
         std::int32_t streamId;
         {
+            // The stream is registered in the map while sessionMu is
+            // still held (callbacks run under sessionMu, so none can
+            // observe the stream id before it is in the map). The closed
+            // flag is re-checked after registration: if the driver has
+            // already swept orphans, nobody would ever resume this
+            // request.
             std::lock_guard<std::mutex> lk(state->sessionMu);
             streamId = ::nghttp2_submit_request(
                 state->session, nullptr,
@@ -640,18 +810,32 @@ namespace Soccer {
                 throw std::runtime_error(std::string("nghttp2_submit_request: ") +
                                           ::nghttp2_strerror(streamId));
             }
-        }
-        {
-            std::lock_guard<std::mutex> lk(state->mapMu);
+            std::lock_guard<std::mutex> mk(state->mapMu);
             state->streams.emplace(streamId, std::move(streamState));
+            if (state->closed.load(std::memory_order_acquire)) {
+                state->streams.erase(streamId);
+                throw std::runtime_error("Http2Connection::request: connection closed");
+            }
         }
 
         // Push the freshly enqueued frames onto the wire so the peer
         // sees the request without waiting for any inbound activity.
-        co_await drainAndWrite(state);
+        try {
+            co_await drainAndWrite(state);
+        } catch (...) {
+            // The transport failed: every stream on this connection is lost, this
+            // one included. (The stream stays in the map until the state dies; nghttp2
+            // still holds pointers into it.)
+            abortConnection(*state);
+            throw;
+        }
 
         // Suspend until the stream completes.
         co_return co_await StreamAwaiter{state, streamId};
+    }
+
+    bool Http2Connection::isClosed() const noexcept {
+        return !this->state || this->state->closed.load(std::memory_order_acquire);
     }
 
     void Http2Connection::close() noexcept {
@@ -667,7 +851,11 @@ namespace Soccer {
             ::nghttp2_submit_goaway(this->state->session, NGHTTP2_FLAG_NONE,
                                      0, NGHTTP2_NO_ERROR, nullptr, 0);
         }
-        // Drain the GOAWAY and close the pipe on the Yarn pool rather
+        // Requests still waiting are failed now: they would otherwise wait on
+        // the driver, which is parked reading a socket the peer may never write to.
+        failOutstandingStreams(*this->state);
+        // Drain the GOAWAY and shut the socket down (which also wakes the
+        // parked driver) on the Yarn pool rather
         // than blocking here with syncWait. close() runs from
         // ~Http2Connection(), which fires wherever the object goes out
         // of scope -- including from inside a coroutine running on a
@@ -730,6 +918,15 @@ namespace Soccer {
              *        clear-and-keep-counting reset.
              */
             bool bodyRejected{false};
+            /// Latched when the request headers exceed the configured caps.
+            bool rejected{false};
+            std::size_t headerBytes{0};
+            /// Body bytes accounted to the connection-wide budget for this stream.
+            std::size_t bodyBytes{0};
+            /// Fires when the stream closes (reset by the client, or the connection
+            /// ends); the request handed to the handler carries its token.
+            std::stop_source cancel;
+            std::chrono::steady_clock::time_point started{std::chrono::steady_clock::now()};
         };
     }
 
@@ -742,20 +939,74 @@ namespace Soccer {
         std::unique_ptr<Http2Pipe> pipe;
         ::nghttp2_session *session{nullptr};
         std::mutex sessionMu;
-        std::mutex writeMu;
+        std::vector<std::uint8_t> outPending;
+        bool writing{false};
 
         std::mutex streamsMu;
         std::unordered_map<std::int32_t, std::unique_ptr<ServerStream>> streams;
+        /// Request-body bytes held across all streams (guarded by streamsMu).
+        std::size_t bodyBytesInFlight{0};
 
         /// Shared route table from the owning Http2Server. Read-only
         /// after the server starts; no mutex needed.
         const std::unordered_map<std::string, HttpRouteHandler> *routes{nullptr};
 
+        Http2ServerOptions opts;
+
         std::atomic<bool> closed{false};
+        /// Set from a callback when the peer misbehaves (reset flood, body budget
+        /// blown); the driver closes the connection after flushing the GOAWAY.
+        std::atomic<bool> abusive{false};
+        /// Handlers dispatched and not yet finished.
+        std::atomic<int> activeHandlers{0};
+
+        /// Reset-rate window (touched only from callbacks, i.e. under sessionMu).
+        std::chrono::steady_clock::time_point resetWindowStart{std::chrono::steady_clock::now()};
+        std::size_t resetsInWindow{0};
+
+        /// Deadline against stalled peers, re-armed as the connection's state
+        /// changes (see updateDeadline). Declared after `pipe` so it is destroyed
+        /// -- disarmed -- before the socket closes.
+        std::mutex deadlineMu;
+        IoDeadline deadline;
 
         Http2ServerConnectionState(std::unique_ptr<Http2Pipe> p,
-                                       const std::unordered_map<std::string, HttpRouteHandler> *r) noexcept
-            : pipe(std::move(p)), routes(r) {}
+                                       const std::unordered_map<std::string, HttpRouteHandler> *r,
+                                       const Http2ServerOptions &o) noexcept
+            : pipe(std::move(p)), routes(r), opts(o) {}
+
+        /**
+         * @brief Choose the deadline that fits what the connection is doing:
+         *        a request still being received -> requestTimeout (the peer owes
+         *        us bytes); nothing in flight -> idleTimeout; handlers running and
+         *        nothing owed -> none (a slow handler is not the peer's fault).
+         *        Called before each read and when the last handler finishes.
+         */
+        void updateDeadline() {
+            std::lock_guard<std::mutex> dl(this->deadlineMu);
+            if (this->closed.load(std::memory_order_acquire)) {
+                this->deadline.disarm();
+                return;
+            }
+            bool incomplete = false;
+            {
+                std::lock_guard<std::mutex> lk(this->streamsMu);
+                for (const auto &kv : this->streams) {
+                    if (!kv.second->handlerStarted && !kv.second->rejected && !kv.second->bodyRejected) {
+                        incomplete = true;
+                        break;
+                    }
+                }
+            }
+            const int fd = this->pipe->fd();
+            if (incomplete) {
+                this->deadline.arm(fd, this->opts.requestTimeout);
+            } else if (this->activeHandlers.load(std::memory_order_acquire) == 0) {
+                this->deadline.arm(fd, this->opts.idleTimeout);
+            } else {
+                this->deadline.disarm();
+            }
+        }
 
         ~Http2ServerConnectionState() {
             if (this->session) {
@@ -781,21 +1032,7 @@ namespace Soccer {
          */
         YarnBall::Task<void> serverDrainAndWrite(
             std::shared_ptr<Http2ServerConnectionState> state) {
-            std::vector<std::uint8_t> outBuf;
-            {
-                std::lock_guard<std::mutex> lk(state->sessionMu);
-                while (true) {
-                    const std::uint8_t *data = nullptr;
-                    ::ssize_t n = ::nghttp2_session_mem_send(state->session, &data);
-                    if (n <= 0) break;
-                    outBuf.insert(outBuf.end(), data, data + n);
-                }
-            }
-            if (outBuf.empty()) co_return;
-            std::lock_guard<std::mutex> lk(state->writeMu);
-            co_await state->pipe->writeAll(std::span<const std::byte>(
-                reinterpret_cast<const std::byte *>(outBuf.data()),
-                outBuf.size()));
+            co_await flushSession(std::move(state));
             co_return;
         }
 
@@ -870,10 +1107,10 @@ namespace Soccer {
             // store the strings in the stream-state vector and feed
             // nghttp2_nv pointers into it.
             for (const auto &h : resp.headers) {
-                st->respHeaders.emplace_back(h.name, h.value);
+                st->respHeaders.emplace_back(lowerAscii(h.name), h.value);
             }
             for (const auto &h : resp.trailers) {
-                st->respTrailers.emplace_back(h.name, h.value);
+                st->respTrailers.emplace_back(lowerAscii(h.name), h.value);
             }
             // Always emit content-length so the peer can validate
             // framing without relying on END_STREAM semantics.
@@ -902,8 +1139,14 @@ namespace Soccer {
                 providerPtr = &provider;
             }
 
-            ::nghttp2_submit_response(state->session, streamId,
+            const int rc = ::nghttp2_submit_response(state->session, streamId,
                                        nv.data(), nv.size(), providerPtr);
+            if (rc != 0) {
+                // Invalid response (e.g. a header nghttp2 rejects): reset
+                // the stream rather than leaving the client waiting.
+                ::nghttp2_submit_rst_stream(state->session, NGHTTP2_FLAG_NONE,
+                                             streamId, NGHTTP2_INTERNAL_ERROR);
+            }
             // Trailers are submitted inside the data provider's EOF
             // call so nghttp2's frame queue serialises them correctly
             // after the last DATA frame.
@@ -919,6 +1162,27 @@ namespace Soccer {
             std::shared_ptr<Http2ServerConnectionState> state,
             std::int32_t streamId,
             HttpRequest req) {
+            // Counted from dispatch (the driver incremented it) to here, so the
+            // connection is not considered idle while a handler is working.
+            struct Finished {
+                Http2ServerConnectionState *st;
+                ~Finished() {
+                    if (st->activeHandlers.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                        st->updateDeadline();
+                    }
+                }
+            } finished{state.get()};
+
+            // The client may have reset the stream (or the connection may have died)
+            // between dispatch and now: there is nobody to answer, so do not run the handler.
+            if (state->closed.load(std::memory_order_acquire) || req.cancel.stop_requested()) {
+                co_return;
+            }
+            {
+                std::lock_guard<std::mutex> sk(state->streamsMu);
+                if (state->streams.find(streamId) == state->streams.end()) co_return;
+            }
+
             HttpResponse resp;
             try {
                 const auto key = routeKey(req.method, req.path);
@@ -932,37 +1196,60 @@ namespace Soccer {
             } catch (const std::exception &e) {
                 resp.status = 500;
                 resp.body = e.what();
+            } catch (...) {
+                resp.status = 500;
+                resp.body = "handler failed";
             }
-            ServerStream *st = nullptr;
-            {
-                std::lock_guard<std::mutex> lk(state->streamsMu);
-                auto it = state->streams.find(streamId);
-                if (it == state->streams.end()) co_return;
-                st = it->second.get();
+            if (state->closed.load(std::memory_order_acquire)) co_return;
+            try {
+                {
+                    // Look the stream up and use it under sessionMu: stream
+                    // close callbacks run under sessionMu and free the
+                    // ServerStream, so a pointer fetched earlier could dangle
+                    // by the time the response is submitted.
+                    std::lock_guard<std::mutex> lk(state->sessionMu);
+                    ServerStream *st = nullptr;
+                    {
+                        std::lock_guard<std::mutex> sk(state->streamsMu);
+                        auto it = state->streams.find(streamId);
+                        if (it == state->streams.end()) co_return; // reset while the handler ran
+                        st = it->second.get();
+                    }
+                    submitResponseLocked(state.get(), streamId, st, resp);
+                }
+                co_await serverDrainAndWrite(state);
+            } catch (...) {
+                // The transport is gone; the driver notices on its own read and
+                // winds the connection down. Nothing here may escape a detached task.
             }
-            {
-                std::lock_guard<std::mutex> lk(state->sessionMu);
-                submitResponseLocked(state.get(), streamId, st, resp);
-            }
-            co_await serverDrainAndWrite(state);
             co_return;
         }
 
         // ---- nghttp2 server callbacks -------------------------------
 
-        int serverOnBeginHeaders(::nghttp2_session * /*session*/,
+        int serverOnBeginHeaders(::nghttp2_session *session,
                                    const ::nghttp2_frame *frame,
                                    void *user_data) noexcept {
             if (frame->hd.type != NGHTTP2_HEADERS ||
                 frame->headers.cat != NGHTTP2_HCAT_REQUEST) return 0;
             auto *state = static_cast<Http2ServerConnectionState *>(user_data);
             std::lock_guard<std::mutex> lk(state->streamsMu);
-            state->streams.emplace(frame->hd.stream_id,
-                                    std::make_unique<ServerStream>());
+            // nghttp2 only applies our advertised MAX_CONCURRENT_STREAMS once the
+            // peer has acknowledged the SETTINGS, so enforce it here too. A stream
+            // that is refused gets no entry; its remaining callbacks find nothing.
+            if (state->opts.maxConcurrentStreams != 0 &&
+                state->streams.size() >= state->opts.maxConcurrentStreams) {
+                ::nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                             frame->hd.stream_id, NGHTTP2_REFUSED_STREAM);
+                return 0;
+            }
+            auto st = std::make_unique<ServerStream>();
+            st->req.cancel = st->cancel.get_token();
+            state->streams.emplace(frame->hd.stream_id, std::move(st));
             return 0;
         }
 
-        int serverOnHeader(::nghttp2_session * /*session*/,
+        int serverOnHeader(::nghttp2_session *session,
                              const ::nghttp2_frame *frame,
                              const std::uint8_t *name, std::size_t namelen,
                              const std::uint8_t *value, std::size_t valuelen,
@@ -971,13 +1258,29 @@ namespace Soccer {
             if (frame->hd.type != NGHTTP2_HEADERS) return 0;
             auto *state = static_cast<Http2ServerConnectionState *>(user_data);
 
+            // Request trailers must not be merged into the request headers,
+            // where a handler cannot tell them from real headers.
+            if (frame->headers.cat != NGHTTP2_HCAT_REQUEST) return 0;
+
             ServerStream *st = nullptr;
             {
                 std::lock_guard<std::mutex> lk(state->streamsMu);
                 auto it = state->streams.find(frame->hd.stream_id);
                 if (it != state->streams.end()) st = it->second.get();
             }
-            if (!st) return 0;
+            if (!st || st->rejected) return 0;
+
+            // Header-list caps: nghttp2 decodes (and bounds) one field at a time, so a
+            // peer could still stream an endless number of fields; stop at the budget.
+            st->headerBytes += namelen + valuelen + 32;
+            if ((state->opts.maxHeaderListBytes != 0 && st->headerBytes > state->opts.maxHeaderListBytes) ||
+                (state->opts.maxHeaderCount != 0 && st->req.headers.size() >= state->opts.maxHeaderCount)) {
+                st->rejected = true;
+                st->req.headers.clear();
+                ::nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                             frame->hd.stream_id, NGHTTP2_ENHANCE_YOUR_CALM);
+                return 0;
+            }
 
             std::string_view nm(reinterpret_cast<const char *>(name), namelen);
             std::string_view va(reinterpret_cast<const char *>(value), valuelen);
@@ -1019,16 +1322,37 @@ namespace Soccer {
             // silently reset itself instead of durably rejecting the
             // stream (see onDataChunk's docblock, same issue on the
             // client side).
-            if (it->second->bodyRejected) return 0;
-            if (it->second->req.body.size() + len > kHttp2MaxBodyBytes) {
-                it->second->bodyRejected = true;
-                it->second->req.body.clear();
-                it->second->req.body.shrink_to_fit();
+            ServerStream &st = *it->second;
+            if (st.bodyRejected || st.rejected) return 0;
+            const std::size_t maxBody = state->opts.maxBodyBytes;
+            const std::size_t maxConn = state->opts.maxConnectionBodyBytes;
+            if (maxConn != 0 && state->bodyBytesInFlight + len > maxConn) {
+                // Too much buffered across the connection's streams: the peer is
+                // either abusive or has far more in flight than we agreed to hold.
+                st.bodyRejected = true;
+                state->bodyBytesInFlight -= st.bodyBytes;
+                st.bodyBytes = 0;
+                st.req.body.clear();
+                st.req.body.shrink_to_fit();
+                state->abusive.store(true, std::memory_order_release);
+                ::nghttp2_submit_goaway(session, NGHTTP2_FLAG_NONE,
+                                         ::nghttp2_session_get_last_proc_stream_id(session),
+                                         NGHTTP2_ENHANCE_YOUR_CALM, nullptr, 0);
+                return 0;
+            }
+            if (maxBody != 0 && st.req.body.size() + len > maxBody) {
+                st.bodyRejected = true;
+                state->bodyBytesInFlight -= st.bodyBytes;
+                st.bodyBytes = 0;
+                st.req.body.clear();
+                st.req.body.shrink_to_fit();
                 ::nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
                                              stream_id, NGHTTP2_ENHANCE_YOUR_CALM);
                 return 0;
             }
-            it->second->req.body.append(reinterpret_cast<const char *>(data), len);
+            st.req.body.append(reinterpret_cast<const char *>(data), len);
+            st.bodyBytes += len;
+            state->bodyBytesInFlight += len;
             return 0;
         }
 
@@ -1039,10 +1363,27 @@ namespace Soccer {
          *        The dispatch is a coSpawn so we don't run the user
          *        coroutine inside the nghttp2 callback stack.
          */
-        int serverOnFrameRecv(::nghttp2_session * /*session*/,
+        int serverOnFrameRecv(::nghttp2_session *session,
                                 const ::nghttp2_frame *frame,
                                 void *user_data) noexcept {
             auto *state = static_cast<Http2ServerConnectionState *>(user_data);
+
+            if (frame->hd.type == NGHTTP2_RST_STREAM && state->opts.maxResetsPerSecond != 0) {
+                // Rapid reset: a client that opens streams and cancels them as fast as it
+                // can makes us start work it then discards. Bound the rate.
+                const auto now = std::chrono::steady_clock::now();
+                if (now - state->resetWindowStart >= std::chrono::seconds{1}) {
+                    state->resetWindowStart = now;
+                    state->resetsInWindow = 0;
+                }
+                if (++state->resetsInWindow > state->opts.maxResetsPerSecond &&
+                    !state->abusive.exchange(true, std::memory_order_acq_rel)) {
+                    ::nghttp2_submit_goaway(session, NGHTTP2_FLAG_NONE,
+                                             ::nghttp2_session_get_last_proc_stream_id(session),
+                                             NGHTTP2_ENHANCE_YOUR_CALM, nullptr, 0);
+                }
+                return 0;
+            }
 
             const bool endStream =
                 (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) != 0;
@@ -1069,7 +1410,14 @@ namespace Soccer {
                                   void *user_data) noexcept {
             auto *state = static_cast<Http2ServerConnectionState *>(user_data);
             std::lock_guard<std::mutex> lk(state->streamsMu);
-            state->streams.erase(stream_id);
+            auto it = state->streams.find(stream_id);
+            if (it == state->streams.end()) return 0;
+            // The stream is over, whether the response went out or the client reset
+            // it: tell a handler still working on it that nobody is waiting, and give
+            // its buffered body back to the connection budget.
+            it->second->cancel.request_stop();
+            state->bodyBytesInFlight -= it->second->bodyBytes;
+            state->streams.erase(it);
             return 0;
         }
 
@@ -1094,80 +1442,120 @@ namespace Soccer {
     namespace {
         YarnBall::Task<void> serverDriver(
             std::shared_ptr<Http2ServerConnectionState> state) {
-            // Send initial SETTINGS.
-            ::nghttp2_settings_entry iv[1] = {
-                {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, 100},
-            };
-            {
-                std::lock_guard<std::mutex> lk(state->sessionMu);
-                ::nghttp2_submit_settings(state->session,
-                                           NGHTTP2_FLAG_NONE, iv, 1);
-            }
-            co_await serverDrainAndWrite(state);
-
             std::array<std::byte, 8192> buf{};
-            while (!state->closed.load(std::memory_order_acquire)) {
-                std::size_t n;
-                try {
-                    n = co_await state->pipe->readBytes(buf);
-                } catch (const SocketException &) {
-                    break;
+            try {
+                // Send initial SETTINGS.
+                std::array<::nghttp2_settings_entry, 2> iv{};
+                std::size_t ivCount = 0;
+                if (state->opts.maxConcurrentStreams != 0) {
+                    iv[ivCount++] = {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS,
+                                     static_cast<std::uint32_t>(state->opts.maxConcurrentStreams)};
                 }
-                if (n == 0) break;
+                if (state->opts.maxHeaderListBytes != 0) {
+                    iv[ivCount++] = {NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE,
+                                     static_cast<std::uint32_t>(state->opts.maxHeaderListBytes)};
+                }
                 {
                     std::lock_guard<std::mutex> lk(state->sessionMu);
-                    const ::ssize_t fed = ::nghttp2_session_mem_recv(
-                        state->session,
-                        reinterpret_cast<const std::uint8_t *>(buf.data()),
-                        n);
-                    if (fed < 0) break;
-                }
-                // Dispatch any handler-started streams whose handler
-                // hasn't actually been spawned yet. The callback only
-                // flips the flag; spawn happens here so the driver's
-                // shared_ptr is captured by value into the handler
-                // coroutine.
-                std::vector<std::pair<std::int32_t, HttpRequest>> ready;
-                {
-                    std::lock_guard<std::mutex> lk(state->streamsMu);
-                    for (auto &kv : state->streams) {
-                        // A body-rejected stream was already reset in
-                        // serverOnDataChunk; its req.body is a
-                        // deliberately-cleared partial fragment, not a
-                        // usable request. Skip it here too (rather
-                        // than relying solely on nghttp2 to suppress
-                        // further frame-recv events for a reset
-                        // stream) so a route handler is never invoked
-                        // with a truncated body. Mark it submitted so
-                        // this entry is not re-considered every tick.
-                        if (kv.second->bodyRejected) {
-                            kv.second->responseSubmitted = true;
-                            continue;
-                        }
-                        if (kv.second->handlerStarted &&
-                            !kv.second->responseSubmitted) {
-                            // Move req out; mark responseSubmitted=true
-                            // pre-emptively so a subsequent driver
-                            // tick does not re-dispatch the same
-                            // request before the handler completes.
-                            ready.emplace_back(kv.first, std::move(kv.second->req));
-                            kv.second->responseSubmitted = true;
-                        }
-                    }
-                }
-                for (auto &[sid, req] : ready) {
-                    YarnBall::coSpawn(runOneHandler(state, sid, std::move(req)));
+                    ::nghttp2_submit_settings(state->session,
+                                               NGHTTP2_FLAG_NONE, iv.data(), ivCount);
                 }
                 co_await serverDrainAndWrite(state);
-                {
-                    std::lock_guard<std::mutex> lk(state->sessionMu);
-                    if (::nghttp2_session_want_read(state->session) == 0 &&
-                        ::nghttp2_session_want_write(state->session) == 0) {
+
+                while (!state->closed.load(std::memory_order_acquire)) {
+                    // Whatever the connection is doing decides how long a silent peer is tolerated.
+                    state->updateDeadline();
+                    std::size_t n;
+                    try {
+                        n = co_await state->pipe->readBytes(buf);
+                    } catch (const SocketException &) {
                         break;
                     }
+                    if (n == 0) break;
+                    bool fatal = false;
+                    {
+                        std::lock_guard<std::mutex> lk(state->sessionMu);
+                        const ::ssize_t fed = ::nghttp2_session_mem_recv(
+                            state->session,
+                            reinterpret_cast<const std::uint8_t *>(buf.data()),
+                            n);
+                        fatal = fed < 0;
+                    }
+                    if (fatal || state->abusive.load(std::memory_order_acquire)) {
+                        // Flush the GOAWAY nghttp2 queued for the protocol error / abuse.
+                        try { co_await serverDrainAndWrite(state); } catch (...) {}
+                        break;
+                    }
+                    // Dispatch any handler-started streams whose handler
+                    // hasn't actually been spawned yet. The callback only
+                    // flips the flag; spawn happens here so the driver's
+                    // shared_ptr is captured by value into the handler
+                    // coroutine.
+                    std::vector<std::pair<std::int32_t, HttpRequest>> ready;
+                    bool trickling = false;
+                    {
+                        const auto now = std::chrono::steady_clock::now();
+                        std::lock_guard<std::mutex> lk(state->streamsMu);
+                        for (auto &kv : state->streams) {
+                            // A rejected stream was already reset in the
+                            // callbacks; its request is a deliberately-cleared
+                            // partial fragment, not a usable request. Skip it
+                            // here too (rather than relying solely on nghttp2
+                            // to suppress further frame-recv events for a reset
+                            // stream) so a route handler is never invoked
+                            // with a truncated request. Mark it submitted so
+                            // this entry is not re-considered every tick.
+                            if (kv.second->bodyRejected || kv.second->rejected) {
+                                kv.second->responseSubmitted = true;
+                                continue;
+                            }
+                            if (kv.second->handlerStarted &&
+                                !kv.second->responseSubmitted) {
+                                // Move req out; mark responseSubmitted=true
+                                // pre-emptively so a subsequent driver
+                                // tick does not re-dispatch the same
+                                // request before the handler completes.
+                                ready.emplace_back(kv.first, std::move(kv.second->req));
+                                kv.second->responseSubmitted = true;
+                            } else if (!kv.second->handlerStarted &&
+                                       state->opts.requestTimeout.count() > 0 &&
+                                       now - kv.second->started > state->opts.requestTimeout) {
+                                // A request still unfinished long after it began: a peer
+                                // trickling bytes keeps resetting the idle deadline, so
+                                // measure the request itself.
+                                trickling = true;
+                            }
+                        }
+                    }
+                    if (trickling) break;
+                    for (auto &[sid, req] : ready) {
+                        state->activeHandlers.fetch_add(1, std::memory_order_acq_rel);
+                        YarnBall::coSpawn(runOneHandler(state, sid, std::move(req)));
+                    }
+                    co_await serverDrainAndWrite(state);
+                    {
+                        std::lock_guard<std::mutex> lk(state->sessionMu);
+                        if (::nghttp2_session_want_read(state->session) == 0 &&
+                            ::nghttp2_session_want_write(state->session) == 0) {
+                            break;
+                        }
+                    }
                 }
+            } catch (...) {
+                // A failed write or anything unexpected ends the connection.
             }
             state->closed.store(true, std::memory_order_release);
+            {
+                std::lock_guard<std::mutex> dl(state->deadlineMu);
+                state->deadline.disarm();
+            }
+            // Tell handlers still working that nobody is waiting for them, and wake
+            // anything parked on the socket.
+            {
+                std::lock_guard<std::mutex> lk(state->streamsMu);
+                for (auto &kv : state->streams) kv.second->cancel.request_stop();
+            }
+            state->pipe->shutdown();
             co_return;
         }
     }
@@ -1177,13 +1565,14 @@ namespace Soccer {
     struct Http2Server::ServerState {
         TcpListener listener;
         std::unordered_map<std::string, HttpRouteHandler> routes;
+        Http2ServerOptions opts;
 
-        explicit ServerState(TcpListener l) noexcept
-            : listener(std::move(l)) {}
+        ServerState(TcpListener l, const Http2ServerOptions &o) noexcept
+            : listener(std::move(l)), opts(o) {}
     };
 
-    Http2Server::Http2Server(const std::string &host, std::uint16_t port)
-        : serverState(std::make_shared<ServerState>(TcpListener::bind(host, port))) {
+    Http2Server::Http2Server(const std::string &host, std::uint16_t port, Http2ServerOptions options)
+        : serverState(std::make_shared<ServerState>(TcpListener::bind(host, port), options)) {
     }
 
     Http2Server::Http2Server(Http2Server &&) noexcept = default;
@@ -1211,7 +1600,7 @@ namespace Soccer {
             TcpStream client) {
             auto pipe = std::make_unique<TcpPipe>(std::move(client));
             auto state = std::make_shared<Http2ServerConnectionState>(
-                std::move(pipe), &server->routes);
+                std::move(pipe), &server->routes, server->opts);
 
             ::nghttp2_session_callbacks *cb = makeServerCallbacks();
             if (::nghttp2_session_server_new(&state->session, cb,
@@ -1239,7 +1628,8 @@ namespace Soccer {
             auto factory = [serverState](TcpStream client) -> YarnBall::Task<void> {
                 return runServerConnection(serverState, std::move(client));
             };
-            co_await tcpServe(std::move(serverState->listener), factory, stop);
+            const std::size_t maxConnections = serverState->opts.maxConnections;
+            co_await tcpServe(std::move(serverState->listener), factory, stop, maxConnections);
             co_return;
         }
     }
@@ -1287,7 +1677,10 @@ namespace Soccer {
         {
             std::lock_guard<std::mutex> lk(this->mu);
             auto it = this->entries.find(k);
-            if (it != this->entries.end()) co_return it->second;
+            if (it != this->entries.end()) {
+                if (!it->second->isClosed()) co_return it->second;
+                this->entries.erase(it); // dead connection: reconnect
+            }
         }
         auto conn = std::make_shared<Http2Connection>(
             co_await Http2Connection::connectPlain(host, port));
@@ -1295,6 +1688,7 @@ namespace Soccer {
         // Race: another acquirer may have populated the entry while
         // we were connecting. Prefer theirs; let our local conn drop.
         auto [ins, fresh] = this->entries.emplace(k, conn);
+        if (!fresh && ins->second->isClosed()) ins->second = conn;
         co_return ins->second;
     }
 
@@ -1311,15 +1705,28 @@ namespace Soccer {
         k.append(opts.clientCertFile);
         k.push_back('|');
         k.append(opts.alpnProtocols);
+        k.push_back('|');
+        k.append(opts.caBundleDir);
+        k.push_back('|');
+        k.append(opts.clientKeyFile);
+        k.push_back('|');
+        k.push_back(opts.insecure_no_verify_cert ? '1' : '0');
+        k.push_back(opts.insecure_no_verify_name ? '1' : '0');
         {
             std::lock_guard<std::mutex> lk(this->mu);
             auto it = this->entries.find(k);
-            if (it != this->entries.end()) co_return it->second;
+            if (it != this->entries.end()) {
+                if (!it->second->isClosed()) co_return it->second;
+                this->entries.erase(it); // dead connection: reconnect
+            }
         }
         auto conn = std::make_shared<Http2Connection>(
             co_await Http2Connection::connect(host, port, std::move(opts)));
         std::lock_guard<std::mutex> lk(this->mu);
+        // Another acquirer may have populated the entry while we were connecting;
+        // prefer theirs unless it has died since (same rule as acquirePlain).
         auto [ins, fresh] = this->entries.emplace(k, conn);
+        if (!fresh && ins->second->isClosed()) ins->second = conn;
         co_return ins->second;
     }
 #endif
@@ -1327,7 +1734,16 @@ namespace Soccer {
     void Http2ConnectionPool::evict(std::string_view host, std::uint16_t port) {
         const std::string k = keyOf(host, port);
         std::lock_guard<std::mutex> lk(this->mu);
-        this->entries.erase(k);
+        // TLS entries are keyed "host:port|options"; drop those too.
+        for (auto it = this->entries.begin(); it != this->entries.end();) {
+            const std::string &ek = it->first;
+            if (ek == k || (ek.size() > k.size() && ek.compare(0, k.size(), k) == 0 &&
+                            ek[k.size()] == '|')) {
+                it = this->entries.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 
     std::size_t Http2ConnectionPool::size() const {

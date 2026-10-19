@@ -20,11 +20,14 @@
 #include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <deque>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
+#include <string_view>
 #include <string>
 #include <unordered_map>
 #include <utility>
@@ -32,6 +35,7 @@
 
 #include "BufferedReader.h"
 #include "Coroutines.h"
+#include "PlatformNet.h"
 #include "SocketException.h"
 #include "TcpStream.h"
 
@@ -90,6 +94,48 @@ namespace Soccer {
                 if (ca != cb) return false;
             }
             return true;
+        }
+
+        /**
+         * @brief True if @p s contains CR, LF or NUL, i.e. cannot be put
+         *        into a start line or header field without enabling
+         *        header injection / response splitting.
+         */
+        inline bool hasCtlLineBreak(std::string_view s) noexcept {
+            return s.find_first_of(std::string_view("\r\n\0", 3)) != std::string_view::npos;
+        }
+
+        /**
+         * @brief Strict Content-Length extraction. Returns false if the
+         *        header is absent; throws if any occurrence is not a
+         *        plain decimal number, if occurrences disagree, or if the
+         *        value exceeds @p limit (default @ref kHttpMaxBodyBytes;
+         *        zero means no limit beyond the 12-digit syntax bound).
+         */
+        template<typename HeaderVec>
+        inline bool strictContentLength(const HeaderVec &headers, std::size_t &out,
+                                        std::size_t limit = kHttpMaxBodyBytes) {
+            bool found = false;
+            std::size_t value = 0;
+            for (const auto &h : headers) {
+                if (!iequalsAscii(h.name, "Content-Length")) continue;
+                const std::string &v = h.value;
+                if (v.empty() || v.size() > 12 ||
+                    v.find_first_not_of("0123456789") != std::string::npos) {
+                    throw std::runtime_error("HTTP: invalid Content-Length");
+                }
+                const std::size_t n = static_cast<std::size_t>(std::stoull(v));
+                if (found && n != value) {
+                    throw std::runtime_error("HTTP: conflicting Content-Length headers");
+                }
+                value = n;
+                found = true;
+            }
+            if (found && limit != 0 && value > limit) {
+                throw std::runtime_error("HTTP: invalid Content-Length");
+            }
+            out = value;
+            return found;
         }
     }
 
@@ -202,8 +248,18 @@ namespace Soccer {
         /**
          * @brief Try to obtain an existing idle connection to
          *        @p host:@p port. Returns an empty optional if none.
+         *        Connections idle longer than the max idle age are discarded
+         *        rather than returned. (This does not touch the socket; use
+         *        @ref acquireLive to also skip connections the peer has closed.)
          */
         std::optional<TcpStream> acquire(std::string_view host, std::uint16_t port);
+
+        /**
+         * @brief Like @ref acquire, but also discards connections whose peer has
+         *        closed or broken them in the meantime (a non-blocking peek finds
+         *        EOF or an error), so a request is not sent into a dead socket.
+         */
+        std::optional<TcpStream> acquireLive(std::string_view host, std::uint16_t port);
 
         /**
          * @brief Return a healthy, at-message-boundary connection to
@@ -218,7 +274,27 @@ namespace Soccer {
          */
         std::size_t idleCount(std::string_view host, std::uint16_t port) const;
 
+        /**
+         * @brief Default longest an idle connection may sit in the pool before
+         *        it is considered stale. Servers close keep-alive connections
+         *        after a few tens of seconds; reusing one past that point just
+         *        fails the request.
+         */
+        static constexpr std::chrono::milliseconds kDefaultMaxIdleAge{30000};
+
+        /**
+         * @brief Set the longest an idle connection may wait in the pool. Older
+         *        ones are dropped instead of handed out. Zero disables the age
+         *        limit (the liveness check in @ref acquire still applies).
+         */
+        void setMaxIdleAge(std::chrono::milliseconds age) noexcept;
+
     private:
+        struct IdleConn {
+            TcpStream stream;
+            std::chrono::steady_clock::time_point lastUsed;
+        };
+
         static std::string keyOf(std::string_view host, std::uint16_t port) {
             std::string k(host);
             k.push_back(':');
@@ -226,9 +302,13 @@ namespace Soccer {
             return k;
         }
 
+        /// True if the peer has closed (or broken) @p s, or sent bytes nobody asked for.
+        static bool looksDead(const TcpStream &s) noexcept;
+
         mutable std::mutex mu;
-        std::unordered_map<std::string, std::deque<TcpStream>> idle;
+        std::unordered_map<std::string, std::deque<IdleConn>> idle;
         std::atomic<std::size_t> maxIdlePerHost{kDefaultMaxIdlePerHost};
+        std::atomic<std::int64_t> maxIdleAgeMs{kDefaultMaxIdleAge.count()};
     };
 
 
@@ -314,7 +394,33 @@ namespace Soccer {
                 std::move(extraHeaders), std::move(body));
         }
 
+        /**
+         * @brief Default longest a new connection (name resolution plus the TCP
+         *        handshake) may take before the request fails with a
+         *        @c SocketException; applies to every request this class makes
+         *        on a fresh connection.
+         */
+        static constexpr std::chrono::milliseconds kDefaultConnectTimeout{10000};
+
+        /**
+         * @brief Change the process-wide connect timeout. Zero disables it
+         *        (the kernel's own connect timeout still applies).
+         */
+        static void setConnectTimeout(std::chrono::milliseconds t) noexcept {
+            connectTimeoutMs().store(t.count(), std::memory_order_relaxed);
+        }
+
+        /// @return The current connect timeout.
+        static std::chrono::milliseconds connectTimeout() noexcept {
+            return std::chrono::milliseconds{connectTimeoutMs().load(std::memory_order_relaxed)};
+        }
+
     private:
+        static std::atomic<long long> &connectTimeoutMs() noexcept {
+            static std::atomic<long long> v{kDefaultConnectTimeout.count()};
+            return v;
+        }
+
         /**
          * @brief Shared response-parsing path used by both @ref request
          *        and @ref pooledRequest: read the status line, skip
@@ -348,9 +454,14 @@ namespace Soccer {
          *        be read to closure and cannot be reused.
          */
         static YarnBall::Task<HttpResponse> readResponse(
-            BufferedReader<TcpStream> &r, bool &outStreamReusable) {
+            BufferedReader<TcpStream> &r, bool &outStreamReusable,
+            bool *sawResponseByte = nullptr) {
             outStreamReusable = false;
+            if (sawResponseByte) *sawResponseByte = false;
             HttpResponse resp;
+            // Counted across the interim responses too, so a stream of 1xx
+            // responses cannot make the client buffer more than one cap's worth.
+            std::size_t header_bytes = 0;
 
             // Loop past any 1xx interim response(s) to the real,
             // final status line + header block. Bounded by
@@ -368,16 +479,21 @@ namespace Soccer {
                     throw std::runtime_error(
                         "HttpClient: connection closed before status line");
                 }
+                if (sawResponseByte) *sawResponseByte = true;
                 HttpClient::parseStatusLine(status_line, resp);
 
-                std::size_t header_bytes = status_line.size();
+                header_bytes += status_line.size();
                 while (true) {
                     std::string line = co_await r.readLine();
                     header_bytes += line.size();
                     if (header_bytes > detail::kHttpMaxHeaderBytes) {
                         throw std::runtime_error("HttpClient: header block too large");
                     }
-                    if (line.empty() || line == "\r\n" || line == "\n") break;
+                    if (line.empty()) {
+                        throw std::runtime_error(
+                            "HttpClient: connection closed inside header block");
+                    }
+                    if (line == "\r\n" || line == "\n") break;
                     HttpClient::parseHeaderLine(line, resp);
                 }
 
@@ -394,14 +510,19 @@ namespace Soccer {
                 co_return resp;
             }
 
-            const std::string clen = resp.header("Content-Length");
-            if (!clen.empty()) {
-                const long long len = std::atoll(clen.c_str());
-                if (len < 0 ||
-                    static_cast<std::size_t>(len) > detail::kHttpMaxBodyBytes) {
-                    throw std::runtime_error("HttpClient: invalid Content-Length");
+            // Chunked framing is not implemented. Reading such a response
+            // as identity or Content-Length framed would hand the caller
+            // raw chunk framing and, on a pooled connection, leave unread
+            // bytes that desynchronise the next response.
+            if (!resp.header("Transfer-Encoding").empty()) {
+                throw std::runtime_error("HttpClient: Transfer-Encoding not supported");
+            }
+            std::size_t clenValue = 0;
+            if (detail::strictContentLength(resp.headers, clenValue)) {
+                auto bytes = co_await r.readExact(clenValue);
+                if (bytes.size() != clenValue) {
+                    throw std::runtime_error("HttpClient: truncated response body");
                 }
-                auto bytes = co_await r.readExact(static_cast<std::size_t>(len));
                 resp.body.assign(reinterpret_cast<const char *>(bytes.data()),
                                  bytes.size());
                 outStreamReusable = true;
@@ -439,11 +560,8 @@ namespace Soccer {
             std::string path,
             std::vector<HttpHeader> extra,
             std::string body) {
+            checkRequestParts(method, host, path, extra);
             auto &pool = HttpConnectionPool::defaultPool();
-
-            std::optional<TcpStream> reused = pool.acquire(host, port);
-            TcpStream stream = reused ? std::move(*reused)
-                                       : co_await tcpConnect(host, port);
 
             std::string req = method;
             req += ' ';
@@ -460,25 +578,46 @@ namespace Soccer {
             }
             req += "\r\n";
 
-            co_await stream.write(std::span<const std::byte>(
-                reinterpret_cast<const std::byte *>(req.data()), req.size()));
-            if (!body.empty()) {
-                co_await stream.write(std::span<const std::byte>(
-                    reinterpret_cast<const std::byte *>(body.data()),
-                    body.size()));
-            }
+            const bool idempotent = isIdempotentMethod(method);
+            for (int attempt = 0; ; ++attempt) {
+                // Only the first attempt may use a pooled connection; the retry
+                // below always dials a fresh one.
+                std::optional<TcpStream> reused;
+                if (attempt == 0) reused = pool.acquireLive(host, port);
+                const bool wasReused = reused.has_value();
+                TcpStream stream = reused ? std::move(*reused)
+                                           : co_await tcpConnect(host, port, connectTimeout());
 
-            BufferedReader<TcpStream> r(&stream);
-            bool reusable = false;
-            HttpResponse resp = co_await HttpClient::readResponse(r, reusable);
+                bool sawResponse = false;
+                try {
+                    co_await stream.write(std::span<const std::byte>(
+                        reinterpret_cast<const std::byte *>(req.data()), req.size()));
+                    if (!body.empty()) {
+                        co_await stream.write(std::span<const std::byte>(
+                            reinterpret_cast<const std::byte *>(body.data()),
+                            body.size()));
+                    }
 
-            // Return the connection to the pool only if the parse left
-            // it at a clean boundary and the server didn't explicitly
-            // close it.
-            if (reusable && !detail::iequalsAscii(resp.header("Connection"), "close")) {
-                pool.release(host, port, std::move(stream));
+                    BufferedReader<TcpStream> r(&stream);
+                    bool reusable = false;
+                    HttpResponse resp = co_await HttpClient::readResponse(r, reusable, &sawResponse);
+
+                    // Return the connection to the pool only if the parse left
+                    // it at a clean boundary and the server didn't explicitly
+                    // close it.
+                    if (reusable && !detail::iequalsAscii(resp.header("Connection"), "close")) {
+                        pool.release(host, port, std::move(stream));
+                    }
+                    co_return resp;
+                } catch (...) {
+                    // A pooled connection can die between the liveness check and
+                    // the write (the server closes keep-alives on its own
+                    // schedule). If nothing of a response was seen and the
+                    // request is safe to repeat, redo it once on a new connection.
+                    if (wasReused && idempotent && !sawResponse) continue;
+                    throw;
+                }
             }
-            co_return resp;
         }
 
         /**
@@ -492,6 +631,7 @@ namespace Soccer {
             std::vector<HttpHeader> extra,
             std::string body) {
             // Build the request preamble.
+            checkRequestParts(method, host, path, extra);
             std::string req = method;
             req += ' ';
             req += path;
@@ -507,7 +647,7 @@ namespace Soccer {
             }
             req += "\r\n";
 
-            auto stream = co_await tcpConnect(host, port);
+            auto stream = co_await tcpConnect(host, port, connectTimeout());
 
             // Send preamble + body in two writes; the kernel coalesces
             // these for us. Splitting is fine for v1.
@@ -527,6 +667,32 @@ namespace Soccer {
             co_return resp;
         }
 
+        /// Methods RFC 9110 9.2.2 defines as idempotent: safe to repeat after a failed attempt.
+        static bool isIdempotentMethod(std::string_view m) {
+            for (std::string_view idem : {"GET", "HEAD", "PUT", "DELETE", "OPTIONS", "TRACE"}) {
+                if (detail::iequalsAscii(m, idem)) return true;
+            }
+            return false;
+        }
+
+        /**
+         * @brief Reject CR/LF/NUL in anything interpolated into the
+         *        request head (request-line / header injection).
+         */
+        static void checkRequestParts(const std::string &method,
+                                       const std::string &host,
+                                       const std::string &path,
+                                       const std::vector<HttpHeader> &extra) {
+            bool bad = detail::hasCtlLineBreak(method) || detail::hasCtlLineBreak(host) ||
+                       detail::hasCtlLineBreak(path) || path.find(' ') != std::string::npos;
+            for (const auto &h : extra) {
+                if (detail::hasCtlLineBreak(h.name) || detail::hasCtlLineBreak(h.value)) bad = true;
+            }
+            if (bad) {
+                throw std::runtime_error("HttpClient: control characters in request");
+            }
+        }
+
         /**
          * @brief Parse "HTTP/x.y CODE REASON\\r\\n" into @p resp.
          */
@@ -541,6 +707,10 @@ namespace Soccer {
             const std::string code =
                 line.substr(sp1 + 1, (sp2 == std::string::npos ? line.size() : sp2)
                                       - sp1 - 1);
+            if (code.size() != 3 ||
+                code.find_first_not_of("0123456789") != std::string::npos) {
+                throw std::runtime_error("HttpClient: malformed status code");
+            }
             resp.status = std::atoi(code.c_str());
             if (sp2 != std::string::npos) {
                 resp.reason = detail::trimAscii(line.substr(sp2 + 1));
@@ -573,15 +743,52 @@ namespace Soccer {
         this->maxIdlePerHost.store(n, std::memory_order_relaxed);
     }
 
+    inline void HttpConnectionPool::setMaxIdleAge(std::chrono::milliseconds age) noexcept {
+        this->maxIdleAgeMs.store(age.count(), std::memory_order_relaxed);
+    }
+
+    inline bool HttpConnectionPool::looksDead(const TcpStream &s) noexcept {
+        // An idle keep-alive connection has nothing to read. EOF means the peer
+        // closed it, data means the stream is out of step, an error other than
+        // "would block" means it is broken.
+        char c;
+        const ::ssize_t n = ::recv(s.fd(), &c, 1, MSG_PEEK);
+        if (n == 0) return true;
+        if (n > 0) return true;
+        return !YarnBall::isWouldBlock(YarnBall::lastSocketError());
+    }
+
     inline std::optional<TcpStream>
     HttpConnectionPool::acquire(std::string_view host, std::uint16_t port) {
         const std::string k = keyOf(host, port);
+        const std::int64_t ageMs = this->maxIdleAgeMs.load(std::memory_order_relaxed);
+        const auto now = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lk(this->mu);
         auto it = this->idle.find(k);
-        if (it == this->idle.end() || it->second.empty()) return std::nullopt;
-        TcpStream s = std::move(it->second.back());
-        it->second.pop_back();
-        return s;
+        if (it == this->idle.end()) return std::nullopt;
+        auto &dq = it->second;
+        while (!dq.empty()) {
+            IdleConn c = std::move(dq.back());
+            dq.pop_back();
+            const bool stale = ageMs > 0 &&
+                std::chrono::duration_cast<std::chrono::milliseconds>(now - c.lastUsed).count() > ageMs;
+            if (stale) {
+                // Everything older sits in front of this one: drop it all.
+                dq.clear();
+                break;
+            }
+            return std::move(c.stream);
+        }
+        return std::nullopt;
+    }
+
+    inline std::optional<TcpStream>
+    HttpConnectionPool::acquireLive(std::string_view host, std::uint16_t port) {
+        while (true) {
+            std::optional<TcpStream> s = this->acquire(host, port);
+            if (!s || !looksDead(*s)) return s;
+            // The peer closed it while it sat idle: drop it (closing our end) and try the next.
+        }
     }
 
     inline void HttpConnectionPool::release(std::string_view host,
@@ -589,15 +796,22 @@ namespace Soccer {
                                               TcpStream stream) {
         const std::string k = keyOf(host, port);
         const std::size_t cap = this->maxIdlePerHost.load(std::memory_order_relaxed);
+        const std::int64_t ageMs = this->maxIdleAgeMs.load(std::memory_order_relaxed);
+        const auto now = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lk(this->mu);
         auto &dq = this->idle[k];
+        // Drop what has gone stale while it waited; the oldest are at the front.
+        while (ageMs > 0 && !dq.empty() &&
+               std::chrono::duration_cast<std::chrono::milliseconds>(now - dq.front().lastUsed).count() > ageMs) {
+            dq.pop_front();
+        }
         if (dq.size() >= cap) {
             // Over the cap: drop the stream by letting its destructor
             // run. Caller's move means we already own it.
             (void) stream;
             return;
         }
-        dq.push_back(std::move(stream));
+        dq.push_back(IdleConn{std::move(stream), now});
     }
 
     inline std::size_t

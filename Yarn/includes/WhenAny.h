@@ -2,12 +2,12 @@
 // Created by Fabrizio Paino on 2026-05-15.
 //
 // whenAny: race a vector of tasks; resume with the index + value of the
-// first one to finish. The losers keep running on the Yarn pool until
-// they reach their own completion -- C++ coroutines have no first-class
-// cancellation, so the "losers" are simply left to finish (their results
-// are discarded). Pair with a cooperative stop_token if you need to
-// actually shorten their wall-clock cost. withTimeout is the canonical
-// consumer: whenAny(task, sleepFor(d)).
+// first one to finish. Every branch runs inside a cancellation scope (see
+// Cancellation.h) that is stopped the moment one branch wins, so losers
+// parked on a timer, an fd, a lock, a channel, ... stop waiting and unwind
+// with CancelledException (discarded) instead of lingering. Work that is not
+// parked in a cancellable await runs to its natural end and its result is
+// dropped. withTimeout is the canonical consumer: whenAny(task, sleepFor(d)).
 //
 
 #ifndef YARN_WHEN_ANY_H
@@ -20,10 +20,12 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stop_token>
 #include <utility>
 #include <variant>
 #include <vector>
 
+#include "Cancellation.h"
 #include "Coroutines.h"
 
 namespace YarnBall {
@@ -45,6 +47,9 @@ namespace YarnBall {
             /// Set exactly once by whichever runner wins.
             std::atomic<bool> finished{false};
 
+            /// Set (under @c mu) only after index/result/exception are written; the awaiter keys off this, not @c finished.
+            bool published{false};
+
             /// Index of the winning subtask. Only meaningful once
             /// @c finished is observed true.
             std::size_t winning_index{0};
@@ -59,6 +64,9 @@ namespace YarnBall {
             /// Guards @c waiter publication against the runner that wins
             /// before the awaiter has registered.
             std::mutex mu;
+
+            /// Stopped by the winning runner: the cancellation scope of every branch.
+            std::stop_source stop;
         };
 
         /**
@@ -67,10 +75,12 @@ namespace YarnBall {
          */
         struct WhenAnyVoidState {
             std::atomic<bool> finished{false};
+            bool published{false};
             std::size_t winning_index{0};
             std::exception_ptr exception{};
             std::coroutine_handle<> waiter{};
             std::mutex mu;
+            std::stop_source stop;
         };
 
         /**
@@ -82,25 +92,35 @@ namespace YarnBall {
         Task<> whenAnyRunner(std::shared_ptr<WhenAnyState<T>> state,
                                    std::size_t idx,
                                    Task<T> task) {
+            const std::stop_token scope = state->stop.get_token();
+            co_await InstallScopeAwaiter{&scope};
             try {
                 auto value = co_await std::move(task);
                 if (!state->finished.exchange(true, std::memory_order_acq_rel)) {
+                    state->stop.request_stop();
                     state->winning_index = idx;
-                    state->result.emplace(std::move(value));
+                    try {
+                        state->result.emplace(std::move(value));
+                    } catch (...) {
+                        state->exception = std::current_exception();
+                    }
                     std::coroutine_handle<> w;
                     {
                         std::lock_guard<std::mutex> lk(state->mu);
+                        state->published = true;
                         w = state->waiter;
                     }
                     if (w) w.resume();
                 }
             } catch (...) {
                 if (!state->finished.exchange(true, std::memory_order_acq_rel)) {
+                    state->stop.request_stop();
                     state->winning_index = idx;
                     state->exception = std::current_exception();
                     std::coroutine_handle<> w;
                     {
                         std::lock_guard<std::mutex> lk(state->mu);
+                        state->published = true;
                         w = state->waiter;
                     }
                     if (w) w.resume();
@@ -116,24 +136,30 @@ namespace YarnBall {
         inline Task<> whenAnyRunnerVoid(std::shared_ptr<WhenAnyVoidState> state,
                                                 std::size_t idx,
                                                 Task<> task) {
+            const std::stop_token scope = state->stop.get_token();
+            co_await InstallScopeAwaiter{&scope};
             try {
                 co_await std::move(task);
                 if (!state->finished.exchange(true, std::memory_order_acq_rel)) {
+                    state->stop.request_stop();
                     state->winning_index = idx;
                     std::coroutine_handle<> w;
                     {
                         std::lock_guard<std::mutex> lk(state->mu);
+                        state->published = true;
                         w = state->waiter;
                     }
                     if (w) w.resume();
                 }
             } catch (...) {
                 if (!state->finished.exchange(true, std::memory_order_acq_rel)) {
+                    state->stop.request_stop();
                     state->winning_index = idx;
                     state->exception = std::current_exception();
                     std::coroutine_handle<> w;
                     {
                         std::lock_guard<std::mutex> lk(state->mu);
+                        state->published = true;
                         w = state->waiter;
                     }
                     if (w) w.resume();
@@ -152,7 +178,8 @@ namespace YarnBall {
             std::shared_ptr<State> state;
 
             bool await_ready() const noexcept {
-                return this->state->finished.load(std::memory_order_acquire);
+                std::lock_guard<std::mutex> lk(this->state->mu);
+                return this->state->published;
             }
 
             std::coroutine_handle<> await_suspend(std::coroutine_handle<> h) noexcept {
@@ -161,7 +188,7 @@ namespace YarnBall {
                     // Race: a runner may have flipped @c finished after
                     // await_ready returned false but before we take the
                     // lock. Re-check; if it has, symmetric-transfer back.
-                    if (this->state->finished.load(std::memory_order_acquire)) {
+                    if (this->state->published) {
                         return h;
                     }
                     this->state->waiter = h;
@@ -192,10 +219,13 @@ namespace YarnBall {
 
     /**
      * @brief Race @p tasks concurrently; resume with the index + value
-     *        of the first one to finish. Losers continue running on the
-     *        Yarn pool until they reach their own completion -- C++
-     *        coroutines do not support forced cancellation, so wire up
-     *        a @c std::stop_token if you want to actively shorten them.
+     *        of the first one to finish. The losers' cancellation scope is
+     *        stopped as soon as the winner is known: their parked
+     *        cancellable awaits wake with @c CancelledException (swallowed
+     *        here) and they unwind; anything not parked runs to its end
+     *        with the result discarded. If the caller is itself inside a
+     *        cancellation scope, stopping that scope stops every branch
+     *        and whenAny then throws @c CancelledException.
      *
      * @throws Rethrows the exception of the winning subtask if it
      *         finished by throwing.
@@ -208,6 +238,9 @@ namespace YarnBall {
     template<typename T>
     Task<WhenAnyResult<T>> whenAny(std::vector<Task<T>> tasks) {
         auto state = std::make_shared<detail::WhenAnyState<T>>();
+        detail::TaskPromiseCore *outer = co_await detail::CurrentScopeAwaiter{};
+        detail::ScopeLink link;
+        link.follow(outer, state->stop);
 
         for (std::size_t i = 0; i < tasks.size(); ++i) {
             coSpawn(detail::whenAnyRunner<T>(state, i, std::move(tasks[i])));
@@ -225,6 +258,9 @@ namespace YarnBall {
      */
     inline Task<std::size_t> whenAny(std::vector<Task<>> tasks) {
         auto state = std::make_shared<detail::WhenAnyVoidState>();
+        detail::TaskPromiseCore *outer = co_await detail::CurrentScopeAwaiter{};
+        detail::ScopeLink link;
+        link.follow(outer, state->stop);
 
         for (std::size_t i = 0; i < tasks.size(); ++i) {
             coSpawn(detail::whenAnyRunnerVoid(state, i, std::move(tasks[i])));

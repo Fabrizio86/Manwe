@@ -5,6 +5,8 @@
 #ifndef WIRE_CHANNEL_H
 #define WIRE_CHANNEL_H
 
+#include <algorithm>
+#include <atomic>
 #include <coroutine>
 #include <deque>
 #include <memory>
@@ -12,6 +14,7 @@
 #include <optional>
 #include <utility>
 
+#include "Cancellation.h"
 #include "Coroutines.h"
 
 namespace Telegraph {
@@ -35,6 +38,14 @@ namespace Telegraph {
      *
      * Bounded variants and explicit backpressure can be added later;
      * v1 is unbounded to keep the protocol simple.
+     *
+     * A parked @c receive is cancellable (see @c Cancellation.h): inside
+     * a stopped cancellation scope it leaves the waiter queue and throws
+     * @c YarnBall::CancelledException, so a value sent afterwards goes to
+     * the next receiver or the buffer, not to the abandoned one. A frame
+     * destroyed while parked also leaves the queue. @ref pushFront puts a
+     * value back at the head, for a receiver that obtained a value it
+     * can no longer use (see @c channelSelect).
      */
     template<typename T>
     class Channel {
@@ -63,17 +74,42 @@ namespace Telegraph {
                 if (!this->waiters.empty()) {
                     receiver = std::move(this->waiters.front());
                     this->waiters.pop_front();
+                    receiver->queued.store(false, std::memory_order_release);
+                    // Under the lock, so a receiver frame destroyed before the wake runs can take the value back.
+                    receiver->slot.emplace(std::move(value));
                 } else {
                     this->buffer.push_back(std::move(value));
                     return true;
                 }
             }
 
-            // Hand off directly to the receiver, outside the lock.
-            receiver->slot.emplace(std::move(value));
-            std::unique_ptr<YarnBall::ITask> ct{
-                new YarnBall::detail::CoroutineITask(receiver->handle)};
-            YarnBall::Yarn::instance()->run(std::move(ct));
+            // Wake the receiver, outside the lock.
+            dispatch(receiver->handle);
+            return true;
+        }
+
+        /**
+         * @brief Put @p value back at the head of the channel, ahead of
+         *        anything buffered: it goes straight to the oldest parked
+         *        receiver if there is one. Returns @c false (dropping the
+         *        value) if the channel is closed.
+         */
+        bool pushFront(T value) {
+            std::shared_ptr<Waiter> receiver;
+            {
+                std::lock_guard<std::mutex> lk(this->mu);
+                if (this->closed_) return false;
+                if (!this->waiters.empty()) {
+                    receiver = std::move(this->waiters.front());
+                    this->waiters.pop_front();
+                    receiver->queued.store(false, std::memory_order_release);
+                    receiver->slot.emplace(std::move(value));
+                } else {
+                    this->buffer.push_front(std::move(value));
+                    return true;
+                }
+            }
+            dispatch(receiver->handle);
             return true;
         }
 
@@ -118,12 +154,11 @@ namespace Telegraph {
                 this->closed_ = true;
                 to_wake = std::move(this->waiters);
                 this->waiters.clear();
+                for (auto &w : to_wake) w->queued.store(false, std::memory_order_release);
             }
             for (auto &w : to_wake) {
                 // slot stays nullopt -> receiver returns nullopt.
-                std::unique_ptr<YarnBall::ITask> ct{
-                    new YarnBall::detail::CoroutineITask(w->handle)};
-                YarnBall::Yarn::instance()->run(std::move(ct));
+                dispatch(w->handle);
             }
         }
 
@@ -151,36 +186,129 @@ namespace Telegraph {
         struct Waiter {
             std::coroutine_handle<> handle{};
             std::optional<T> slot;
+            std::atomic<bool> queued{false};
         };
 
         /**
          * @brief Awaiter that registers a Waiter on the channel and parks
-         *        the coroutine until @c send or @c close wakes it.
+         *        the coroutine until @c send or @c close wakes it. Cancel
+         *        protocol as in @c YarnBall::detail::ParkBase.
          */
         struct ReceiveAwaiter {
             Channel *ch;
             std::shared_ptr<Waiter> waiter;
 
-            bool await_ready() const noexcept { return false; }
+            ReceiveAwaiter(Channel *c, std::shared_ptr<Waiter> w) noexcept
+                : ch(c), waiter(std::move(w)) {
+            }
+            ReceiveAwaiter(const ReceiveAwaiter &) = delete;
+            ReceiveAwaiter &operator=(const ReceiveAwaiter &) = delete;
 
-            bool await_suspend(std::coroutine_handle<> h) {
-                std::lock_guard<std::mutex> lk(ch->mu);
-                // Recheck buffer + closed under the lock to close the race.
-                if (!ch->buffer.empty()) {
-                    waiter->slot.emplace(std::move(ch->buffer.front()));
-                    ch->buffer.pop_front();
-                    return false;
+            ~ReceiveAwaiter() {
+                this->bind.disarm();
+                if (!this->proxy) return;
+                std::optional<T> orphan;
+                {
+                    std::lock_guard<std::mutex> lk(this->ch->mu);
+                    bool removed = false;
+                    if (this->waiter->queued.load(std::memory_order_relaxed)) {
+                        this->unlinkLocked();
+                        removed = true;
+                    }
+                    // A wake that was handed this receiver but never ran (the frame is being destroyed): the value it
+                    // carried is put back instead of dying with the receiver. The sender stored it under this lock.
+                    if (this->proxy.retire(removed) && this->waiter->slot.has_value()) {
+                        orphan.emplace(std::move(*this->waiter->slot));
+                        this->waiter->slot.reset();
+                    }
                 }
-                if (ch->closed_) {
-                    return false;
-                }
-                waiter->handle = h;
-                ch->waiters.push_back(waiter);
-                return true;
+                if (orphan) this->ch->pushFront(std::move(*orphan));
             }
 
-            void await_resume() noexcept {}
+            bool await_ready() const noexcept { return false; }
+
+            template<typename Promise>
+            bool await_suspend(std::coroutine_handle<Promise> h) {
+                YarnBall::detail::TaskPromiseCore *core = YarnBall::detail::CancelBinding::ambient(h);
+                bool armed = false;
+                for (;;) {
+                    {
+                        std::lock_guard<std::mutex> lk(ch->mu);
+                        if (this->earlyCancel) {
+                            this->cancelled = true;
+                            return false;
+                        }
+                        // Recheck buffer + closed under the lock to close the race.
+                        if (!ch->buffer.empty()) {
+                            waiter->slot.emplace(std::move(ch->buffer.front()));
+                            ch->buffer.pop_front();
+                            return false;
+                        }
+                        if (ch->closed_) {
+                            return false;
+                        }
+                        if (!core || armed) {
+                            waiter->handle = this->proxy.publish(h);
+                            waiter->queued.store(true, std::memory_order_release);
+                            ch->waiters.push_back(waiter);
+                            return true;
+                        }
+                        if (core->isCancellationRequested()) {
+                            this->cancelled = true;
+                            return false;
+                        }
+                    }
+                    this->bind.arm(core, &ReceiveAwaiter::cancelThunk, this);
+                    armed = true;
+                }
+            }
+
+            void await_resume() {
+                if (this->cancelled) throw YarnBall::CancelledException{};
+            }
+
+        private:
+            void unlinkLocked() noexcept {
+                auto it = std::find(ch->waiters.begin(), ch->waiters.end(), this->waiter);
+                if (it != ch->waiters.end()) ch->waiters.erase(it);
+                this->waiter->queued.store(false, std::memory_order_release);
+            }
+
+            static void cancelThunk(void *p) noexcept {
+                auto *self = static_cast<ReceiveAwaiter *>(p);
+                std::coroutine_handle<> h{};
+                {
+                    std::lock_guard<std::mutex> lk(self->ch->mu);
+                    if (self->waiter->queued.load(std::memory_order_relaxed)) {
+                        h = self->waiter->handle;
+                        self->unlinkLocked();
+                        self->cancelled = true;
+                    } else {
+                        self->earlyCancel = true;
+                    }
+                }
+                if (h) dispatch(h);
+            }
+
+            bool earlyCancel = false; // guarded by ch->mu
+            bool cancelled = false;
+            YarnBall::detail::WaitProxy proxy;
+            YarnBall::detail::CancelBinding bind;
         };
+
+        /**
+         * @brief Wake @p h on the Yarn pool; if the pool refuses the
+         *        task, resume inline so the receiver is never stranded.
+         */
+        static void dispatch(std::coroutine_handle<> h) noexcept {
+            try {
+                std::unique_ptr<YarnBall::ITask> ct{
+                    new YarnBall::detail::CoroutineITask(h)};
+                YarnBall::Yarn::instance()->run(std::move(ct));
+            } catch (...) {
+                h.resume();
+            }
+        }
 
         mutable std::mutex mu;
         std::deque<T> buffer;

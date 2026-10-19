@@ -142,9 +142,10 @@ namespace Embedded {
             // Always-on flags: ignore modem-status lines, enable receiver.
             tio.c_cflag |= (CLOCAL | CREAD);
 
-            // Non-canonical reads with VMIN=0 / VTIME=0 so read returns
-            // whatever is available (matching the Reactor-driven model).
-            tio.c_cc[VMIN] = 0;
+            // Non-canonical reads with VMIN=1 / VTIME=0: on an O_NONBLOCK
+            // fd an empty read fails with EAGAIN (so the Reactor wait is
+            // reached) instead of returning 0, which would look like EOF.
+            tio.c_cc[VMIN] = 1;
             tio.c_cc[VTIME] = 0;
 
             if (::tcsetattr(fd, TCSANOW, &tio) < 0) {
@@ -157,7 +158,7 @@ namespace Embedded {
     SerialPort SerialPort::open(const std::string &path,
                                   const SerialConfig &cfg) {
         const int fd = ::open(path.c_str(),
-                                O_RDWR | O_NOCTTY | O_NONBLOCK);
+                                O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
         if (fd < 0) {
             throw SerialPortError("open(" + path + "): " +
                                    std::strerror(errno));
@@ -184,6 +185,7 @@ namespace Embedded {
             const int err = errno;
             if (err == EAGAIN || err == EWOULDBLOCK) {
                 co_await YarnBall::io::waitReadable(this->descriptor);
+                if (this->descriptor < 0) throw SerialPortError("SerialPort closed during read");
                 continue;
             }
             throw SerialPortError(std::string("read: ") + std::strerror(err));
@@ -203,6 +205,7 @@ namespace Embedded {
             const int err = errno;
             if (err == EAGAIN || err == EWOULDBLOCK) {
                 co_await YarnBall::io::waitWritable(this->descriptor);
+                if (this->descriptor < 0) throw SerialPortError("SerialPort closed during write");
                 continue;
             }
             throw SerialPortError(std::string("write: ") + std::strerror(err));
@@ -211,6 +214,8 @@ namespace Embedded {
 
     void SerialPort::close() noexcept {
         if (this->descriptor >= 0) {
+            // Wake any read()/write() parked on this fd; they see the closed port on resume instead of hanging.
+            YarnBall::Reactor::instance()->cancelFd(this->descriptor);
             (void) ::close(this->descriptor);
             this->descriptor = -1;
         }

@@ -7,6 +7,7 @@
 
 #ifdef SOCCER_HAS_TLS
 
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -74,6 +75,21 @@ namespace Soccer {
          *        ALPN.
          */
         std::string alpnProtocols;
+
+        /**
+         * @brief Longest resolving the host and establishing the TCP connection
+         *        may take (see @c tcpConnect). The connect is abandoned and
+         *        @c connect throws when it is exceeded. Zero means no limit
+         *        beyond the kernel's own connect timeout.
+         */
+        std::chrono::milliseconds connectTimeout{10000};
+
+        /**
+         * @brief Longest the TLS handshake (after the TCP connection is up)
+         *        may take; the connection is dropped and @c connect throws if
+         *        the server stalls past it. Zero means no limit.
+         */
+        std::chrono::milliseconds handshakeTimeout{10000};
     };
 
     /**
@@ -149,6 +165,12 @@ namespace Soccer {
         YarnBall::Task<std::size_t> write(std::span<const std::byte> buf);
 
         void close() noexcept;
+
+        /**
+         * @return The ALPN protocol negotiated with the peer, or an empty
+         *         string if none (or the stream is closed).
+         */
+        std::string alpnSelected() const;
 
         /**
          * @return Underlying socket fd or -1 if closed.

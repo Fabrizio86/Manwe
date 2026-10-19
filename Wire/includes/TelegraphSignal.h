@@ -5,16 +5,20 @@
 #ifndef WIRE_SIGNAL_H
 #define WIRE_SIGNAL_H
 
+#include <algorithm>
 #include <atomic>
 #include <coroutine>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <exception>
 #include <mutex>
+#include <optional>
 #include <tuple>
 #include <utility>
 #include <vector>
 
+#include "Cancellation.h"
 #include "Coroutines.h"
 
 namespace Telegraph {
@@ -65,7 +69,9 @@ namespace Telegraph {
         }
 
         /**
-         * @brief Remove a previously-connected handler.
+         * @brief Remove a previously-connected handler. An emission
+         *        already in flight works from a snapshot, so the handler
+         *        may still run once after this returns.
          * @return @c true if the slot existed and was removed.
          */
         bool disconnect(SlotId id) {
@@ -107,6 +113,7 @@ namespace Telegraph {
                 handlers_copy = this->handlers;
                 waiters_copy = std::move(this->pending);
                 this->pending.clear();
+                for (auto &slot : waiters_copy) slot->queued.store(false, std::memory_order_release);
             }
 
             for (auto &slot : waiters_copy) {
@@ -134,6 +141,7 @@ namespace Telegraph {
                 handlers_copy = this->handlers;
                 waiters_copy = std::move(this->pending);
                 this->pending.clear();
+                for (auto &slot : waiters_copy) slot->queued.store(false, std::memory_order_release);
             }
 
             for (auto &slot : waiters_copy) {
@@ -157,28 +165,109 @@ namespace Telegraph {
         struct NextSlot {
             std::coroutine_handle<> handle{};
             std::optional<std::tuple<Args...>> value;
+            std::atomic<bool> queued{false};
         };
 
         /**
          * @brief Awaiter returned from @ref next. Suspends until the next
          *        emission, then resumes with a tuple of the emitted args.
+         *        Cancellable (see @c Cancellation.h): inside a stopped scope
+         *        it leaves the pending list and throws
+         *        @c YarnBall::CancelledException; a frame destroyed while
+         *        parked also leaves it.
          */
         struct NextAwaiter {
             Signal *sig;
             std::shared_ptr<NextSlot> slot;
 
+            NextAwaiter(Signal *s, std::shared_ptr<NextSlot> sl) noexcept
+                : sig(s), slot(std::move(sl)) {
+            }
+            NextAwaiter(const NextAwaiter &) = delete;
+            NextAwaiter &operator=(const NextAwaiter &) = delete;
+
+            ~NextAwaiter() {
+                this->bind.disarm();
+                if (!this->proxy) return;
+                bool removed = false;
+                if (this->slot->queued.load(std::memory_order_acquire)) {
+                    std::lock_guard<std::mutex> lk(sig->mu);
+                    if (this->slot->queued.load(std::memory_order_relaxed)) {
+                        this->unlinkLocked();
+                        removed = true;
+                    }
+                }
+                this->proxy.retire(removed);
+            }
+
             bool await_ready() const noexcept { return false; }
 
-            bool await_suspend(std::coroutine_handle<> h) {
-                std::lock_guard<std::mutex> lk(sig->mu);
-                slot->handle = h;
-                sig->pending.push_back(slot);
-                return true;
+            template<typename Promise>
+            bool await_suspend(std::coroutine_handle<Promise> h) {
+                YarnBall::detail::TaskPromiseCore *core = YarnBall::detail::CancelBinding::ambient(h);
+                bool armed = false;
+                for (;;) {
+                    {
+                        std::lock_guard<std::mutex> lk(sig->mu);
+                        if (this->earlyCancel) {
+                            this->cancelled = true;
+                            return false;
+                        }
+                        if (!core || armed) {
+                            slot->handle = this->proxy.publish(h);
+                            slot->queued.store(true, std::memory_order_release);
+                            sig->pending.push_back(slot);
+                            return true;
+                        }
+                        if (core->isCancellationRequested()) {
+                            this->cancelled = true;
+                            return false;
+                        }
+                    }
+                    this->bind.arm(core, &NextAwaiter::cancelThunk, this);
+                    armed = true;
+                }
             }
 
             std::tuple<Args...> await_resume() {
+                if (this->cancelled) throw YarnBall::CancelledException{};
                 return std::move(*slot->value);
             }
+
+        private:
+            void unlinkLocked() noexcept {
+                auto it = std::find(sig->pending.begin(), sig->pending.end(), this->slot);
+                if (it != sig->pending.end()) sig->pending.erase(it);
+                this->slot->queued.store(false, std::memory_order_release);
+            }
+
+            static void cancelThunk(void *p) noexcept {
+                auto *self = static_cast<NextAwaiter *>(p);
+                std::coroutine_handle<> h{};
+                {
+                    std::lock_guard<std::mutex> lk(self->sig->mu);
+                    if (self->slot->queued.load(std::memory_order_relaxed)) {
+                        h = self->slot->handle;
+                        self->unlinkLocked();
+                        self->cancelled = true;
+                    } else {
+                        self->earlyCancel = true;
+                    }
+                }
+                if (h) {
+                    try {
+                        std::unique_ptr<YarnBall::ITask> ct{new YarnBall::detail::CoroutineITask(h)};
+                        YarnBall::Yarn::instance()->run(std::move(ct));
+                    } catch (...) {
+                        h.resume();
+                    }
+                }
+            }
+
+            bool earlyCancel = false; // guarded by sig->mu
+            bool cancelled = false;
+            YarnBall::detail::WaitProxy proxy;
+            YarnBall::detail::CancelBinding bind;
         };
 
         /**

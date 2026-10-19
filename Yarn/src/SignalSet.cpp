@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cerrno>
 #include <cstring>
+#include <string>
 
 #if !defined(_WIN32)
 #include <fcntl.h>
@@ -37,12 +38,14 @@ namespace YarnBall {
          *        number.
          */
         extern "C" void manwe_signal_handler(int sig) {
+            const int savedErrno = errno;
             const int fd = g_signalWritePipe.load(std::memory_order_acquire);
             if (fd < 0) return;
             const unsigned char b = static_cast<unsigned char>(sig);
             // Async-signal-safe; ignore partial / EAGAIN — losing one
             // notification under extreme pressure is acceptable.
             (void) ::write(fd, &b, 1);
+            errno = savedErrno;
         }
     }
 
@@ -58,7 +61,8 @@ namespace YarnBall {
         // write does not stall if the pipe fills up.
         for (int fd : {this->pipeRead, this->pipeWrite}) {
             int flags = ::fcntl(fd, F_GETFL, 0);
-            if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            if (flags < 0 || ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0
+                || ::fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
                 const int e = errno;
                 ::close(this->pipeRead);
                 ::close(this->pipeWrite);
@@ -87,13 +91,26 @@ namespace YarnBall {
         // our handler returning EINTR.
         newAction.sa_flags = SA_RESTART;
 
+        // Reserve up front so the push_backs below cannot throw after a
+        // handler has already been replaced.
+        try {
+            this->installedSignals.reserve(signals.size());
+            this->originalActions.reserve(signals.size());
+        } catch (...) {
+            g_signalWritePipe.store(-1, std::memory_order_release);
+            ::close(this->pipeRead);
+            ::close(this->pipeWrite);
+            this->pipeRead = this->pipeWrite = -1;
+            throw;
+        }
+
         for (int sig : signals) {
             struct sigaction prev{};
             if (::sigaction(sig, &newAction, &prev) < 0) {
                 const int e = errno;
                 // Roll back: restore any handlers we already replaced,
                 // release the singleton claim, close the pipe.
-                for (std::size_t i = 0; i < this->installedSignals.size(); ++i) {
+                for (std::size_t i = this->installedSignals.size(); i-- > 0;) {
                     (void) ::sigaction(this->installedSignals[i],
                                        &this->originalActions[i], nullptr);
                 }
@@ -111,7 +128,9 @@ namespace YarnBall {
     }
 
     SignalSet::~SignalSet() {
-        for (std::size_t i = 0; i < this->installedSignals.size(); ++i) {
+        // Reverse order so a signal listed twice ends up with its true
+        // original handler rather than ours.
+        for (std::size_t i = this->installedSignals.size(); i-- > 0;) {
             (void) ::sigaction(this->installedSignals[i],
                                 &this->originalActions[i], nullptr);
         }
@@ -120,21 +139,28 @@ namespace YarnBall {
         // a still-open descriptor.
         g_signalWritePipe.store(-1, std::memory_order_release);
         if (this->pipeWrite >= 0) ::close(this->pipeWrite);
-        if (this->pipeRead >= 0) ::close(this->pipeRead);
+        if (this->pipeRead >= 0) {
+            // A next() parked on the read end would otherwise stay parked forever once the fd is closed: wake it so it
+            // reads the closed pipe and throws.
+            Reactor::instance()->cancelFd(this->pipeRead);
+            ::close(this->pipeRead);
+        }
     }
 
     YarnBall::Task<int> SignalSet::next() {
+        // Copied: a waiter woken by the destructor must not touch the (possibly gone) object again.
+        const int fd = this->pipeRead;
         while (true) {
             unsigned char b = 0;
             ::ssize_t n;
             do {
-                n = ::read(this->pipeRead, &b, 1);
+                n = ::read(fd, &b, 1);
             } while (n < 0 && errno == EINTR);
 
             if (n == 1) co_return static_cast<int>(b);
 
             if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                co_await YarnBall::io::waitReadable(this->pipeRead);
+                co_await YarnBall::io::waitReadable(fd);
                 continue;
             }
             if (n == 0) {

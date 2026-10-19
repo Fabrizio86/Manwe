@@ -10,16 +10,67 @@
 #include <exception>
 #include <random>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 #ifndef _WIN32
 #include <csignal>
 #endif
 
+#include "Coroutines.h"
+#include "Log.h"
 #include "RandomScheduler.hpp"
 #include "SmallObjectPool.h"
 
 namespace YarnBall {
+
+    namespace {
+        /**
+         * @brief Handler slot for exceptions escaping detached tasks. Leaked on
+         *        purpose: detached tasks can finish during static teardown.
+         */
+        struct UnhandledState {
+            std::mutex mu;
+            UnhandledExceptionHandler handler;
+        };
+
+        UnhandledState &unhandledState() {
+            static UnhandledState *st = new UnhandledState;
+            return *st;
+        }
+    }
+
+    void setUnhandledExceptionHandler(UnhandledExceptionHandler handler) {
+        auto &st = unhandledState();
+        std::lock_guard<std::mutex> lk(st.mu);
+        st.handler = std::move(handler);
+    }
+
+    void detail::reportDetachedException(std::exception_ptr e) noexcept {
+        std::string what = "unknown exception";
+        try {
+            std::rethrow_exception(e);
+        } catch (const CancelledException &) {
+            return;
+        } catch (const std::exception &ex) {
+            what = ex.what();
+        } catch (...) {
+        }
+        try {
+            UnhandledExceptionHandler handler;
+            {
+                auto &st = unhandledState();
+                std::lock_guard<std::mutex> lk(st.mu);
+                handler = st.handler;
+            }
+            if (handler) {
+                handler(e);
+            } else {
+                log::error("unhandled exception in detached task", {log::str("what", what)});
+            }
+        } catch (...) {
+        }
+    }
 
     namespace {
         /**
@@ -136,19 +187,33 @@ namespace YarnBall {
         };
     } // namespace
 
-    int Yarn::MinThreadCount = std::max<int>(
-        kMinThreadsFloor,
-        static_cast<int>(std::thread::hardware_concurrency()));
-
-    int Yarn::MaxThreadCount = std::max<int>(
-        Yarn::MinThreadCount,
-        static_cast<int>(std::floor(Yarn::MinThreadCount * kOptimalMultiplier)));
+    // Constant-initialised (no dynamic init), then computed on first Yarn construction, so a Yarn::instance() call made
+    // from another translation unit's static initialiser cannot observe zeros or be overwritten afterwards.
+    int Yarn::MinThreadCount = 0;
+    int Yarn::MaxThreadCount = 0;
 
     /**
      * @brief Thread-local PRNG for stealing victim selection. Per-worker
      *        state eliminates the shared rng mutex on the hot path.
      */
     static thread_local std::mt19937 tls_stealRng{std::random_device{}()};
+
+    namespace {
+        void computeThreadCounts(int &minCount, int &maxCount) {
+            minCount = std::max<int>(
+                kMinThreadsFloor,
+                static_cast<int>(std::thread::hardware_concurrency()));
+            maxCount = std::max<int>(
+                minCount,
+                static_cast<int>(std::floor(minCount * kOptimalMultiplier)));
+        }
+
+        // Runs before the member initialisers below (which size queues from nothing, but keep the order explicit).
+        inline bool threadCountsInit(int &minCount, int &maxCount) {
+            computeThreadCounts(minCount, maxCount);
+            return true;
+        }
+    }
 
     Yarn::Yarn()
         : injection(std::make_shared<InjectionQueue>(QueueSize::Huge)),
@@ -162,6 +227,7 @@ namespace YarnBall {
         // can re-install their own handler after Yarn::instance().
         std::signal(SIGPIPE, SIG_IGN);
 #endif
+        threadCountsInit(Yarn::MinThreadCount, Yarn::MaxThreadCount);
         std::lock_guard<std::mutex> lk(this->cmu);
         this->fibers.resize(Yarn::MaxThreadCount);
         for (int i = 0; i < Yarn::MinThreadCount; ++i) {
@@ -332,7 +398,8 @@ namespace YarnBall {
             int newId = this->maybeGrowLocked();
             if (newId >= 0 && this->fibers[newId]) grown = this->fibers[newId];
         }
-        if (grown && grown->seed(task)) return;
+        // The deque is single-producer (owner only); this thread is a foreign producer, so go through the MPMC inbox.
+        if (grown && grown->tryPushInbox(task)) return;
 
         // Trampoline instead of recurse -- see tlsInlineDrainQueue's
         // comment for the full rationale. A nested re-entry (this
@@ -425,6 +492,9 @@ namespace YarnBall {
         // copy, no shared_ptr ref-count traffic. Steady-state submit
         // loads with all workers busy hit this branch unconditionally,
         // which is the win the parkedWorkers counter exists for.
+        // The caller has just published work (queue enqueue); pairs with the fence in Fiber::park() so a worker that
+        // is about to sleep either is counted here or finds the work in its re-check.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
         if (this->parkedWorkers.load(std::memory_order_acquire) == 0) {
             return false;
         }
@@ -509,7 +579,13 @@ namespace YarnBall {
             TaskPtr t = nullptr;
             for (int i = 0; i < kPendingRefillBurst && this->injection->dequeue(t); ++i) {
                 if (!f->seed(t)) {
-                    this->injection->enqueue(t);
+                    if (!this->injection->enqueue(t)) {
+                        // Queue refilled by concurrent producers: run it here rather than drop it.
+                        try { t->run(); } catch (...) {
+                            try { t->exception(std::current_exception()); } catch (...) { }
+                        }
+                        delete t;
+                    }
                     break;
                 }
             }

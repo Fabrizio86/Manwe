@@ -70,6 +70,17 @@ namespace YarnBall::detail {
          */
         static void deallocate(void *p) noexcept {
             auto *node = static_cast<Node *>(p);
+            if (tlsCount == 0) {
+                // The local list is empty, so this thread may not have a flush-on-exit hook yet (blocks also arrive here
+                // from threads that only ever free). After the hook has run, bypass the thread cache entirely.
+                if (tlsDead) {
+                    std::lock_guard<std::mutex> lk(globalMu);
+                    node->next = globalHead;
+                    globalHead = node;
+                    return;
+                }
+                armThreadExit();
+            }
             node->next = tlsHead;
             tlsHead = node;
             ++tlsCount;
@@ -106,6 +117,8 @@ namespace YarnBall::detail {
          *        the local cache. Called when the local cache is empty.
          */
         static void refillFromGlobal() {
+            if (tlsDead) return;
+            armThreadExit();
             std::lock_guard<std::mutex> lk(globalMu);
             for (std::size_t i = 0; i < kBatchSize && globalHead != nullptr; ++i) {
                 Node *n = globalHead;
@@ -138,11 +151,47 @@ namespace YarnBall::detail {
         }
 
         /**
+         * @brief Return the whole local cache to the shared pool. Runs when
+         *        the owning thread exits (via @ref ThreadExitFlush), so the
+         *        blocks it cached are reusable instead of leaking.
+         */
+        static void flushLocal() noexcept {
+            Node *h = tlsHead;
+            tlsHead = nullptr;
+            tlsCount = 0;
+            if (!h) return;
+            Node *t = h;
+            while (t->next) t = t->next;
+            std::lock_guard<std::mutex> lk(globalMu);
+            t->next = globalHead;
+            globalHead = h;
+        }
+
+        struct ThreadExitFlush {
+            ~ThreadExitFlush() {
+                flushLocal();
+                tlsDead = true;
+            }
+        };
+
+        /**
+         * @brief Make sure this thread's exit flushes its cache. A
+         *        function-local thread_local registers its destructor on
+         *        first use; this is only reached when the local list is
+         *        empty, never on the allocate/free fast path.
+         */
+        static void armThreadExit() noexcept {
+            static thread_local ThreadExitFlush hook;
+            (void) hook;
+        }
+
+        /**
          * @brief Thread-local LIFO cache. Single-producer / single-consumer
          *        (the thread itself), so no atomics needed.
          */
         static thread_local Node *tlsHead;
         static thread_local std::size_t tlsCount;
+        static thread_local bool tlsDead;
 
         /**
          * @brief Shared pool. Protected by @c globalMu; touched only on
@@ -158,6 +207,9 @@ namespace YarnBall::detail {
 
     template<std::size_t SlotSize>
     thread_local std::size_t SmallObjectPool<SlotSize>::tlsCount = 0;
+
+    template<std::size_t SlotSize>
+    thread_local bool SmallObjectPool<SlotSize>::tlsDead = false;
 
     template<std::size_t SlotSize>
     typename SmallObjectPool<SlotSize>::Node *
@@ -190,6 +242,8 @@ namespace YarnBall::detail {
      */
     template<typename T>
     inline void *poolAlloc() {
+        static_assert(alignof(T) <= alignof(std::max_align_t),
+                      "SmallObjectPool does not support over-aligned types");
         return SmallObjectPool<poolSlotSize<sizeof(T), alignof(T)>()>::allocate();
     }
 

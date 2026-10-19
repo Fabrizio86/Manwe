@@ -33,6 +33,7 @@
 #include <coroutine>
 #include <cstddef>
 #include <exception>
+#include <memory>
 #include <optional>
 #include <type_traits>
 #include <utility>
@@ -148,6 +149,22 @@ namespace YarnBall {
                 this->current = std::addressof(value);
                 return {};
             }
+
+            /**
+             * @brief @c co_yield of a const lvalue. The consumer may move
+             *        from the yielded value, so a const object cannot be
+             *        handed over by pointer; it is copied into the promise
+             *        first (requires @c T to be copy-constructible, and only
+             *        when this overload is actually used).
+             */
+            YieldAwaiter yield_value(const T &value) noexcept(std::is_nothrow_copy_constructible_v<T>) {
+                this->copy.emplace(value);
+                this->current = std::addressof(*this->copy);
+                return {};
+            }
+
+            /// Storage for a value yielded by const reference.
+            std::optional<T> copy;
         };
 
     } // namespace detail
@@ -352,7 +369,6 @@ namespace YarnBall {
         for (auto _yfa_opt = co_await _yfa_stream.next();                        \
              _yfa_opt.has_value();                                               \
              _yfa_opt = co_await _yfa_stream.next())                             \
-            for (bool _yfa_once = true; _yfa_once; _yfa_once = false)            \
-                for (decl = std::move(*_yfa_opt); _yfa_once; _yfa_once = false)
+            if (decl = std::move(*_yfa_opt); false) {} else
 
 #endif // YARN_STREAM_H

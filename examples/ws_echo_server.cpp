@@ -1,9 +1,9 @@
 //
 // examples/ws_echo_server.cpp -- Minimal WebSocket echo server.
 //
-// Demonstrates: Soccer::WsConnection::serverHandshake on top of an
-// existing TcpListener, plus the receive/send/close coroutine API.
-// Each accepted client gets its own coroutine via coSpawn, so the
+// Demonstrates: Soccer::wsServe (accept loop, handshake, connection cap,
+// Origin policy) on top of a TcpListener, plus the receive/send/close
+// coroutine API. Each accepted client gets its own coroutine, so the
 // listener stays responsive while clients chat.
 //
 // Run with no args to listen on 0.0.0.0:8080, or pass a port number.
@@ -16,6 +16,7 @@
 // or from `wscat -c ws://127.0.0.1:8080`.
 //
 
+#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
@@ -29,13 +30,12 @@
 constexpr std::uint16_t kDefaultPort = 8080;
 
 /**
- * @brief Echo coroutine: complete the WebSocket handshake on the
- *        accepted stream, then loop receive -> send back until the
- *        peer closes or a protocol error fires.
+ * @brief Echo coroutine: runs once wsServe has completed the WebSocket
+ *        handshake, then loops receive -> send back until the peer
+ *        closes or a protocol error fires.
  */
-YarnBall::Task<void> ws_echo_one(Soccer::TcpStream client) {
+YarnBall::Task<void> ws_echo_one(Soccer::WsConnection ws) {
     try {
-        auto ws = co_await Soccer::WsConnection::serverHandshake(std::move(client));
         while (ws.isOpen()) {
             auto msg = co_await ws.receive();
             if (msg.type == Soccer::WsMessageType::Text) {
@@ -58,15 +58,31 @@ YarnBall::Task<void> ws_echo_server(std::uint16_t port) {
     auto listener = Soccer::TcpListener::bind("0.0.0.0", port);
     std::cout << "ws_echo_server listening on "
               << listener.localAddress().to_string() << "\n";
-    while (true) {
-        auto client = co_await listener.accept();
-        YarnBall::coSpawn(ws_echo_one(std::move(client)));
+    // wsServe runs the accept loop and the opening handshake for us and applies the
+    // limits below: at most 1000 clients at once, a 10 s handshake, and (uncomment
+    // allowedOrigins) an Origin allow-list against cross-site WebSocket hijacking.
+    Soccer::WsOptions options;
+    options.maxConnections = 1000;
+    options.handshakeTimeout = std::chrono::seconds{10};
+    // options.allowedOrigins = {"https://app.example.com"};
+    co_await Soccer::wsServe(std::move(listener), ws_echo_one, options);
+}
+
+/// Parse a TCP port (0-65535); exits with a message on bad input instead
+/// of silently truncating through a narrowing cast.
+static std::uint16_t parsePort(const char *text) {
+    char *end = nullptr;
+    const long v = std::strtol(text, &end, 10);
+    if (end == text || *end != '\0' || v < 0 || v > 65535) {
+        std::cerr << "invalid port: " << text << "\n";
+        std::exit(1);
     }
+    return static_cast<std::uint16_t>(v);
 }
 
 int main(int argc, char **argv) {
     const std::uint16_t port = (argc > 1)
-        ? static_cast<std::uint16_t>(std::atoi(argv[1]))
+        ? parsePort(argv[1])
         : kDefaultPort;
     YarnBall::syncWait(ws_echo_server(port));
     return 0;

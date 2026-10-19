@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <functional>
 #include <initializer_list>
+#include <locale>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -82,8 +83,13 @@ namespace YarnBall::log {
      *        so locale-independent decimal notation.
      */
     inline Field f64(std::string key, double value) {
+        // JSON has no NaN/Inf literals.
+        if (!(value == value) || value > 1.7976931348623157e308 || value < -1.7976931348623157e308) {
+            return Field{std::move(key), "null"};
+        }
         std::ostringstream os;
         os.imbue(std::locale::classic());
+        os.precision(17);
         os << value;
         return Field{std::move(key), os.str()};
     }

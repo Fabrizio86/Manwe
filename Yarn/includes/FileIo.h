@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <fstream>
 #include <ios>
+#include <iterator>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -117,6 +118,12 @@ namespace YarnBall::fs {
                     break;
             }
             f.stream.open(path, flags);
+            if (!f.stream.is_open() && mode == OpenMode::ReadWrite) {
+                // in|out does not create; touch the file, then reopen.
+                { std::ofstream touch(path, std::ios_base::binary | std::ios_base::app); }
+                f.stream.clear();
+                f.stream.open(path, flags);
+            }
             if (!f.stream.is_open()) {
                 throw FileIoError("open(" + path + ") failed");
             }

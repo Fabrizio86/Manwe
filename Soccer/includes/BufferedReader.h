@@ -128,7 +128,9 @@ namespace Soccer {
          */
         YarnBall::Task<std::vector<std::byte>> readExact(std::size_t n) {
             std::vector<std::byte> out;
-            out.reserve(n);
+            // Do not trust n up front: a peer that announces a huge length and
+            // then sends nothing must not pin n bytes per connection.
+            out.reserve(std::min<std::size_t>(n, 64 * 1024));
             while (out.size() < n) {
                 if (this->readPos == this->writePos) {
                     if (this->eofObserved) co_return out;

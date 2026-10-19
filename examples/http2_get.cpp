@@ -6,7 +6,7 @@
 // public endpoints).
 //
 // Usage:
-//     ./http2_get                              # GET https://nghttp2.org/
+//     ./http2_get                              # h2c GET 127.0.0.1:8080/
 //     ./http2_get <host> <port>                # h2c GET <host>:<port>/
 //     ./http2_get <host> <port> <path>         # h2c GET path
 //     ./http2_get tls <host> <port> <path>     # h2 over TLS
@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <string>
 
@@ -49,9 +50,16 @@ namespace {
         try {
             Soccer::TlsClientOptions opts;
             opts.alpnProtocols = "h2";
-            // Use the system trust store path on macOS / Linux. Adjust if
-            // your distro keeps the CA bundle elsewhere.
-            opts.caBundleFile = "/etc/ssl/cert.pem";
+            // Pick the first CA bundle that exists (macOS/BSD vs Debian
+            // vs RHEL layouts).
+            for (const char *cand : {"/etc/ssl/cert.pem",
+                                     "/etc/ssl/certs/ca-certificates.crt",
+                                     "/etc/pki/tls/certs/ca-bundle.crt"}) {
+                if (std::filesystem::exists(cand)) {
+                    opts.caBundleFile = cand;
+                    break;
+                }
+            }
 
             auto conn = co_await Soccer::Http2Connection::connect(host, port, opts);
             auto resp = co_await conn.request("GET", path);

@@ -19,6 +19,7 @@
 //     curl -v http://127.0.0.1:8080/count
 //     curl -v -X POST -d 'hello' http://127.0.0.1:8080/echo
 
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
@@ -44,12 +45,24 @@ namespace {
 
 }
 
+/// Parse a TCP port (0-65535); exits with a message on bad input instead
+/// of silently truncating through a narrowing cast.
+static std::uint16_t parsePort(const char *text) {
+    char *end = nullptr;
+    const long v = std::strtol(text, &end, 10);
+    if (end == text || *end != '\0' || v < 0 || v > 65535) {
+        std::cerr << "invalid port: " << text << "\n";
+        std::exit(1);
+    }
+    return static_cast<std::uint16_t>(v);
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) {
         std::cerr << "usage: " << argv[0] << " <port>\n";
         return 1;
     }
-    const std::uint16_t port = static_cast<std::uint16_t>(std::atoi(argv[1]));
+    const std::uint16_t port = parsePort(argv[1]);
 
     auto counter = std::make_shared<Counter>();
     Soccer::HttpServer server("0.0.0.0", port);

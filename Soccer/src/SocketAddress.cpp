@@ -47,7 +47,15 @@ namespace Soccer {
 
         const std::string port_str = std::to_string(port);
         addrinfo *results = nullptr;
-        const int rc = ::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &results);
+        int rc = ::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &results);
+        if (rc != 0 || results == nullptr) {
+            // AI_ADDRCONFIG hides every family the host has no non-loopback
+            // address for, which makes even "localhost" unresolvable on a machine
+            // (or container) whose only interface is the loopback. Retry without it.
+            if (results) { ::freeaddrinfo(results); results = nullptr; }
+            hints.ai_flags = 0;
+            rc = ::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &results);
+        }
         if (rc != 0 || results == nullptr) {
             // gai_strerror exists on both POSIX and Windows (via ws2tcpip.h);
             // on Windows it is the ANSI variant gai_strerrorA under the hood.
@@ -62,6 +70,9 @@ namespace Soccer {
         // instead of failing outright when the first is unreachable.
         std::vector<SocketAddress> out;
         for (addrinfo *p = results; p != nullptr; p = p->ai_next) {
+            // ai_socktype is 0 in the hints, so each address comes back once
+            // per socket type; keep a single entry per address.
+            if (p->ai_socktype != results->ai_socktype) continue;
             out.emplace_back(p->ai_addr, static_cast<socklen_t>(p->ai_addrlen));
         }
         ::freeaddrinfo(results);

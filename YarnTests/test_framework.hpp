@@ -6,10 +6,12 @@
 #define YARN_TEST_FRAMEWORK_HPP
 
 #include <chrono>
+#include <cstdlib>
 #include <exception>
 #include <functional>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -62,7 +64,10 @@ namespace test {
         int passed = 0;
         int failed = 0;
         std::vector<std::string> failures;
+        // TEST_FILTER=substr runs only the tests whose name contains it.
+        const char *filter = std::getenv("TEST_FILTER");
         for (const auto &tc : registry()) {
+            if (filter && *filter && std::string(tc.name).find(filter) == std::string::npos) continue;
             auto start = std::chrono::steady_clock::now();
             std::cout << "[ RUN  ] " << tc.name << std::endl;
             try {
@@ -128,11 +133,13 @@ namespace test {
 /**
  * @def EXPECT_EQ(a, b)
  * @brief Assert @c a == @c b. Both operands must be streamable to ostream.
+ *        The operands are copied: binding a reference would dangle for an
+ *        lvalue that lives inside a temporary (e.g. @c *queue.pop_front()).
  */
 #define EXPECT_EQ(a, b)                                                       \
     do {                                                                      \
-        auto &&_a = (a);                                                      \
-        auto &&_b = (b);                                                      \
+        const auto _a = (a);                                                  \
+        const auto _b = (b);                                                  \
         if (!(_a == _b)) {                                                    \
             std::ostringstream _os;                                           \
             _os << __FILE__ << ":" << __LINE__                                \
@@ -147,8 +154,8 @@ namespace test {
  */
 #define EXPECT_NE(a, b)                                                       \
     do {                                                                      \
-        auto &&_a = (a);                                                      \
-        auto &&_b = (b);                                                      \
+        const auto _a = (a);                                                  \
+        const auto _b = (b);                                                  \
         if (_a == _b) {                                                       \
             std::ostringstream _os;                                           \
             _os << __FILE__ << ":" << __LINE__                                \

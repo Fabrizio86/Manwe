@@ -19,9 +19,14 @@
 
 #include "Coroutines.h"
 #include "Soccer.h"
+#include "Timeout.h"
 #include "Yarn.hpp"
 
 using clk = std::chrono::steady_clock;
+using namespace std::chrono_literals;
+
+// A lost echo reply must not hang the loop: each ping gets this long, after which the pending recv is cancelled.
+constexpr auto kPingTimeout = 1s;
 
 /**
  * @brief Send one Echo Request, wait for the matching Echo Reply, return
@@ -63,9 +68,11 @@ YarnBall::Task<void> ping_loop(std::string target, int count) {
     const auto identifier = static_cast<std::uint16_t>(::getpid() & 0xFFFFu);
     for (int i = 1; i <= count; ++i) {
         try {
-            const long long us =
-                co_await ping_one(sock, dest, identifier, static_cast<std::uint16_t>(i));
+            const long long us = co_await YarnBall::withTimeout(
+                ping_one(sock, dest, identifier, static_cast<std::uint16_t>(i)), kPingTimeout);
             std::printf("seq=%d time=%.3f ms\n", i, static_cast<double>(us) / 1000.0);
+        } catch (const YarnBall::TimeoutException &) {
+            std::printf("seq=%d timeout\n", i);
         } catch (const Soccer::SocketException &e) {
             std::cerr << "seq=" << i << " error: " << e.what() << "\n";
         }

@@ -8,10 +8,15 @@
 #include <atomic>
 #include <coroutine>
 #include <condition_variable>
+#include <cstdint>
 #include <exception>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <new>
+#include <stdexcept>
+#include <stop_token>
+#include <thread>
 #include <type_traits>
 #include <utility>
 
@@ -44,7 +49,64 @@ namespace YarnBall {
         }
     };
 
+    /**
+     * @brief Handler invoked when a detached (@c coSpawn) task finishes by
+     *        throwing. Nobody awaits a detached task, so without a handler
+     *        the exception would be lost.
+     */
+    using UnhandledExceptionHandler = std::function<void(std::exception_ptr)>;
+
+    /**
+     * @brief Install the process-wide handler for exceptions escaping
+     *        detached tasks. Pass an empty function to restore the
+     *        default, which writes an error line through @c log::error.
+     *        @c CancelledException (an expected way for a cancelled task
+     *        to end) is never reported. The handler may run on any Yarn
+     *        worker and must not throw. Thread-safe.
+     */
+    void setUnhandledExceptionHandler(UnhandledExceptionHandler handler);
+
     namespace detail {
+
+        /**
+         * @brief Route @p e to the active unhandled-exception handler.
+         *        Defined in Yarn.cpp.
+         */
+        void reportDetachedException(std::exception_ptr e) noexcept;
+
+        struct TaskPromiseCore;
+
+        /**
+         * @brief Intrusive registration of a parked await (or a scope
+         *        forwarder) with the chain-cancel registry of the root of
+         *        its @c co_await chain, so @c Task::requestCancel on any task
+         *        of that chain can wake it. Lives inside the owning awaiter.
+         *        See @ref armCancelHook / @ref requestChainCancel.
+         */
+        struct CancelHook {
+            void (*fn)(void *) = nullptr;
+            void *ctx = nullptr;
+            TaskPromiseCore *leaf = nullptr;
+            std::atomic<TaskPromiseCore *> root{nullptr}; // non-null while linked
+            CancelHook *prev = nullptr;
+            CancelHook *next = nullptr;
+            std::atomic<bool> firing{false};
+            std::thread::id firer{};
+            bool *abandoned = nullptr;
+        };
+
+        /**
+         * @brief Lock guarding the hook list of the chain rooted at @p root
+         *        (striped: roots hash onto a fixed set of mutexes). Lock
+         *        order: this lock, then the mutex of whatever primitive a
+         *        hook's callback takes; no code arms or disarms a hook while
+         *        holding such a primitive mutex.
+         */
+        inline std::mutex &chainCancelLock(const void *root) noexcept {
+            // Immortal: a detached coroutine can still be torn down by a worker while static destructors run.
+            static std::mutex *const stripes = new std::mutex[64];
+            return stripes[(reinterpret_cast<std::uintptr_t>(root) >> 6) % 64];
+        }
 
         /**
          * @brief Non-template core base for every Task promise. Holds the
@@ -72,7 +134,66 @@ namespace YarnBall {
              *        awaiter is a non-Task coroutine (e.g. @c SyncWaitTask).
              *        Set once in @c Task::Awaiter::await_suspend.
              */
-            TaskPromiseCore *parent{nullptr};
+            std::atomic<TaskPromiseCore *> parent{nullptr};
+
+            /**
+             * @brief Head of the chain-cancel hook list; meaningful only on
+             *        the root of a chain (a promise with no parent). Guarded
+             *        by @ref chainCancelLock.
+             */
+            CancelHook *hooks{nullptr};
+
+            /**
+             * @brief Set when the coroutine reaches its final suspend, i.e.
+             *        before its frame can go away together with the chain
+             *        above it. @ref pins keeps that from happening while
+             *        Task::requestCancel walks the chain.
+             */
+            std::atomic<bool> finishing{false};
+            std::atomic<int> pins{0};
+
+            /**
+             * @brief Cancellation scope installed on this coroutine (see
+             *        @c Cancellation.h), or @c nullptr. Points at a token
+             *        that lives in this coroutine's own frame. Cancellable
+             *        awaits below this promise park against the nearest
+             *        scope found by walking @c parent.
+             */
+            const std::stop_token *scope{nullptr};
+
+            /**
+             * @brief Nearest cancellation scope at or above this promise,
+             *        or @c nullptr when the chain is not inside one.
+             */
+            const std::stop_token *cancelToken() const noexcept {
+                const TaskPromiseCore *p = this;
+                while (p) {
+                    if (p->scope) return p->scope;
+                    p = p->parent.load(std::memory_order_acquire);
+                }
+                return nullptr;
+            }
+
+            /**
+             * @brief Top of the @c co_await chain this promise sits in.
+             */
+            TaskPromiseCore *chainRoot() noexcept {
+                TaskPromiseCore *p = this;
+                while (TaskPromiseCore *q = p->parent.load(std::memory_order_acquire)) p = q;
+                return p;
+            }
+
+            /**
+             * @brief @c true if @p x is this promise or one of its ancestors.
+             */
+            bool inChainOf(const TaskPromiseCore *x) const noexcept {
+                const TaskPromiseCore *p = this;
+                while (p) {
+                    if (p == x) return true;
+                    p = p->parent.load(std::memory_order_acquire);
+                }
+                return false;
+            }
 
             /**
              * @brief Trace context carried by this coroutine. Lives in
@@ -86,7 +207,8 @@ namespace YarnBall {
 
             /**
              * @brief @c true if this promise or any ancestor has been
-             *        marked cancelled. Walks the parent chain with
+             *        marked cancelled or sits in a stopped cancellation
+             *        scope. Walks the parent chain with
              *        acquire loads. O(depth) — bounded by user code's
              *        @c co_await nesting depth.
              */
@@ -94,7 +216,8 @@ namespace YarnBall {
                 const TaskPromiseCore *p = this;
                 while (p) {
                     if (p->cancelled.load(std::memory_order_acquire)) return true;
-                    p = p->parent;
+                    if (p->scope && p->scope->stop_requested()) return true;
+                    p = p->parent.load(std::memory_order_acquire);
                 }
                 return false;
             }
@@ -108,11 +231,124 @@ namespace YarnBall {
                 const TaskPromiseCore *p = this;
                 while (p) {
                     if (!p->traceCtx.empty()) return p->traceCtx;
-                    p = p->parent;
+                    p = p->parent.load(std::memory_order_acquire);
                 }
                 return {};
             }
         };
+
+        /**
+         * @brief Link @p h into the registry of the chain @p leaf belongs
+         *        to, so that @ref requestChainCancel on @p leaf or any ancestor
+         *        calls @p fn(@p ctx) once. If @p leaf's chain is already
+         *        cancelled, @p fn runs inline before this returns (a cancel
+         *        that raced the registration is therefore never lost: the
+         *        flag is stored before the registry is scanned, and read here
+         *        after the hook is linked).
+         */
+        inline void armCancelHook(CancelHook &h, TaskPromiseCore *leaf, void (*fn)(void *), void *ctx) noexcept {
+            h.fn = fn;
+            h.ctx = ctx;
+            h.leaf = leaf;
+            TaskPromiseCore *root = leaf->chainRoot();
+            {
+                std::lock_guard<std::mutex> lk(chainCancelLock(root));
+                h.prev = nullptr;
+                h.next = root->hooks;
+                if (root->hooks) root->hooks->prev = &h;
+                root->hooks = &h;
+                h.root.store(root, std::memory_order_relaxed);
+            }
+            if (leaf->isCancellationRequested()) fn(ctx);
+        }
+
+        /**
+         * @brief Unlink @p h. If a @ref runTakenHooks is running its
+         *        callback on another thread this waits for it, so the owner
+         *        may free @p h afterwards. Idempotent; a hook that was never
+         *        armed is a no-op.
+         */
+        inline void disarmCancelHook(CancelHook &h) noexcept {
+            if (TaskPromiseCore *root = h.root.load(std::memory_order_relaxed)) {
+                std::lock_guard<std::mutex> lk(chainCancelLock(root));
+                if (h.root.load(std::memory_order_relaxed) == root) {
+                    if (h.prev) h.prev->next = h.next; else root->hooks = h.next;
+                    if (h.next) h.next->prev = h.prev;
+                    h.prev = h.next = nullptr;
+                    h.root.store(nullptr, std::memory_order_relaxed);
+                    return;
+                }
+            }
+            // Unlinked by a fire: its callback may still be running.
+            if (h.firing.load(std::memory_order_acquire)) {
+                if (h.firer == std::this_thread::get_id()) {
+                    // Called from inside the callback itself (an inline resume): the firing thread must not touch h again.
+                    if (h.abandoned) *h.abandoned = true;
+                    return;
+                }
+                while (h.firing.load(std::memory_order_acquire)) std::this_thread::yield();
+            }
+        }
+
+        /**
+         * @brief Unlink every hook whose leaf sits at or below @p x and
+         *        return them as a list (through @c next) for
+         *        @ref runTakenHooks. The caller must have @p x pinned.
+         */
+        inline CancelHook *takeChainHooks(TaskPromiseCore *x) noexcept {
+            TaskPromiseCore *root = x->chainRoot();
+            CancelHook *taken = nullptr;
+            std::lock_guard<std::mutex> lk(chainCancelLock(root));
+            for (CancelHook *h = root->hooks; h;) {
+                CancelHook *nx = h->next;
+                if (h->leaf->inChainOf(x)) {
+                    if (h->prev) h->prev->next = h->next; else root->hooks = h->next;
+                    if (h->next) h->next->prev = h->prev;
+                    h->root.store(nullptr, std::memory_order_relaxed);
+                    h->firer = std::this_thread::get_id();
+                    h->abandoned = nullptr;
+                    h->firing.store(true, std::memory_order_release);
+                    h->prev = nullptr;
+                    h->next = taken;
+                    taken = h;
+                }
+                h = nx;
+            }
+            return taken;
+        }
+
+        /**
+         * @brief Run the callbacks of hooks returned by @ref takeChainHooks.
+         *        Each hook fires at most once; a hook's owner may be freed
+         *        as soon as its callback has run (its disarm waits for it).
+         */
+        inline void runTakenHooks(CancelHook *taken) noexcept {
+            while (taken) {
+                CancelHook *h = taken;
+                taken = h->next;
+                bool abandoned = false;
+                h->abandoned = &abandoned;
+                const auto fn = h->fn;
+                void *const ctx = h->ctx;
+                fn(ctx);
+                if (!abandoned) h->firing.store(false, std::memory_order_release);
+            }
+        }
+
+        /**
+         * @brief Cancel request on @p x: set its flag and fire the hooks at
+         *        or below it. Safe against @p x completing concurrently (the
+         *        chain above a finished task may already be gone): the
+         *        completion waits for the walk, or the walk is skipped.
+         */
+        inline void requestChainCancel(TaskPromiseCore *x) noexcept {
+            x->cancelled.store(true, std::memory_order_seq_cst);
+            x->pins.fetch_add(1, std::memory_order_seq_cst);
+            CancelHook *taken = nullptr;
+            if (!x->finishing.load(std::memory_order_seq_cst)) taken = takeChainHooks(x);
+            x->pins.fetch_sub(1, std::memory_order_seq_cst);
+            runTakenHooks(taken);
+        }
 
         /**
          * @brief Common state for every Task promise: the continuation handle
@@ -177,9 +413,13 @@ namespace YarnBall {
                 template<typename Promise>
                 std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) noexcept {
                     auto &p = h.promise();
+                    // Let a concurrent Task::requestCancel finish walking the chain before it can be torn down.
+                    p.finishing.store(true, std::memory_order_seq_cst);
+                    while (p.pins.load(std::memory_order_seq_cst) != 0) std::this_thread::yield();
                     std::coroutine_handle<> next =
                         p.continuation ? p.continuation : std::noop_coroutine();
                     if (p.detached) {
+                        if (p.exception) reportDetachedException(p.exception);
                         h.destroy();
                         // `p` and `*this` are now invalid; only `next` is safe.
                     }
@@ -332,20 +572,21 @@ namespace YarnBall {
         handle_type getHandle() const noexcept { return this->handle; }
 
         /**
-         * @brief Mark this task (and via the parent chain, any task that
-         *        co_awaits it) as cancellation-requested. The task
-         *        observes the request only at points where it explicitly
-         *        polls — see @ref checkCancel.
+         * @brief Mark this task (and, via the parent chain, every task it
+         *        co_awaits) as cancellation-requested, and wake whatever of
+         *        them is parked in a cancellable await (see
+         *        @c Cancellation.h): the await throws @c CancelledException.
+         *        Work that is not parked observes the request at its next
+         *        cancellable await or @ref checkCancel poll.
          *
          * Safe to call from any thread. Idempotent. A no-op if the Task
-         * wrapper is empty or the coroutine has already completed; in
-         * the latter case the flag is still set on the promise but the
-         * coroutine will not observe it.
+         * wrapper is empty; if the coroutine has already completed the flag
+         * is still set on the promise but nothing is woken. The Task must
+         * not be destroyed while this call is running.
          */
         void requestCancel() noexcept {
-            if (this->handle) {
-                this->handle.promise().cancelled.store(true, std::memory_order_release);
-            }
+            if (!this->handle) return;
+            detail::requestChainCancel(&this->handle.promise());
         }
 
         /**
@@ -391,12 +632,14 @@ namespace YarnBall {
                 auto &p = this->handle.promise();
                 p.continuation = caller;
                 if constexpr (std::is_base_of_v<detail::TaskPromiseCore, CallerPromise>) {
-                    p.parent = static_cast<detail::TaskPromiseCore *>(&caller.promise());
+                    p.parent.store(static_cast<detail::TaskPromiseCore *>(&caller.promise()),
+                                   std::memory_order_release);
                 }
                 return this->handle;
             }
 
             decltype(auto) await_resume() {
+                if (!this->handle) throw std::logic_error("co_await on an empty Task");
                 if constexpr (std::is_void_v<T>) {
                     this->handle.promise().result();
                 } else {
@@ -933,13 +1176,23 @@ namespace YarnBall {
 
 
     /**
-     * @section cooperative_cancellation Cooperative cancellation with std::stop_token
+     * @section cooperative_cancellation Cancellation with std::stop_token
      *
-     * Yarn does not need a custom cancellation primitive: pass a
-     * @c std::stop_token as a parameter to your coroutine and check
-     * @c stop_token::stop_requested() at safe points. The token integrates
-     * naturally with the executor — the coroutine observes the request
-     * between awaits and exits via @c co_return.
+     * Cancellation uses plain @c std::stop_token. Two complementary ways
+     * to observe a request:
+     *
+     *  - Polling: pass a token to your coroutine and check
+     *    @c stop_requested() (or @c co_await checkCancel()) at safe points.
+     *  - Waking: run the work with @c withCancellation(token, task)
+     *    (Cancellation.h), or under @c whenAny / @c withTimeout, which do it
+     *    for their branches. Inside such a scope every parked await
+     *    (sleepFor, io::waitReadable/Writable, AsyncMutex & friends,
+     *    JoinHandle, Telegraph channels) is taken out of its queue when the
+     *    token is stopped and throws @c CancelledException, and
+     *    @c checkCancel() sees the scope too.
+     *  - Task::requestCancel: wakes the same parked awaits of the task and
+     *    of every task it co_awaits (and the scopes whenAny / whenAll /
+     *    withCancellation open below it), without any scope or token.
      *
      * Example:
      * @code
@@ -958,14 +1211,13 @@ namespace YarnBall {
      * src.request_stop();
      * @endcode
      *
-     * Reactor-suspended coroutines observe stop requests at their next
-     * awaited point. If you need stop to interrupt an in-flight syscall
-     * (e.g. a long @c waitReadable), close the fd from the stop-requester
-     * thread — the awaiter will resume with an error.
+     * To interrupt an fd wait without a scope, call
+     * @c Reactor::cancelFd(fd) from the code that owns the fd just before
+     * closing it; the parked coroutines resume and see the closed fd.
      *
-     * Auto-propagation of stop tokens to sub-tasks is NOT provided in v1;
-     * either pass the token explicitly to children or store it in shared
-     * state.
+     * Tokens are not propagated implicitly into tasks that are detached with
+     * @c coSpawn: pass the token explicitly or wrap the task in
+     * @c withCancellation.
      */
 
 }

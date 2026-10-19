@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.16)
+cmake_minimum_required(VERSION 3.20)
 project(Yarn VERSION 3.1.2)
 
 set(CMAKE_CXX_STANDARD 23)
@@ -18,8 +18,8 @@ endif ()
 # MSVC: keep std::min/max from being macroised by Windows headers, allow
 # the standards-conformant preprocessor that the coroutine machinery needs.
 if (MSVC)
-    add_compile_definitions(NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
-    add_compile_options(/Zc:preprocessor /EHsc /permissive-)
+    set(YARN_MSVC_DEFS NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
+    set(YARN_MSVC_OPTS /Zc:preprocessor /EHsc /permissive-)
 endif ()
 
 # ---- Optional Linux reactor backends -------------------------------------
@@ -50,12 +50,14 @@ add_library(Yarn STATIC
         includes/MPMCQueue.h
         includes/WorkStealingDeque.h
         includes/Coroutines.h
+        includes/Cancellation.h
         includes/Reactor.h
         src/Reactor.cpp
         includes/AsyncSync.h
         src/AsyncSync.cpp
         includes/IoAwaiters.h
         includes/PlatformNet.h
+        includes/SocketHandle.h
         includes/WindowsOverlapped.h
         includes/WhenAll.h
         includes/WhenAny.h
@@ -84,6 +86,16 @@ target_include_directories(Yarn PUBLIC
 if (WIN32)
     target_link_libraries(Yarn PUBLIC ws2_32 mswsock)
 endif ()
+
+# Propagate the MSVC definitions/options to every consumer (Soccer, tests, ...),
+# not just this directory.
+if (MSVC)
+    target_compile_definitions(Yarn PUBLIC ${YARN_MSVC_DEFS})
+    target_compile_options(Yarn PUBLIC ${YARN_MSVC_OPTS})
+endif ()
+
+find_package(Threads REQUIRED)
+target_link_libraries(Yarn PUBLIC Threads::Threads)
 
 # AppleClang's libc++ hides several C++20/23 facilities (notably
 # <stop_token>, the freestanding bits of <coroutine>, jthread) behind

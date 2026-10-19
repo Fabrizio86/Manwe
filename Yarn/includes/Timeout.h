@@ -2,10 +2,11 @@
 // Created by Fabrizio Paino on 2026-05-15.
 //
 // withTimeout: race a task against a sleep. If the task wins, returns
-// its value; if the sleep wins, throws TimeoutException. The "losing"
-// task keeps running on the Yarn pool to its natural completion --
-// C++ coroutines have no first-class cancellation, so plumb a
-// std::stop_token through if you need to actively shorten it.
+// its value; if the sleep wins, throws TimeoutException. The loser runs in
+// a cancellation scope (see Cancellation.h) stopped when the race is
+// decided: a task still parked in a cancellable await (I/O, lock, channel,
+// sleep, ...) is woken with CancelledException and unwinds; work that is
+// not parked finishes on its own and its result is discarded.
 //
 
 #ifndef YARN_TIMEOUT_H
@@ -31,11 +32,10 @@ namespace YarnBall {
      * @class TimeoutException
      * @brief Thrown by @ref withTimeout when the timer wins the race.
      *
-     * The losing user task is NOT cancelled (C++ coroutines do not
-     * support forced cancellation). It continues on the Yarn pool to
-     * its natural completion; its eventual result is discarded.
-     * Wire a @c std::stop_token through to the user task to actively
-     * shorten its wall-clock cost.
+     * On timeout the user task's cancellation scope is stopped: its
+     * parked cancellable awaits wake with @c CancelledException and it
+     * unwinds (see @c Cancellation.h). Work that is not parked in such
+     * an await finishes on the Yarn pool and its result is discarded.
      */
     class TimeoutException : public std::runtime_error {
     public:
@@ -96,10 +96,10 @@ namespace YarnBall {
      * Implementation: stores @p task's eventual result in a shared
      * @c optional and races the storer coroutine against a sleeper
      * via @ref whenAny. The whenAny result's @c index field tells
-     * us which side won. The loser keeps running until its own
-     * completion (C++ coroutines have no forced cancellation);
-     * pass a @c stop_token if you want to actively shorten the user
-     * side.
+     * us which side won. Whichever side loses is cancelled as
+     * described in @ref whenAny; in particular the sleeper is woken
+     * and torn down as soon as the task finishes, instead of keeping
+     * its frame alive for the whole timeout.
      */
     template<typename T, typename Rep, typename Period>
     Task<T> withTimeout(Task<T> task,

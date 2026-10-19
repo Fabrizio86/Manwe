@@ -33,7 +33,8 @@ int main() {
         std::cout << "[sync logger] room=" << room << " text=" << text << "\n";
     });
 
-    // Asynchronous historian (runs on a Yarn worker per emission).
+    // Slow historian: plain handlers run inline on emit(), and on a Yarn
+    // worker per emission only when fired through emitAsync().
     auto historian_id = chat.connect([](std::string text, int room) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
         std::cout << "[async historian] persisted room=" << room
@@ -42,6 +43,10 @@ int main() {
 
     // Coroutine awaiter for a single message.
     YarnBall::coSpawn(await_one_message(&chat));
+
+    // Give the spawned awaiter time to register: next() only catches
+    // emissions that happen after it has suspended.
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     std::cout << "-- emit (sync) --\n";
     chat.emit("hello", 1);

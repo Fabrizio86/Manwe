@@ -6,6 +6,7 @@
 
 #include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <stdexcept>
@@ -46,13 +47,30 @@
 
 namespace YarnBall {
 
+    namespace {
+        Reactor *g_reactorForExit = nullptr;
+    }
+
     Reactor *Reactor::instance() {
         // Force Yarn to construct first so its static-dtor runs AFTER ours.
         // We keep scheduling onto Yarn until our thread is joined; Yarn must
         // be alive for that window.
         Yarn::instance();
-        static Reactor inst;
-        return &inst;
+        // Immortal: coroutines that outlive main() (detached tasks closing sockets, withTimeout sleepers) may still
+        // call cancelFd & co. during static destruction. At exit only the loop thread is stopped and joined, at the
+        // point where the Reactor used to be destroyed, i.e. while Yarn (constructed first, destroyed last) is alive.
+        static Reactor *const inst = [] {
+            auto *r = new Reactor;
+            g_reactorForExit = r;
+            std::atexit([] { g_reactorForExit->retire(); });
+            return r;
+        }();
+        return inst;
+    }
+
+    void Reactor::retire() noexcept {
+        this->stop();
+        if (this->thread.joinable()) this->thread.join();
     }
 
     void Reactor::schedule(std::coroutine_handle<> h) noexcept {
@@ -101,20 +119,97 @@ namespace YarnBall {
         ::kevent(this->kq, &change, 1, nullptr, 0, nullptr);
     }
 
-    void Reactor::registerReadable(int fd, std::coroutine_handle<> h) noexcept {
-        struct kevent change;
-        EV_SET(&change, fd, EVFILT_READ, EV_ADD | EV_ONESHOT, 0, 0, h.address());
-        if (::kevent(this->kq, &change, 1, nullptr, 0, nullptr) < 0) {
-            this->schedule(h);
+    void Reactor::registerFd(int fd, std::coroutine_handle<> h, bool writable) noexcept {
+        bool refused = false;
+        std::vector<void *> stale;
+        {
+            // Hold fdMu across the kevent call: the readiness event can only be consumed by the run loop after the
+            // handle is in the table.
+            std::lock_guard<std::mutex> lk(this->fdMu);
+            detail::FdWaiters &w = this->fdWaiters[fd];
+            // Waiters already parked on this fd number must still have a live knote behind them. If it is gone, the fd
+            // they waited on was closed without cancelFd (the kernel dropped the knote) and this number has been
+            // reused: they would otherwise sit here until an unrelated socket's readiness woke them, or forever.
+            // Resume them; their next syscall reports the closed descriptor.
+            struct kevent probe;
+            if (!w.readers.empty()) {
+                EV_SET(&probe, fd, EVFILT_READ, EV_ENABLE, 0, 0, nullptr);
+                if (::kevent(this->kq, &probe, 1, nullptr, 0, nullptr) < 0 && errno == ENOENT) w.readers.takeAll(stale);
+            }
+            if (!w.writers.empty()) {
+                EV_SET(&probe, fd, EVFILT_WRITE, EV_ENABLE, 0, 0, nullptr);
+                if (::kevent(this->kq, &probe, 1, nullptr, 0, nullptr) < 0 && errno == ENOENT) w.writers.takeAll(stale);
+            }
+            detail::DirWaiters &d = writable ? w.writers : w.readers;
+            d.push(h.address());
+            struct kevent change;
+            EV_SET(&change, fd, writable ? EVFILT_WRITE : EVFILT_READ, EV_ADD | EV_ONESHOT, 0, 0, nullptr);
+            if (::kevent(this->kq, &change, 1, nullptr, 0, nullptr) < 0) {
+                d.remove(h.address());
+                if (w.empty()) this->fdWaiters.erase(fd);
+                refused = true;
+            }
         }
+        for (void *p : stale) this->schedule(std::coroutine_handle<>::from_address(p));
+        if (refused) this->schedule(h);
     }
 
-    void Reactor::registerWritable(int fd, std::coroutine_handle<> h) noexcept {
-        struct kevent change;
-        EV_SET(&change, fd, EVFILT_WRITE, EV_ADD | EV_ONESHOT, 0, 0, h.address());
-        if (::kevent(this->kq, &change, 1, nullptr, 0, nullptr) < 0) {
-            this->schedule(h);
+    void Reactor::registerReadable(SocketHandle fd, std::coroutine_handle<> h) noexcept {
+        this->registerFd(fd, h, /*writable=*/false);
+    }
+
+    void Reactor::registerWritable(SocketHandle fd, std::coroutine_handle<> h) noexcept {
+        this->registerFd(fd, h, /*writable=*/true);
+    }
+
+    bool Reactor::cancelWait(SocketHandle fd, std::coroutine_handle<> h, bool resume) noexcept {
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lk(this->fdMu);
+            auto it = this->fdWaiters.find(fd);
+            if (it == this->fdWaiters.end()) return false;
+            detail::FdWaiters &w = it->second;
+            struct kevent change;
+            if (w.readers.remove(h.address())) {
+                found = true;
+                if (w.readers.empty()) {
+                    EV_SET(&change, fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+                    (void) ::kevent(this->kq, &change, 1, nullptr, 0, nullptr);
+                }
+            } else if (w.writers.remove(h.address())) {
+                found = true;
+                if (w.writers.empty()) {
+                    EV_SET(&change, fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+                    (void) ::kevent(this->kq, &change, 1, nullptr, 0, nullptr);
+                }
+            }
+            if (w.empty()) this->fdWaiters.erase(it);
         }
+        if (found && resume) this->schedule(h);
+        return found;
+    }
+
+    std::size_t Reactor::cancelFd(SocketHandle fd) noexcept {
+        std::vector<void *> woken;
+        {
+            std::lock_guard<std::mutex> lk(this->fdMu);
+            auto it = this->fdWaiters.find(fd);
+            if (it == this->fdWaiters.end()) return 0;
+            struct kevent change;
+            if (!it->second.readers.empty()) {
+                EV_SET(&change, fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+                (void) ::kevent(this->kq, &change, 1, nullptr, 0, nullptr);
+            }
+            if (!it->second.writers.empty()) {
+                EV_SET(&change, fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+                (void) ::kevent(this->kq, &change, 1, nullptr, 0, nullptr);
+            }
+            it->second.readers.takeAll(woken);
+            it->second.writers.takeAll(woken);
+            this->fdWaiters.erase(it);
+        }
+        for (void *p : woken) this->schedule(std::coroutine_handle<>::from_address(p));
+        return woken.size();
     }
 
     void Reactor::registerTimer(std::chrono::nanoseconds duration,
@@ -134,9 +229,21 @@ namespace YarnBall {
         }
     }
 
+    bool Reactor::cancelTimer(std::coroutine_handle<> h, bool resume) noexcept {
+        // A one-shot timer that already fired is gone from the kqueue (ENOENT), so success here means this call, and
+        // not the run loop, owns the handle.
+        const std::uintptr_t ident = reinterpret_cast<std::uintptr_t>(h.address());
+        struct kevent change;
+        EV_SET(&change, ident, EVFILT_TIMER, EV_DELETE, 0, 0, nullptr);
+        if (::kevent(this->kq, &change, 1, nullptr, 0, nullptr) < 0) return false;
+        if (resume) this->schedule(h);
+        return true;
+    }
+
     void Reactor::run() {
         constexpr int kBatch = 64;
         struct kevent events[kBatch];
+        std::vector<void *> ready;
 
         while (this->running.load(std::memory_order_acquire)) {
             int n = ::kevent(this->kq, nullptr, 0, events, kBatch, nullptr);
@@ -145,9 +252,22 @@ namespace YarnBall {
                 break;
             }
             for (int i = 0; i < n; ++i) {
-                if (events[i].filter == EVFILT_USER) continue;
-                auto h = std::coroutine_handle<>::from_address(events[i].udata);
-                this->schedule(h);
+                const struct kevent &ev = events[i];
+                if (ev.filter == EVFILT_USER) continue;
+                if (ev.filter == EVFILT_TIMER) {
+                    this->schedule(std::coroutine_handle<>::from_address(ev.udata));
+                    continue;
+                }
+                const int fd = static_cast<int>(ev.ident);
+                ready.clear();
+                {
+                    std::lock_guard<std::mutex> lk(this->fdMu);
+                    auto it = this->fdWaiters.find(fd);
+                    if (it == this->fdWaiters.end()) continue;
+                    (ev.filter == EVFILT_WRITE ? it->second.writers : it->second.readers).takeAll(ready);
+                    if (it->second.empty()) this->fdWaiters.erase(it);
+                }
+                for (void *p : ready) this->schedule(std::coroutine_handle<>::from_address(p));
             }
         }
     }
@@ -241,7 +361,37 @@ namespace YarnBall {
         (void) ::write(this->wakefd, &v, sizeof(v));
     }
 
-    void Reactor::registerReadable(int fd, std::coroutine_handle<> h) noexcept {
+    namespace {
+        /**
+         * @brief Tag in the low bits of a user_data that marks the completion
+         *        of a poll/timeout *removal* request; the remaining bits are
+         *        the handle address whose operation it targeted.
+         */
+        inline constexpr std::uintptr_t kRemovalTag = 2;
+
+        /**
+         * @brief Push queued SQEs, retrying transient errors. A failed
+         *        io_uring_submit leaves the prepared SQEs in the ring (the
+         *        next submit sends them), so callers must NOT treat the
+         *        operation as lost.
+         */
+        int submitRetry(::io_uring *ring) noexcept {
+            int r = 0;
+            for (int i = 0; i < 1000; ++i) {
+                r = ::io_uring_submit(ring);
+                if (r >= 0 || (r != -EINTR && r != -EAGAIN && r != -EBUSY)) return r;
+                std::this_thread::yield();
+            }
+            return r;
+        }
+    }
+
+    void Reactor::pokeLoop() noexcept {
+        std::uint64_t v = 1;
+        (void) ::write(this->wakefd, &v, sizeof(v));
+    }
+
+    void Reactor::registerReadable(SocketHandle fd, std::coroutine_handle<> h) noexcept {
         std::lock_guard<std::mutex> lk(this->sqMu);
         io_uring_sqe *sqe = ::io_uring_get_sqe(this->ring);
         if (!sqe) {
@@ -252,12 +402,12 @@ namespace YarnBall {
         }
         ::io_uring_prep_poll_add(sqe, fd, POLLIN);
         ::io_uring_sqe_set_data(sqe, h.address());
-        if (::io_uring_submit(this->ring) < 0) {
-            this->schedule(h);
-        }
+        // On failure the SQE is still queued and will complete (and resume h) once submitted; scheduling h here as well
+        // would resume it twice. Make the loop submit it instead.
+        if (submitRetry(this->ring) < 0) this->pokeLoop();
     }
 
-    void Reactor::registerWritable(int fd, std::coroutine_handle<> h) noexcept {
+    void Reactor::registerWritable(SocketHandle fd, std::coroutine_handle<> h) noexcept {
         std::lock_guard<std::mutex> lk(this->sqMu);
         io_uring_sqe *sqe = ::io_uring_get_sqe(this->ring);
         if (!sqe) {
@@ -266,9 +416,7 @@ namespace YarnBall {
         }
         ::io_uring_prep_poll_add(sqe, fd, POLLOUT);
         ::io_uring_sqe_set_data(sqe, h.address());
-        if (::io_uring_submit(this->ring) < 0) {
-            this->schedule(h);
-        }
+        if (submitRetry(this->ring) < 0) this->pokeLoop();
     }
 
     void Reactor::registerTimer(std::chrono::nanoseconds duration,
@@ -287,9 +435,62 @@ namespace YarnBall {
         ts.tv_nsec = static_cast<long long>(duration.count() % 1'000'000'000LL);
         ::io_uring_prep_timeout(sqe, &ts, 0, 0);
         ::io_uring_sqe_set_data(sqe, h.address());
-        if (::io_uring_submit(this->ring) < 0) {
-            this->schedule(h);
+        if (submitRetry(this->ring) < 0) {
+            // Still queued (see registerReadable), but it points at this stack frame's timespec: repoint it at a copy
+            // that outlives the call. Leaked on purpose; only reachable when the ring is wedged.
+            auto *keep = new __kernel_timespec(ts);
+            sqe->addr = reinterpret_cast<std::uintptr_t>(keep);
+            this->pokeLoop();
+            return;
         }
+#  ifdef YARN_IO_URING_SQPOLL
+        // With SQPOLL the kernel thread reads the SQE (and the timespec it points at) asynchronously; keep `ts`
+        // alive on this stack until it has been consumed.
+        while (::io_uring_sq_ready(this->ring) != 0) std::this_thread::yield();
+#  endif
+    }
+
+    bool Reactor::cancelByHandle(void *key, bool resume, bool timer) noexcept {
+        std::lock_guard<std::mutex> lk(this->sqMu);
+        io_uring_sqe *sqe = ::io_uring_get_sqe(this->ring);
+        if (!sqe) return false;
+        if (timer) {
+            ::io_uring_prep_timeout_remove(sqe, reinterpret_cast<std::uintptr_t>(key), 0);
+        } else {
+            ::io_uring_prep_poll_remove(sqe, reinterpret_cast<std::uintptr_t>(key));
+        }
+        // Resuming needs nothing more: the cancelled operation completes (-ECANCELED) and the loop resumes its handle as
+        // for any other completion. Dropping marks the handle so that completion is swallowed.
+        if (!resume) {
+            this->droppedHandles.push_back(key);
+            this->droppedPending.fetch_add(1, std::memory_order_release);
+        }
+        ::io_uring_sqe_set_data(sqe, reinterpret_cast<void *>(reinterpret_cast<std::uintptr_t>(key) | kRemovalTag));
+        if (submitRetry(this->ring) < 0) this->pokeLoop();
+        return true;
+    }
+
+    bool Reactor::cancelWait(SocketHandle, std::coroutine_handle<> h, bool resume) noexcept {
+        return this->cancelByHandle(h.address(), resume, /*timer=*/false);
+    }
+
+    bool Reactor::cancelTimer(std::coroutine_handle<> h, bool resume) noexcept {
+        return this->cancelByHandle(h.address(), resume, /*timer=*/true);
+    }
+
+    std::size_t Reactor::cancelFd(SocketHandle fd) noexcept {
+#  if defined(IORING_ASYNC_CANCEL_FD)
+        std::lock_guard<std::mutex> lk(this->sqMu);
+        io_uring_sqe *sqe = ::io_uring_get_sqe(this->ring);
+        if (!sqe) return 0;
+        ::io_uring_prep_cancel_fd(sqe, fd, IORING_ASYNC_CANCEL_ALL);
+        ::io_uring_sqe_set_data(sqe, reinterpret_cast<void *>(kRemovalTag));
+        if (submitRetry(this->ring) < 0) this->pokeLoop();
+        return 1;
+#  else
+        (void) fd;
+        return 0;
+#  endif
     }
 
     void Reactor::run() {
@@ -316,15 +517,51 @@ namespace YarnBall {
                     if (sqe) {
                         ::io_uring_prep_poll_add(sqe, this->wakefd, POLLIN);
                         ::io_uring_sqe_set_data(sqe, reinterpret_cast<void *>(kWakeUserData));
-                        ::io_uring_submit(this->ring);
+                    }
+                    // Also pushes any SQE a failed submit left queued.
+                    ::io_uring_submit(this->ring);
+                }
+                continue;
+            }
+
+            const std::uintptr_t bits = reinterpret_cast<std::uintptr_t>(data);
+            if ((bits & 0x3) == kRemovalTag) {
+                // Completion of a removal request. -ENOENT means the target had already completed, so a drop mark left
+                // for it would never be consumed: clear it so it cannot swallow a later wait on a reused address.
+                const int res = cqe->res;
+                ::io_uring_cqe_seen(this->ring, cqe);
+                if (res == -ENOENT && (bits & ~static_cast<std::uintptr_t>(0x3)) != 0
+                    && this->droppedPending.load(std::memory_order_acquire) > 0) {
+                    void *key = reinterpret_cast<void *>(bits & ~static_cast<std::uintptr_t>(0x3));
+                    std::lock_guard<std::mutex> lk(this->sqMu);
+                    for (std::size_t i = 0; i < this->droppedHandles.size(); ++i) {
+                        if (this->droppedHandles[i] == key) {
+                            this->droppedHandles.erase(this->droppedHandles.begin() + static_cast<std::ptrdiff_t>(i));
+                            this->droppedPending.fetch_sub(1, std::memory_order_release);
+                            break;
+                        }
                     }
                 }
                 continue;
             }
 
-            auto h = std::coroutine_handle<>::from_address(data);
             ::io_uring_cqe_seen(this->ring, cqe);
-            this->schedule(h);
+            if (this->droppedPending.load(std::memory_order_acquire) > 0) {
+                bool dropped = false;
+                {
+                    std::lock_guard<std::mutex> lk(this->sqMu);
+                    for (std::size_t i = 0; i < this->droppedHandles.size(); ++i) {
+                        if (this->droppedHandles[i] == data) {
+                            this->droppedHandles.erase(this->droppedHandles.begin() + static_cast<std::ptrdiff_t>(i));
+                            this->droppedPending.fetch_sub(1, std::memory_order_release);
+                            dropped = true;
+                            break;
+                        }
+                    }
+                }
+                if (dropped) continue;
+            }
+            this->schedule(std::coroutine_handle<>::from_address(data));
         }
     }
 
@@ -381,18 +618,19 @@ namespace YarnBall {
 
         /**
          * @brief Remove (without deleting) @p entry from @p pending if
-         *        present. Linear scan over a vector that in practice
+         *        present; @c true if it was. Linear scan over a vector that in practice
          *        holds at most a handful of concurrently-armed timers;
          *        swap-pop since order does not matter.
          */
-        void untrackTimer(std::vector<void *> &pending, TimerEntry *entry) {
+        bool untrackTimer(std::vector<void *> &pending, TimerEntry *entry) {
             for (std::size_t i = 0; i < pending.size(); ++i) {
                 if (pending[i] == static_cast<void *>(entry)) {
                     pending[i] = pending.back();
                     pending.pop_back();
-                    return;
+                    return true;
                 }
             }
+            return false;
         }
     }
 
@@ -432,6 +670,8 @@ namespace YarnBall {
                 delete entry;
             }
             this->pendingTimers.clear();
+            for (void *p : this->deadTimers) delete static_cast<TimerEntry *>(p);
+            this->deadTimers.clear();
         }
         if (this->wakefd >= 0) ::close(this->wakefd);
         if (this->epfd >= 0) ::close(this->epfd);
@@ -451,9 +691,9 @@ namespace YarnBall {
         inline int untagFd(std::uint64_t u) { return static_cast<int>(static_cast<std::uint32_t>(u >> 2)); }
     }
 
-    bool Reactor::armFdLocked(int fd, const FdWaiters &w) noexcept {
+    bool Reactor::armFdLocked(int fd, const detail::FdWaiters &w) noexcept {
         struct epoll_event ev{};
-        ev.events = EPOLLONESHOT | (w.readH ? EPOLLIN : 0u) | (w.writeH ? EPOLLOUT : 0u);
+        ev.events = EPOLLONESHOT | (!w.readers.empty() ? EPOLLIN : 0u) | (!w.writers.empty() ? EPOLLOUT : 0u);
         ev.data.u64 = tagFd(fd);
         if (::epoll_ctl(this->epfd, EPOLL_CTL_ADD, fd, &ev) == 0) return true;
         if (errno == EEXIST && ::epoll_ctl(this->epfd, EPOLL_CTL_MOD, fd, &ev) == 0) return true;
@@ -461,39 +701,73 @@ namespace YarnBall {
     }
 
     void Reactor::registerFd(int fd, std::coroutine_handle<> h, bool writable) noexcept {
-        std::vector<void *> refused;
+        std::vector<void *> woken;
         {
             std::lock_guard<std::mutex> lk(this->fdMu);
-            FdWaiters &w = this->fdWaiters[fd];
-            // A fresh kernel registration (ADD succeeds) means the fd is new (a closed fd's registration is gone with it), so a
-            // waiter still recorded for the OTHER direction belongs to a closed fd: it can never be resumed, drop it.
-            (writable ? w.writeH : w.readH) = h.address();
+            detail::FdWaiters &w = this->fdWaiters[fd];
+            // A fresh kernel registration (ADD succeeds) means the fd is new (a closed fd's registration is gone with it), so
+            // any waiter still recorded belongs to a closed fd: it can never be woken by the kernel, hand it to the pool so
+            // its next syscall reports the error instead of leaving it parked.
             struct epoll_event ev{};
-            ev.events = EPOLLONESHOT | (w.readH ? EPOLLIN : 0u) | (w.writeH ? EPOLLOUT : 0u);
+            ev.events = EPOLLONESHOT | (writable ? EPOLLOUT : EPOLLIN);
             ev.data.u64 = tagFd(fd);
             bool ok = false;
             if (::epoll_ctl(this->epfd, EPOLL_CTL_ADD, fd, &ev) == 0) {
-                // New registration: only this call's waiter is real.
-                if (writable) w.readH = nullptr; else w.writeH = nullptr;
-                ev.events = EPOLLONESHOT | (writable ? EPOLLOUT : EPOLLIN);
-                ok = ::epoll_ctl(this->epfd, EPOLL_CTL_MOD, fd, &ev) == 0;
+                w.readers.takeAll(woken);
+                w.writers.takeAll(woken);
+                (writable ? w.writers : w.readers).push(h.address());
+                ok = true;
             } else if (errno == EEXIST) {
+                (writable ? w.writers : w.readers).push(h.address());
+                ev.events = EPOLLONESHOT | (!w.readers.empty() ? EPOLLIN : 0u) | (!w.writers.empty() ? EPOLLOUT : 0u);
                 ok = ::epoll_ctl(this->epfd, EPOLL_CTL_MOD, fd, &ev) == 0;
             }
             if (!ok) {
-                if (w.readH) refused.push_back(w.readH);
-                if (w.writeH) refused.push_back(w.writeH);
+                w.readers.takeAll(woken);
+                w.writers.takeAll(woken);
+                woken.push_back(h.address());
                 this->fdWaiters.erase(fd);
             }
         }
-        for (void *p : refused) this->schedule(std::coroutine_handle<>::from_address(p));
+        for (void *p : woken) this->schedule(std::coroutine_handle<>::from_address(p));
     }
 
-    void Reactor::registerReadable(int fd, std::coroutine_handle<> h) noexcept {
+    bool Reactor::cancelWait(SocketHandle fd, std::coroutine_handle<> h, bool resume) noexcept {
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lk(this->fdMu);
+            auto it = this->fdWaiters.find(fd);
+            if (it == this->fdWaiters.end()) return false;
+            detail::FdWaiters &w = it->second;
+            found = w.readers.remove(h.address()) || w.writers.remove(h.address());
+            // An armed one-shot event for a direction nobody waits on any more is harmless: the run loop ignores it and
+            // re-arms whatever is still waiting.
+            if (w.empty()) this->fdWaiters.erase(it);
+        }
+        if (found && resume) this->schedule(h);
+        return found;
+    }
+
+    std::size_t Reactor::cancelFd(SocketHandle fd) noexcept {
+        std::vector<void *> woken;
+        {
+            std::lock_guard<std::mutex> lk(this->fdMu);
+            auto it = this->fdWaiters.find(fd);
+            if (it == this->fdWaiters.end()) return 0;
+            it->second.readers.takeAll(woken);
+            it->second.writers.takeAll(woken);
+            this->fdWaiters.erase(it);
+            (void) ::epoll_ctl(this->epfd, EPOLL_CTL_DEL, fd, nullptr);
+        }
+        for (void *p : woken) this->schedule(std::coroutine_handle<>::from_address(p));
+        return woken.size();
+    }
+
+    void Reactor::registerReadable(SocketHandle fd, std::coroutine_handle<> h) noexcept {
         this->registerFd(fd, h, /*writable=*/false);
     }
 
-    void Reactor::registerWritable(int fd, std::coroutine_handle<> h) noexcept {
+    void Reactor::registerWritable(SocketHandle fd, std::coroutine_handle<> h) noexcept {
         this->registerFd(fd, h, /*writable=*/true);
     }
 
@@ -501,7 +775,18 @@ namespace YarnBall {
                                  std::coroutine_handle<> h) noexcept {
         const int tfd = ::timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
         if (tfd < 0) {
-            this->schedule(h);
+            // Out of fds (or memory): do not fire early, which would turn every sleep / timeout into an instant wake.
+            try {
+                const auto ns = duration.count() > 0 ? duration : std::chrono::nanoseconds{0};
+                {
+                    std::lock_guard<std::mutex> lk(this->timerSetMu);
+                    this->softTimers.emplace(std::chrono::steady_clock::now() + ns, h.address());
+                }
+                const std::uint64_t one = 1;
+                (void) ::write(this->wakefd, &one, sizeof(one));
+            } catch (...) {
+                this->schedule(h);
+            }
             return;
         }
         struct itimerspec ts{};
@@ -532,12 +817,70 @@ namespace YarnBall {
         }
     }
 
+    bool Reactor::cancelTimer(std::coroutine_handle<> h, bool resume) noexcept {
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lk(this->timerSetMu);
+            for (std::size_t i = 0; i < this->pendingTimers.size(); ++i) {
+                auto *entry = static_cast<TimerEntry *>(this->pendingTimers[i]);
+                if (entry->handle == h) {
+                    this->pendingTimers[i] = this->pendingTimers.back();
+                    this->pendingTimers.pop_back();
+                    // Closing the timerfd removes it from the epoll set, so no later batch can name the entry. One
+                    // already in the run loop's current batch is dropped there (it is no longer tracked); the memory
+                    // is released by the run loop after that batch (see deadTimers).
+                    (void) ::epoll_ctl(this->epfd, EPOLL_CTL_DEL, entry->fd, nullptr);
+                    ::close(entry->fd);
+                    this->deadTimers.push_back(entry);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                for (auto it = this->softTimers.begin(); it != this->softTimers.end(); ++it) {
+                    if (it->second == h.address()) {
+                        this->softTimers.erase(it);
+                        found = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (found && resume) this->schedule(h);
+        return found;
+    }
+
     void Reactor::run() {
         constexpr int kBatch = 64;
         struct epoll_event events[kBatch];
+        std::vector<void *> ready;
 
         while (this->running.load(std::memory_order_acquire)) {
-            int n = ::epoll_wait(this->epfd, events, kBatch, -1);
+            // Entries cancelTimer retired during the previous batch can no longer be named by an event.
+            {
+                std::lock_guard<std::mutex> lk(this->timerSetMu);
+                for (void *d : this->deadTimers) delete static_cast<TimerEntry *>(d);
+                this->deadTimers.clear();
+            }
+            // Service fallback timers and derive the wait timeout from the earliest remaining one.
+            int timeoutMs = -1;
+            std::vector<void *> due;
+            {
+                std::lock_guard<std::mutex> lk(this->timerSetMu);
+                const auto now = std::chrono::steady_clock::now();
+                while (!this->softTimers.empty() && this->softTimers.begin()->first <= now) {
+                    due.push_back(this->softTimers.begin()->second);
+                    this->softTimers.erase(this->softTimers.begin());
+                }
+                if (!this->softTimers.empty()) {
+                    const auto left = this->softTimers.begin()->first - now;
+                    const long long ms = (std::chrono::duration_cast<std::chrono::nanoseconds>(left).count() + 999'999LL) / 1'000'000LL;
+                    timeoutMs = ms > 1'000'000'000LL ? 1'000'000'000 : static_cast<int>(ms);
+                }
+            }
+            for (void *p : due) this->schedule(std::coroutine_handle<>::from_address(p));
+
+            int n = ::epoll_wait(this->epfd, events, kBatch, timeoutMs);
             if (n < 0) {
                 if (errno == EINTR) continue;
                 break;
@@ -551,14 +894,16 @@ namespace YarnBall {
                 }
                 if (isTimer(p)) {
                     TimerEntry *entry = untagTimer(p);
+                    {
+                        // Untrack before touching the entry: if cancelTimer claimed it first it owns the fd and the
+                        // handle, and this stale event is dropped.
+                        std::lock_guard<std::mutex> lk(this->timerSetMu);
+                        if (!untrackTimer(this->pendingTimers, entry)) continue;
+                    }
                     std::uint64_t expirations;
                     (void) ::read(entry->fd, &expirations, sizeof(expirations));
                     ::close(entry->fd);
                     std::coroutine_handle<> h = entry->handle;
-                    {
-                        std::lock_guard<std::mutex> lk(this->timerSetMu);
-                        untrackTimer(this->pendingTimers, entry);
-                    }
                     delete entry;
                     this->schedule(h);
                     continue;
@@ -566,28 +911,26 @@ namespace YarnBall {
                 if (isFdEvent(events[i].data.u64)) {
                     const int fd = untagFd(events[i].data.u64);
                     const std::uint32_t got = events[i].events;
-                    void *readyR = nullptr;
-                    void *readyW = nullptr;
+                    ready.clear();
                     {
                         std::lock_guard<std::mutex> lk(this->fdMu);
                         auto it = this->fdWaiters.find(fd);
                         if (it == this->fdWaiters.end()) continue;
-                        FdWaiters &w = it->second;
+                        detail::FdWaiters &w = it->second;
                         // An error or hang-up is delivered to both directions so each side observes it on its next syscall.
                         const bool err = (got & (EPOLLERR | EPOLLHUP)) != 0;
-                        if (w.readH && (err || (got & EPOLLIN))) { readyR = w.readH; w.readH = nullptr; }
-                        if (w.writeH && (err || (got & EPOLLOUT))) { readyW = w.writeH; w.writeH = nullptr; }
-                        if (!w.readH && !w.writeH) {
+                        if (!w.readers.empty() && (err || (got & EPOLLIN))) w.readers.takeAll(ready);
+                        if (!w.writers.empty() && (err || (got & EPOLLOUT))) w.writers.takeAll(ready);
+                        if (w.empty()) {
                             this->fdWaiters.erase(it);
                         } else if (!this->armFdLocked(fd, w)) {
                             // The other direction cannot be re-armed (fd closed meanwhile): let it run and fail on its own.
-                            if (w.readH) readyR = readyR ? readyR : w.readH;
-                            if (w.writeH) readyW = readyW ? readyW : w.writeH;
+                            w.readers.takeAll(ready);
+                            w.writers.takeAll(ready);
                             this->fdWaiters.erase(it);
                         }
                     }
-                    if (readyR) this->schedule(std::coroutine_handle<>::from_address(readyR));
-                    if (readyW) this->schedule(std::coroutine_handle<>::from_address(readyW));
+                    for (void *r : ready) this->schedule(std::coroutine_handle<>::from_address(r));
                     continue;
                 }
                 auto h = std::coroutine_handle<>::from_address(p);
@@ -668,6 +1011,19 @@ namespace YarnBall {
         struct TimerEntry {
             std::chrono::steady_clock::time_point deadline;
             std::coroutine_handle<> handle;
+            std::uint64_t id;
+        };
+
+        /**
+         * @brief A cancelWait / cancelFd request for a registration that may
+         *        be sitting in the poll thread's private snapshot (so the
+         *        caller cannot remove it from @c pending). @c handle is null
+         *        for "every registration on @c sock".
+         */
+        struct CancelRequest {
+            std::coroutine_handle<> handle;
+            SOCKET sock;
+            bool resume;
         };
 
         struct TimerEntryGreater {
@@ -718,7 +1074,15 @@ namespace YarnBall {
         /// Pending timer entries, ordered as a min-heap on @c deadline.
         std::priority_queue<TimerEntry, std::vector<TimerEntry>, TimerEntryGreater> timers;
 
-        /// Mutex guarding @c pending, @c timers.
+        /// Cancellations the poll thread has yet to apply to its snapshot.
+        std::vector<CancelRequest> cancels;
+
+        /// Armed timers by handle address -> id of the live heap entry. An
+        /// entry whose id no longer matches was cancelled and is skipped.
+        std::unordered_map<void *, std::uint64_t> liveTimers;
+        std::uint64_t nextTimerId = 0;
+
+        /// Mutex guarding @c pending, @c timers, @c cancels, @c liveTimers.
         std::mutex pollMu;
     };
 
@@ -835,7 +1199,7 @@ namespace YarnBall {
         }
     }
 
-    void Reactor::registerReadable(int fd, std::coroutine_handle<> h) noexcept {
+    void Reactor::registerReadable(SocketHandle fd, std::coroutine_handle<> h) noexcept {
         if (!this->winstate) {
             this->schedule(h);
             return;
@@ -843,7 +1207,7 @@ namespace YarnBall {
         {
             std::lock_guard<std::mutex> lk(this->winstate->pollMu);
             this->winstate->pending.push_back(PollRegistration{
-                static_cast<SOCKET>(static_cast<unsigned>(fd)),
+                static_cast<SOCKET>(fd),
                 static_cast<short>(POLLRDNORM),
                 h
             });
@@ -858,7 +1222,7 @@ namespace YarnBall {
                         sizeof(this->winstate->wakeAddr));
     }
 
-    void Reactor::registerWritable(int fd, std::coroutine_handle<> h) noexcept {
+    void Reactor::registerWritable(SocketHandle fd, std::coroutine_handle<> h) noexcept {
         if (!this->winstate) {
             this->schedule(h);
             return;
@@ -866,7 +1230,7 @@ namespace YarnBall {
         {
             std::lock_guard<std::mutex> lk(this->winstate->pollMu);
             this->winstate->pending.push_back(PollRegistration{
-                static_cast<SOCKET>(static_cast<unsigned>(fd)),
+                static_cast<SOCKET>(fd),
                 static_cast<short>(POLLWRNORM),
                 h
             });
@@ -887,7 +1251,9 @@ namespace YarnBall {
                               (duration.count() > 0 ? duration : std::chrono::nanoseconds{0});
         {
             std::lock_guard<std::mutex> lk(this->winstate->pollMu);
-            this->winstate->timers.push(TimerEntry{deadline, h});
+            const std::uint64_t id = ++this->winstate->nextTimerId;
+            this->winstate->liveTimers[h.address()] = id;
+            this->winstate->timers.push(TimerEntry{deadline, h, id});
         }
         const char b = kWakeupByte;
         (void) ::sendto(this->winstate->wakeSock, &b, 1, 0,
@@ -895,9 +1261,76 @@ namespace YarnBall {
                         sizeof(this->winstate->wakeAddr));
     }
 
-    bool Reactor::associateIocp(int fd) noexcept {
+    bool Reactor::cancelWait(SocketHandle fd, std::coroutine_handle<> h, bool resume) noexcept {
+        if (!this->winstate) return false;
+        const SOCKET sock = static_cast<SOCKET>(fd);
+        bool found = false;
+        {
+            std::lock_guard<std::mutex> lk(this->winstate->pollMu);
+            auto &pending = this->winstate->pending;
+            for (auto it = pending.begin(); it != pending.end(); ++it) {
+                if (it->handle == h) {
+                    pending.erase(it);
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                // Possibly in the poll thread's snapshot right now: let it apply the cancellation.
+                this->winstate->cancels.push_back(CancelRequest{h, sock, resume});
+            }
+        }
+        if (found && resume) {
+            this->schedule(h);
+        } else if (!found) {
+            const char b = kWakeupByte;
+            (void) ::sendto(this->winstate->wakeSock, &b, 1, 0,
+                            reinterpret_cast<sockaddr *>(&this->winstate->wakeAddr),
+                            sizeof(this->winstate->wakeAddr));
+        }
+        // Not found: the poll thread's snapshot holds it and applies the queued request (or its own readiness event)
+        // exactly once; this call took nothing, as on the other backends.
+        return found;
+    }
+
+    bool Reactor::cancelTimer(std::coroutine_handle<> h, bool resume) noexcept {
+        if (!this->winstate) return false;
+        {
+            std::lock_guard<std::mutex> lk(this->winstate->pollMu);
+            if (this->winstate->liveTimers.erase(h.address()) == 0) return false;
+        }
+        if (resume) this->schedule(h);
+        return true;
+    }
+
+    std::size_t Reactor::cancelFd(SocketHandle fd) noexcept {
+        if (!this->winstate) return 0;
+        const SOCKET sock = static_cast<SOCKET>(fd);
+        std::vector<std::coroutine_handle<>> woken;
+        {
+            std::lock_guard<std::mutex> lk(this->winstate->pollMu);
+            auto &pending = this->winstate->pending;
+            for (auto it = pending.begin(); it != pending.end();) {
+                if (it->sock == sock) {
+                    woken.push_back(it->handle);
+                    it = pending.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            this->winstate->cancels.push_back(CancelRequest{std::coroutine_handle<>{}, sock, true});
+        }
+        const char b = kWakeupByte;
+        (void) ::sendto(this->winstate->wakeSock, &b, 1, 0,
+                        reinterpret_cast<sockaddr *>(&this->winstate->wakeAddr),
+                        sizeof(this->winstate->wakeAddr));
+        for (auto h : woken) this->schedule(h);
+        return woken.size();
+    }
+
+    bool Reactor::associateIocp(SocketHandle fd) noexcept {
         if (!this->winstate || !this->winstate->iocp) return false;
-        HANDLE h = reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(static_cast<unsigned>(fd)));
+        HANDLE h = reinterpret_cast<HANDLE>(static_cast<UINT_PTR>(fd));
         HANDLE r = ::CreateIoCompletionPort(h, this->winstate->iocp, /*key=*/0, 0);
         if (r == NULL) {
             // ERROR_INVALID_PARAMETER means the handle is already
@@ -925,24 +1358,33 @@ namespace YarnBall {
             readyHandles.clear();
             std::vector<PollRegistration> active;
             std::vector<std::coroutine_handle<>> expiredTimers;
+            std::vector<CancelRequest> cancelReqs;
             {
                 std::lock_guard<std::mutex> lk(this->winstate->pollMu);
                 active = std::move(this->winstate->pending);
                 this->winstate->pending.clear();
+                cancelReqs = std::move(this->winstate->cancels);
+                this->winstate->cancels.clear();
 
                 // Drain expired timers while we hold the lock.
                 const auto now = std::chrono::steady_clock::now();
                 while (!this->winstate->timers.empty()
                        && this->winstate->timers.top().deadline <= now) {
-                    expiredTimers.push_back(this->winstate->timers.top().handle);
+                    const TimerEntry top = this->winstate->timers.top();
                     this->winstate->timers.pop();
+                    auto live = this->winstate->liveTimers.find(top.handle.address());
+                    // A missing / re-armed entry was cancelled; its handle has been dealt with already.
+                    if (live != this->winstate->liveTimers.end() && live->second == top.id) {
+                        this->winstate->liveTimers.erase(live);
+                        expiredTimers.push_back(top.handle);
+                    }
                 }
 
                 if (!this->winstate->timers.empty()) {
                     const auto next = this->winstate->timers.top().deadline;
                     const auto delta_ns =
                         std::chrono::duration_cast<std::chrono::milliseconds>(next - now);
-                    long long ms = delta_ns.count();
+                    long long ms = delta_ns.count() + 1; // truncation would wake early and spin up to 1 ms
                     if (ms < 0) ms = 0;
                     if (ms > kPollMaxTimeoutMs) ms = kPollMaxTimeoutMs;
                     timeoutMs = static_cast<int>(ms);
@@ -952,6 +1394,20 @@ namespace YarnBall {
             // Schedule expired timers off-lock to avoid holding the
             // pollMu across Yarn::run dispatches.
             for (auto h : expiredTimers) this->schedule(h);
+
+            // Apply cancellations to the registrations this thread now owns.
+            for (const auto &c : cancelReqs) {
+                for (std::size_t i = 0; i < active.size();) {
+                    const bool match = c.handle ? active[i].handle == c.handle : active[i].sock == c.sock;
+                    if (!match) {
+                        ++i;
+                        continue;
+                    }
+                    if (c.resume) this->schedule(active[i].handle);
+                    active.erase(active.begin() + static_cast<std::ptrdiff_t>(i));
+                    if (c.handle) break;
+                }
+            }
 
             // -- build poll set --------------------------------------
             // Wakeup socket always at index 0.
@@ -1027,10 +1483,13 @@ namespace YarnBall {
     Reactor::~Reactor() = default;
 
     void Reactor::stop() {}
-    void Reactor::registerReadable(int, std::coroutine_handle<>) noexcept {}
-    void Reactor::registerWritable(int, std::coroutine_handle<>) noexcept {}
+    void Reactor::registerReadable(SocketHandle, std::coroutine_handle<>) noexcept {}
+    void Reactor::registerWritable(SocketHandle, std::coroutine_handle<>) noexcept {}
     void Reactor::registerTimer(std::chrono::nanoseconds,
                                  std::coroutine_handle<>) noexcept {}
+    bool Reactor::cancelWait(SocketHandle, std::coroutine_handle<>, bool) noexcept { return false; }
+    bool Reactor::cancelTimer(std::coroutine_handle<>, bool) noexcept { return false; }
+    std::size_t Reactor::cancelFd(SocketHandle) noexcept { return 0; }
     void Reactor::run() {}
 
 #endif

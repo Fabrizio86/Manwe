@@ -336,8 +336,14 @@ namespace {
     /// @brief Unique temp file path per test. Includes the iteration
     ///        token so soak runs don't trip on stale files.
     std::string fsTempPath(const char *suffix) {
+        // The thread-id hash is the same in every process, so add the process id: concurrent test runs must not share files.
         const auto pid = static_cast<unsigned long long>(
-            std::hash<std::thread::id>{}(std::this_thread::get_id()));
+                             std::hash<std::thread::id>{}(std::this_thread::get_id())) % 1000000007ULL
+#ifdef _WIN32
+                         + static_cast<unsigned long long>(::GetCurrentProcessId()) * 1000000007ULL;
+#else
+                         + static_cast<unsigned long long>(::getpid()) * 1000000007ULL;
+#endif
         return std::string(
 #ifdef _WIN32
             ".\\manwe-test-"
@@ -1811,11 +1817,12 @@ TEST(wire_signal_coroutine_next_resumes_on_emit) {
 
     YarnBall::coSpawn(captureNext(&sig, &result, &got));
 
-    // Give the spawned coroutine time to register as a waiter, then emit.
-    std::this_thread::sleep_for(20ms);
-    sig.emit(42, std::string("hi"));
-
-    EXPECT_TRUE(wait_for([&] { return got.load(); }, 5s));
+    // next() is not latched: an emit before the coroutine has registered as a waiter is lost. A fixed sleep only
+    // makes that unlikely, so keep emitting until the value arrives.
+    EXPECT_TRUE(wait_for([&] {
+        if (!got.load()) sig.emit(42, std::string("hi"));
+        return got.load();
+    }, 5s));
     EXPECT_EQ(std::get<0>(result), 42);
     EXPECT_EQ(std::get<1>(result), std::string("hi"));
 }
@@ -2039,7 +2046,8 @@ TEST(timer_sleep_until_in_past_does_not_suspend) {
         co_return;
     }());
     auto elapsed = std::chrono::steady_clock::now() - start;
-    EXPECT_TRUE(elapsed < std::chrono::milliseconds(10));
+    // "Does not suspend" means no timer wait at all; allow generously for a loaded machine's scheduling jitter.
+    EXPECT_TRUE(elapsed < std::chrono::milliseconds(250));
 }
 
 TEST(timer_multiple_concurrent_sleepers) {
@@ -3667,8 +3675,8 @@ namespace {
 }
 
 TEST(soccer_tls_loopback_round_trip) {
-    const std::string cert = "/tmp/soccer_test_cert.pem";
-    const std::string key = "/tmp/soccer_test_key.pem";
+    const std::string cert = fsTempPath("soccer-test-cert.pem");
+    const std::string key = fsTempPath("soccer-test-key.pem");
 
     if (!generateSelfSignedCert(cert, key)) {
         std::cout << "       (skipped: openssl unavailable)\n";

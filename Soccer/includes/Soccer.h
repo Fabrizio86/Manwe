@@ -16,6 +16,8 @@
 #include "RawSocket.h"
 #include "IcmpEcho.h"
 #include "BufferedReader.h"
+#include "ConnectionLimiter.h"
+#include "IoDeadline.h"
 #include "HttpClient.h"
 #include "HttpServer.h"
 
