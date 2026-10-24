@@ -173,10 +173,9 @@ namespace Soccer {
 
         /**
          * @brief Make a parked accept on @p listener return so its loop can see a stop request.
-         *        On Linux a read-side shutdown of the listening socket wakes it (and nothing
-         *        is queued, so no handler ever sees a stray connection). Elsewhere (macOS and
-         *        the BSDs: the kernel does not signal a kqueue-suspended accept) it knocks on
-         *        the listener's own address, see @ref knockOnListener.
+         *        Where the Reactor can cancel the wait (everywhere but Windows) nothing is queued,
+         *        so no handler ever sees a stray connection and the stop is immediate. On Windows
+         *        it knocks on the listener's own address, see @ref knockOnListener.
          */
         inline void wakeAccept(TcpListener &listener) noexcept {
             if (listener.interruptAccept()) return;

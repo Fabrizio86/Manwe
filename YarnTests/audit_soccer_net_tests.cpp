@@ -354,6 +354,64 @@ TEST(audit_net_tcp_serve_survives_a_throwing_handler_factory) {
     std::this_thread::sleep_for(50ms);
 }
 
+namespace {
+    std::atomic<int> g_strayHandlers{0};
+
+    YarnBall::Task<void> serveAndFlag(Soccer::TcpListener l, std::stop_token t, std::atomic<bool> *finished) {
+        co_await Soccer::tcpServe(std::move(l),
+                                  [](Soccer::TcpStream) -> YarnBall::Task<void> {
+                                      g_strayHandlers++;
+                                      co_return;
+                                  },
+                                  t, 0);
+        finished->store(true);
+    }
+}
+
+TEST(audit_net_tcp_serve_stop_wakes_the_accept_at_once_without_a_stray_connection) {
+    // The accept is woken through the Reactor on every POSIX platform: no loopback probe is queued (so no handler runs
+    // for it) and request_stop does not wait for a connect to settle.
+    g_strayHandlers = 0;
+    auto listener = Soccer::TcpListener::bind("127.0.0.1", 0);
+    std::stop_source src;
+    std::atomic<bool> finished{false};
+    YarnBall::coSpawn(serveAndFlag(std::move(listener), src.get_token(), &finished));
+    std::this_thread::sleep_for(100ms); // let the accept park
+    const auto t0 = std::chrono::steady_clock::now();
+    src.request_stop();
+    const auto stopCall = std::chrono::steady_clock::now() - t0;
+    EXPECT_TRUE(netWaitUntil([&] { return finished.load(); }, 2s));
+    EXPECT_TRUE(stopCall < 50ms);
+    std::this_thread::sleep_for(50ms);
+    EXPECT_EQ(g_strayHandlers.load(), 0);
+}
+
+TEST(audit_net_listener_interrupt_is_sticky_and_unparks_a_pending_accept) {
+#ifndef _WIN32
+    auto listener = Soccer::TcpListener::bind("127.0.0.1", 0);
+    std::atomic<int> outcome{0}; // 1 = accept threw, 2 = accepted something
+    auto waiter = [](Soccer::TcpListener *l, std::atomic<int> *out) -> YarnBall::Task<void> {
+        try {
+            (void) co_await l->accept();
+            out->store(2);
+        } catch (const Soccer::SocketException &) {
+            out->store(1);
+        }
+    };
+    YarnBall::coSpawn(waiter(&listener, &outcome));
+    std::this_thread::sleep_for(100ms);
+    EXPECT_TRUE(listener.interruptAccept());
+    EXPECT_TRUE(netWaitUntil([&] { return outcome.load() != 0; }, 2s));
+    EXPECT_EQ(outcome.load(), 1);
+    // Later accepts fail at once instead of parking, and a listener closed afterwards is still fine.
+    outcome = 0;
+    YarnBall::coSpawn(waiter(&listener, &outcome));
+    EXPECT_TRUE(netWaitUntil([&] { return outcome.load() != 0; }, 2s));
+    EXPECT_EQ(outcome.load(), 1);
+    listener.close();
+#endif
+}
+
 TEST(audit_net_transient_accept_errors_cover_network_errors) {
 #ifndef _WIN32
     for (int e : {ECONNABORTED, EPROTO, ENETDOWN, ENETUNREACH, EHOSTUNREACH, EHOSTDOWN,
@@ -691,7 +749,7 @@ TEST(audit_net_close_never_strands_a_waiter_that_is_about_to_park) {
         auto done = std::make_shared<std::atomic<int>>(0);
         YarnBall::coSpawn(gapReader(s.get(), done.get()));
         const int spin = static_cast<int>(rng() % 4000);
-        { volatile int sink = 0; for (int k = 0; k < spin; ++k) sink = k; }
+        { volatile int sink = 0; for (int k = 0; k < spin; ++k) sink = k; (void) sink; }
         s->close();
         if (!netWaitUntil([&] { return done->load() != 0; }, 3s)) {
             ++hangs;
@@ -713,7 +771,7 @@ TEST(audit_net_udp_close_never_strands_a_waiter_that_is_about_to_park) {
         auto done = std::make_shared<std::atomic<int>>(0);
         YarnBall::coSpawn(gapRecv(u.get(), done.get()));
         const int spin = static_cast<int>(rng() % 4000);
-        { volatile int sink = 0; for (int k = 0; k < spin; ++k) sink = k; }
+        { volatile int sink = 0; for (int k = 0; k < spin; ++k) sink = k; (void) sink; }
         u->close();
         if (!netWaitUntil([&] { return done->load() != 0; }, 3s)) {
             ++hangs;
@@ -893,8 +951,8 @@ TEST(audit_net_tcp_serve_does_not_drop_a_connection_after_fd_exhaustion_ends) {
         // Child: plain syscalls only. Open many connections, hold them, close them on request,
         // then make exactly one more.
         ::close(listener.fd());
-        auto sig = [&](char c) { (void) ::write(up[1], &c, 1); };
-        auto wait = [&] { char c; (void) ::read(down[0], &c, 1); return c; };
+        auto sig = [&](char c) { [[maybe_unused]] const auto rc = ::write(up[1], &c, 1); };
+        auto wait = [&] { char c = 0; [[maybe_unused]] const auto rc = ::read(down[0], &c, 1); return c; };
         auto dial = [&]() {
             const int s = ::socket(AF_INET, SOCK_STREAM, 0);
             sockaddr_in a{};
@@ -951,17 +1009,17 @@ TEST(audit_net_tcp_serve_does_not_drop_a_connection_after_fd_exhaustion_ends) {
     char c = 0;
     EXPECT_EQ(::read(up[0], &c, 1), 1); // 'a': the child has made its connections
     std::this_thread::sleep_for(500ms); // the server hits EMFILE and sheds
-    (void) ::write(down[1], "b", 1);
+    [[maybe_unused]] const auto wb = ::write(down[1], "b", 1);
     EXPECT_EQ(::read(up[0], &c, 1), 1); // 'c': the child closed them all
     EXPECT_TRUE(netWaitUntil([&] { return gLive.load() == 0; }, 5s));
     std::this_thread::sleep_for(300ms);
     if (limited) (void) ::setrlimit(RLIMIT_NOFILE, &old);
     const int before = gHandled.load();
-    (void) ::write(down[1], "d", 1);
+    [[maybe_unused]] const auto wd = ::write(down[1], "d", 1);
     EXPECT_EQ(::read(up[0], &c, 1), 1); // 'e': one more connection was made
     // Formerly swallowed by the shedding accept that was still parked.
     EXPECT_TRUE(netWaitUntil([&] { return gHandled.load() > before; }, 3s));
-    (void) ::write(down[1], "f", 1);
+    [[maybe_unused]] const auto wf = ::write(down[1], "f", 1);
     int status = 0;
     ::waitpid(pid, &status, 0);
     ss.request_stop();

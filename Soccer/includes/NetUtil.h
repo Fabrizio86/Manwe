@@ -63,6 +63,7 @@ namespace Soccer {
                 static constexpr int kMaxDeferred = 4;
                 std::atomic<int> fdValue{-1};
                 std::atomic<int> busy{0};
+                std::atomic<bool> interrupted{false}; ///< set by @ref SocketSlot::interrupt; sticky
                 std::mutex mu;          ///< guards deferred / nDeferred
                 int deferred[kMaxDeferred]{};
                 int nDeferred = 0;
@@ -122,6 +123,16 @@ namespace Soccer {
 
             /// Take the descriptor out of the slot without closing it (-1 when empty).
             int take() noexcept { return this->st->fdValue.exchange(-1, std::memory_order_seq_cst); }
+
+            /**
+             * @brief Ask whoever is waiting on this slot to give up, without closing it. Sticky: later waits see it
+             *        too. The caller still has to wake a parked waiter (Reactor::cancelFd); a waiter that registers
+             *        after the flag was set wakes itself, see @ref SlotWait.
+             */
+            void interrupt() noexcept { this->st->interrupted.store(true, std::memory_order_seq_cst); }
+
+            /// Whether @ref interrupt was called.
+            bool interrupted() const noexcept { return this->st->interrupted.load(std::memory_order_seq_cst); }
 
             /// Put @p fd in an empty slot.
             void reset(int fd) noexcept { this->st->fdValue.store(fd, std::memory_order_seq_cst); }
@@ -218,10 +229,11 @@ namespace Soccer {
                 // Locals only after the inner registration: the wait may complete, and
                 // destroy this awaiter and the whole frame, on another thread right away.
                 const std::shared_ptr<SocketSlot::State> keep = this->state;
-                const int waitFd = this->fd;
+                [[maybe_unused]] const int waitFd = this->fd;
                 const bool parked = this->inner.await_suspend(h);
 #ifndef _WIN32
-                if (parked && keep->fdValue.load(std::memory_order_seq_cst) != waitFd) {
+                if (parked && (keep->fdValue.load(std::memory_order_seq_cst) != waitFd
+                               || keep->interrupted.load(std::memory_order_seq_cst))) {
                     (void) YarnBall::Reactor::instance()->cancelFd(waitFd);
                 }
 #endif
@@ -343,15 +355,17 @@ namespace Soccer {
                                 reinterpret_cast<const char *>(&on), sizeof(on));
         }
 
+        /// Smallest share of a connect budget an earlier candidate address gets (see @ref connectSlice).
+        inline constexpr std::chrono::milliseconds kMinConnectSlice{250};
+
         /**
          * @brief Share of a connect budget one candidate address may use. The last
          *        candidate gets everything that is left; an earlier one gets an equal share
-         *        (but at least @p kMinConnectSlice, capped by what is left), so a blackholed
+         *        (but at least @ref kMinConnectSlice, capped by what is left), so a blackholed
          *        first address cannot consume the whole budget and starve the others.
          * @param remaining Time left of the overall budget.
          * @param candidatesLeft Candidates still to try, this one included (>= 1).
          */
-        inline constexpr std::chrono::milliseconds kMinConnectSlice{250};
         inline std::chrono::milliseconds connectSlice(std::chrono::milliseconds remaining,
                                                       std::size_t candidatesLeft) noexcept {
             if (candidatesLeft <= 1) return remaining;

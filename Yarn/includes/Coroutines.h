@@ -123,6 +123,12 @@ namespace YarnBall {
          * @c SyncWaitTask). Cost on the happy path is one atomic load.
          */
         struct TaskPromiseCore {
+            /// Frames of Task coroutines come from the size-class pools (see @ref frameAlloc): one is created and
+            /// destroyed per awaited Task, so this is the allocation every coroutine-heavy path pays for.
+            static void *operator new(std::size_t n) { return frameAlloc(n); }
+
+            static void operator delete(void *p, std::size_t n) noexcept { frameFree(p, n); }
+
             /**
              * @brief Cancellation flag for this promise. Set by
              *        @c Task::requestCancel. Read by @c checkCancel and

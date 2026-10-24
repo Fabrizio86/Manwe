@@ -38,7 +38,7 @@ namespace YarnBall {
     };
 
     /**
-     * @struct Cell
+     * @class Cell
      * @brief One slot in the bounded MPMC ring.
      *
      * @tparam T Element type. The cell holds raw aligned storage so the queue

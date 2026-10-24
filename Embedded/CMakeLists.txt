@@ -23,6 +23,7 @@ set(EMBEDDED_SOURCES
 set(EMBEDDED_HEADERS
         includes/SerialPort.h
         includes/Gpio.h
+        includes/FdSlot.h
 )
 
 add_library(Embedded ${EMBEDDED_SOURCES} ${EMBEDDED_HEADERS})

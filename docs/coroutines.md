@@ -315,9 +315,20 @@ try {
 }
 ```
 
-Implementation is `whenAny(task, sleepFor(duration))` with a typed
-wrapper. Both `Task<void>` and `Task<T>` overloads exist. Same loser
-semantics as `whenAny`.
+The task runs in a runner of its own, in a cancellation scope, while a
+plain Reactor timer (no sleeper coroutine, no thread) counts down. If the
+task wins, the timer is taken back and nothing is thrown or unwound for it
+(about 0.7 µs per use on Apple silicon, against 4.3 µs when it was a
+`whenAny` against a sleeper); if the timer wins, the task's scope is
+stopped. `Task<void>` and `Task<T>` are one template. Same loser
+semantics as `whenAny`: the task is cancelled but not waited for, so what
+it borrows must outlive it.
+
+To wait for the task to finish unwinding before the timeout is reported,
+pass the tag: `withTimeout(task, 5s, joinLosers)`. What the task borrows
+then only has to outlive the call, at the price that a task which ignores
+cancellation (it is computing, or parked in a foreign awaitable) delays the
+timeout until it ends. `whenAny(tasks, joinLosers)` is the same for a race.
 
 ### `deadlineToken(duration)` — a stop_token that fires after a delay
 
@@ -333,9 +344,10 @@ auto r = co_await whenAll(
     fetchTertiary(tok));
 ```
 
-Backed by a small detached coroutine that sleeps and calls
-`request_stop()`. Cheap, but don't create thousands per second — pass
-one token to N children instead.
+Backed by a plain Reactor timer that calls `request_stop()` (no coroutine,
+no thread; about 0.25 µs to create). Pass a second `stop_token` as
+`deadlineToken(2s, cancel)` to withdraw the deadline early: the timer is
+taken back, nothing is thrown, and the returned token is never signalled.
 
 ---
 

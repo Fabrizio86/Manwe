@@ -15,12 +15,20 @@ if (NOT MSVC)
 endif ()
 
 add_executable(YarnTests main.cpp soccer_limits_tests.cpp cancellation_tests.cpp
-        audit_core_tests.cpp audit_async_tests.cpp audit_wire_tests.cpp audit_soccer_net_tests.cpp audit_soccer_http_tests.cpp
+        audit_core_tests.cpp audit_async_tests.cpp audit_wire_tests.cpp audit_soccer_net_tests.cpp audit_soccer_http_tests.cpp audit_embedded_tests.cpp
         test_framework.hpp)
 
 # Link against the CMake targets (not raw .a paths) so that PUBLIC compile
 # definitions like SOCCER_HAS_TLS propagate transitively.
-target_link_libraries(YarnTests PUBLIC Soccer Wire Yarn)
+# Embedded's regression tests need a pseudo-terminal, so they are POSIX only (the file is empty elsewhere).
+if(WIN32)
+    target_link_libraries(YarnTests PUBLIC Soccer Wire Yarn)
+else()
+    target_link_libraries(YarnTests PUBLIC Embedded Soccer Wire Yarn)
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        target_link_libraries(YarnTests PUBLIC util)
+    endif()
+endif()
 add_test(NAME YarnTests COMMAND YarnTests)
 
 # Process-exit reproducer for ~Yarn (not part of YarnTests: it must be run many times, see the file header).

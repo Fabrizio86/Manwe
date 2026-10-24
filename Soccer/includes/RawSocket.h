@@ -57,7 +57,7 @@ namespace Soccer {
          *       that frame ICMPv6 themselves.
          */
         static RawSocket icmp(int family = AF_INET) {
-            return open(family, family == AF_INET6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP);
+            return open(family, family == AF_INET6 ? static_cast<int>(IPPROTO_ICMPV6) : static_cast<int>(IPPROTO_ICMP));
         }
 
         RawSocket(const RawSocket &) = delete;

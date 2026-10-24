@@ -428,7 +428,8 @@ namespace YarnBall {
  * @endcode
  */
 #define YARN_FOREACH_AWAIT(decl, stream)                                         \
-    if (auto _yfa_stream = (stream); true)                                       \
+    for (auto _yfa_stream = (stream), *_yfa_once = &_yfa_stream; _yfa_once;      \
+         _yfa_once = nullptr)                                                    \
         for (auto _yfa_opt = co_await _yfa_stream.next();                        \
              _yfa_opt.has_value();                                               \
              _yfa_opt = co_await _yfa_stream.next())                             \

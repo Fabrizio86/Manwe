@@ -4,6 +4,12 @@ project(Manwe VERSION 1.1.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# The scheduler and the work-stealing deque rely on seq_cst fences (a store-load handshake no acquire/release pair gives).
+# GCC's ThreadSanitizer cannot model a standalone fence and warns at each one; the warning carries no information here.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_FLAGS MATCHES "fsanitize=[a-z,]*thread")
+    add_compile_options(-Wno-tsan)
+endif()
+
 # Default to an optimised build so benchmarks are meaningful.
 if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)

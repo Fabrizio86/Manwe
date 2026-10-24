@@ -23,7 +23,7 @@ namespace YarnBall {
     namespace detail {
 
         /**
-         * @struct WhenAllState
+         * @class WhenAllState
          * @brief Shared state between the @c whenAll coroutine and its
          *        spawned per-task workers.
          *

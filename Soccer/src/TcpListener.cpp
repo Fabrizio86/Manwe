@@ -278,6 +278,7 @@ namespace Soccer {
             if (fd < 0) {
                 throw SocketException("accept on closed TcpListener");
             }
+            if (this->sock.interrupted()) throw SocketException("accept interrupted");
             SocketAddress peer;
             int err = 0;
             const int client = acceptOnce(fd, peer, err);
@@ -338,10 +339,15 @@ namespace Soccer {
     }
 
     bool TcpListener::interruptAccept() noexcept {
-#if defined(__linux__)
+#ifndef _WIN32
         auto use = this->sock.begin();
         if (use.fd() < 0) return false;
+        // The flag makes a parked accept fail when it is woken, and a wait that registers after this point wakes
+        // itself (see SlotWait), so no wakeup is lost; the shutdown on Linux only makes the fd readable as well.
+        this->sock.interrupt();
+#if defined(__linux__)
         (void) ::shutdown(use.fd(), SHUT_RD);
+#endif
         (void) YarnBall::Reactor::instance()->cancelFd(use.fd());
         return true;
 #else

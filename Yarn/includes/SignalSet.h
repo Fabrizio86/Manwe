@@ -135,9 +135,9 @@ namespace YarnBall {
         /** Owns the descriptor the Reactor waits on: a kqueue (BSD/macOS) or the read end of the self-pipe. */
         std::shared_ptr<State> state;
         /** Write end of the self-pipe (non-kqueue builds only). */
-        int writeFd = -1;
+        [[maybe_unused]] int writeFd = -1;
         /** Index of this set's slot in the handler's fan-out table (non-kqueue builds only). */
-        int fanSlot = -1;
+        [[maybe_unused]] int fanSlot = -1;
         /** Signals this set holds a reference on (in install order). */
         std::vector<int> installedSignals;
 #endif

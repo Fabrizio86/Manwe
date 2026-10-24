@@ -142,11 +142,11 @@ namespace Soccer {
 
         /**
          * @brief Make an @c accept() parked on this listener return (it throws) without
-         *        closing the listener or queueing a connection. Only supported where a
-         *        shutdown of the listening socket wakes the waiter -- Linux.
-         * @return @c true if the wake was issued; @c false where unsupported (macOS and
-         *         the BSDs), or if the listener is closed. Callers then have to knock on
-         *         the listener's own address instead (see @c tcpServe).
+         *        closing the listener or queueing a connection. Sticky: every later
+         *        @c accept() throws too (@c tryAccept is unaffected).
+         * @return @c true if the wake was issued; @c false on Windows, or if the listener is
+         *         closed. Callers then have to knock on the listener's own address instead
+         *         (see @c tcpServe).
          */
         bool interruptAccept() noexcept;
 

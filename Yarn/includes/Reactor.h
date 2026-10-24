@@ -368,6 +368,32 @@ namespace YarnBall {
         std::mutex fdMu;
 
         void registerFd(int fd, std::coroutine_handle<> h, bool writable) noexcept;
+
+        /// Armed timers ordered by deadline: O(log n) insert, O(1) earliest. Guarded by @ref timerSetMu.
+        using TimerMap = std::multimap<std::chrono::steady_clock::time_point, void *>;
+        TimerMap timers;
+
+        /**
+         * @brief Handle address -> its @ref timers node, so @ref cancelTimer erases in O(log n) without a syscall. An
+         *        address is in here exactly while its timer is armed; whoever erases it (fire, cancel, shutdown) owns
+         *        the one resume. Guarded by @ref timerSetMu.
+         */
+        std::unordered_map<void *, TimerMap::iterator> timerIndex;
+
+        /**
+         * @brief Whether the one kernel timer (a single EVFILT_TIMER knote serves every sleep) is armed, and for which
+         *        deadline. A cancel never re-arms (the extra expiry is harmless: the loop finds nothing due and
+         *        re-arms for what is left), so this can be earlier than the first entry of @ref timers but never
+         *        later. Guarded by @ref timerSetMu.
+         */
+        bool timerArmed = false;
+        std::chrono::steady_clock::time_point timerArmedFor{};
+
+        /// Guards @ref timers, @ref timerIndex and the arming state against registerTimer / cancelTimer and the loop.
+        std::mutex timerSetMu;
+
+        /// Arm the kernel timer for @p deadline (never in the past: an already-due deadline fires at once). Held lock.
+        void armKernelTimerLocked(std::chrono::steady_clock::time_point deadline) noexcept;
 #elif defined(__linux__) && defined(YARN_USE_IO_URING)
         /**
          * @brief liburing ring handle. Allocated in the constructor;

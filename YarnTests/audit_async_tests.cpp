@@ -88,7 +88,7 @@ namespace {
     };
 
     /// Body that records it ran; holds @p sentinel so its frame's destruction is observable as a use_count drop.
-    Task<> sentinelBody(std::shared_ptr<int> sentinel, std::atomic<int> *ran) {
+    Task<> sentinelBody([[maybe_unused]] std::shared_ptr<int> sentinel, std::atomic<int> *ran) {
         ran->fetch_add(1);
         co_return;
     }
@@ -114,7 +114,7 @@ namespace {
         ~DtorCounter() { if (n) n->fetch_add(1); }
     };
 
-    Task<int> guardedValue(DtorCounter guard, int v) { co_return v; }
+    Task<int> guardedValue([[maybe_unused]] DtorCounter guard, int v) { co_return v; }
 
     Task<> joinGuarded(std::atomic<int> *gone, int *failures) {
         auto h = YarnBall::spawnJoinable(guardedValue(DtorCounter{gone}, 1));
@@ -645,3 +645,160 @@ TEST(audit_async_fd_wait_cancelled_while_registering_never_wakes_another_waiter)
 }
 
 #endif
+
+// ---- withTimeout on a direct Reactor timer ----------------------------------------
+
+namespace {
+    Task<int> asyncThrowsAfterYield() {
+        co_await YarnBall::sleepFor(1ms);
+        throw std::runtime_error("boom");
+        co_return 0;
+    }
+
+    Task<int> asyncTimedThrower() { co_return co_await YarnBall::withTimeout(asyncThrowsAfterYield(), 30s); }
+
+    Task<> asyncTimedSleeper(std::chrono::milliseconds limit) { co_await YarnBall::withTimeout(asyncSleepThirty(), limit); }
+
+    Task<> asyncTimedSleeperInScope(std::stop_token token) {
+        co_await YarnBall::withCancellation(token, asyncTimedSleeper(30s));
+    }
+}
+
+TEST(audit_async_with_timeout_rethrows_the_exception_of_a_task_that_wins_by_throwing) {
+    EXPECT_THROWS_AS(YarnBall::syncWait(asyncTimedThrower()), std::runtime_error);
+}
+
+TEST(audit_async_with_timeout_zero_limit_times_out_a_sleeping_task) {
+    EXPECT_THROWS_AS(YarnBall::syncWait(asyncTimedSleeper(0ms)), YarnBall::TimeoutException);
+}
+
+TEST(audit_async_with_timeout_stops_with_the_scope_it_runs_in) {
+    std::stop_source src;
+    std::atomic<int> flag{0};
+    auto t = asyncTimedSleeperInScope(src.get_token());
+    YarnBall::coSpawn(asyncOutcomeOf(&t, &flag));
+    std::this_thread::sleep_for(50ms);
+    const auto t0 = std::chrono::steady_clock::now();
+    src.request_stop();
+    EXPECT_TRUE(async_wait_for([&] { return flag.load() != 0; }, 5s));
+    EXPECT_EQ(flag.load(), 2); // cancelled, not timed out and not stuck for 30 s
+    EXPECT_TRUE(std::chrono::steady_clock::now() - t0 < 5s);
+}
+
+TEST(audit_async_with_timeout_many_concurrent_early_wins_and_timeouts_stay_exact) {
+    constexpr int kN = 2000;
+    std::atomic<int> won{0}, expired{0};
+    auto early = [](std::atomic<int> *w) -> Task<> {
+        if (co_await YarnBall::withTimeout(asyncInstantSeven(), 60s) == 7) w->fetch_add(1);
+    };
+    auto late = [](std::atomic<int> *e) -> Task<> {
+        try {
+            co_await YarnBall::withTimeout(asyncSleepThirty(), 5ms);
+        } catch (const YarnBall::TimeoutException &) {
+            e->fetch_add(1);
+        }
+    };
+    for (int i = 0; i < kN; ++i) {
+        YarnBall::coSpawn(early(&won));
+        YarnBall::coSpawn(late(&expired));
+    }
+    EXPECT_TRUE(async_wait_for([&] { return won.load() == kN && expired.load() == kN; }, 60s));
+}
+
+TEST(audit_async_deadline_token_withdraw_racing_with_registration_is_clean) {
+    // The withdrawal races the timer registration from another thread: whichever order they land in, the timer must be
+    // taken back, the long deadline must never fire, and nothing may touch a freed timer.
+    constexpr int kRounds = 3000;
+    std::vector<std::stop_token> tokens;
+    tokens.reserve(kRounds);
+    for (int i = 0; i < kRounds; ++i) {
+        std::stop_source cancel;
+        std::thread racer([&cancel] { cancel.request_stop(); });
+        tokens.push_back(YarnBall::deadlineToken(60s, cancel.get_token()));
+        racer.join();
+    }
+    std::this_thread::sleep_for(50ms);
+    for (const auto &t : tokens) EXPECT_FALSE(t.stop_requested());
+}
+
+TEST(audit_async_deadline_token_fires_and_a_late_withdraw_is_harmless) {
+    std::stop_source cancel;
+    const std::stop_token tok = YarnBall::deadlineToken(20ms, cancel.get_token());
+    EXPECT_TRUE(async_wait_for([&] { return tok.stop_requested(); }, 5s));
+    cancel.request_stop(); // after the timer ran: must neither crash nor un-fire
+    std::this_thread::sleep_for(20ms);
+    EXPECT_TRUE(tok.stop_requested());
+}
+
+// ---- Joined losers ------------------------------------------------------------
+
+namespace {
+    /// Sleeps until cancelled, then takes a while to unwind; records when it was done.
+    Task<> asyncSlowUnwind(std::shared_ptr<std::atomic<bool>> unwound) {
+        struct Mark {
+            std::shared_ptr<std::atomic<bool>> f;
+            ~Mark() { f->store(true); }
+        } mark{unwound};
+        try {
+            co_await YarnBall::sleepFor(30s);
+        } catch (const CancelledException &) {
+            std::this_thread::sleep_for(150ms); // cleanup that takes time
+            throw;
+        }
+    }
+
+    Task<> asyncJoinedTimeout(std::shared_ptr<std::atomic<bool>> unwound, std::atomic<bool> *unwoundAtThrow) {
+        try {
+            co_await YarnBall::withTimeout(asyncSlowUnwind(unwound), 20ms, YarnBall::joinLosers);
+        } catch (const YarnBall::TimeoutException &) {
+            unwoundAtThrow->store(unwound->load());
+        }
+    }
+
+    Task<> asyncPlainTimeout(std::shared_ptr<std::atomic<bool>> unwound, std::atomic<bool> *unwoundAtThrow) {
+        try {
+            co_await YarnBall::withTimeout(asyncSlowUnwind(unwound), 20ms);
+        } catch (const YarnBall::TimeoutException &) {
+            unwoundAtThrow->store(unwound->load());
+        }
+    }
+
+    Task<> asyncSleepTen() { co_await YarnBall::sleepFor(10ms); }
+
+    Task<std::size_t> asyncJoinedRace(std::shared_ptr<std::atomic<bool>> unwound, std::atomic<bool> *loserDone) {
+        std::vector<Task<>> v;
+        v.push_back(asyncSleepTen());
+        v.push_back(asyncSlowUnwind(unwound));
+        const std::size_t winner = co_await YarnBall::whenAny(std::move(v), YarnBall::joinLosers);
+        loserDone->store(unwound->load());
+        co_return winner;
+    }
+}
+
+TEST(audit_async_with_timeout_joined_waits_for_the_task_to_unwind_before_throwing) {
+    auto unwound = std::make_shared<std::atomic<bool>>(false);
+    std::atomic<bool> seen{false};
+    YarnBall::syncWait(asyncJoinedTimeout(unwound, &seen));
+    EXPECT_TRUE(seen.load()); // the task had finished unwinding when TimeoutException arrived
+}
+
+TEST(audit_async_with_timeout_default_does_not_wait_for_the_task) {
+    auto unwound = std::make_shared<std::atomic<bool>>(false);
+    std::atomic<bool> seen{true};
+    YarnBall::syncWait(asyncPlainTimeout(unwound, &seen));
+    EXPECT_FALSE(seen.load()); // still unwinding when the timeout was reported
+    EXPECT_TRUE(async_wait_for([&] { return unwound->load(); }, 5s));
+}
+
+TEST(audit_async_when_any_joined_resumes_after_every_loser_finished) {
+    auto unwound = std::make_shared<std::atomic<bool>>(false);
+    std::atomic<bool> loserDone{false};
+    EXPECT_EQ(YarnBall::syncWait(asyncJoinedRace(unwound, &loserDone)), std::size_t(0));
+    EXPECT_TRUE(loserDone.load());
+}
+
+TEST(audit_async_with_timeout_joined_task_win_and_rethrow_are_unchanged) {
+    EXPECT_EQ(YarnBall::syncWait(YarnBall::withTimeout(asyncInstantSeven(), 30s, YarnBall::joinLosers)), 7);
+    auto thrower = []() -> Task<int> { co_return co_await YarnBall::withTimeout(asyncThrowsAfterYield(), 30s, YarnBall::joinLosers); };
+    EXPECT_THROWS_AS(YarnBall::syncWait(thrower()), std::runtime_error);
+}

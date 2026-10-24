@@ -128,7 +128,6 @@ namespace YarnBall::io {
     } // namespace impl
 
     /**
-     * @struct WaitReadableAwaiter
      * @brief Awaiter that suspends the current coroutine until the given fd
      *        becomes readable. Resumption lands on a Yarn worker. Cancellable
      *        (see Cancellation.h).
@@ -136,7 +135,6 @@ namespace YarnBall::io {
     using WaitReadableAwaiter = impl::FdWaitAwaiter<false>;
 
     /**
-     * @struct WaitWritableAwaiter
      * @brief Awaiter that suspends the current coroutine until the given fd
      *        becomes writable. Resumption lands on a Yarn worker. Cancellable
      *        (see Cancellation.h).

@@ -36,11 +36,14 @@ namespace YarnBall::detail {
      * @tparam SlotSize Size in bytes of each allocation. Must be at least
      *                  @c sizeof(void*) so an unused slot can hold the
      *                  freelist link.
+     * @tparam Batch    Blocks moved between a thread's cache and the shared pool per lock hold. A pool whose blocks are
+     *                  allocated on one thread and freed on others (coroutine frames) wants a large one, so that the
+     *                  shared mutex is taken once per many blocks.
      */
-    template<std::size_t SlotSize>
+    template<std::size_t SlotSize, std::size_t Batch = 16>
     class SmallObjectPool {
-        static_assert(SlotSize >= sizeof(void *),
-                      "SmallObjectPool slot must hold a freelist link");
+        static_assert(SlotSize >= 3 * sizeof(void *),
+                      "SmallObjectPool slot must hold a batch header");
 
     public:
         /**
@@ -74,15 +77,8 @@ namespace YarnBall::detail {
                 // The local list is empty, so this thread may not have a flush-on-exit hook yet (blocks also arrive here
                 // from threads that only ever free). After the hook has run, bypass the thread cache entirely.
                 if (tlsDead) {
-                    {
-                        std::lock_guard<std::mutex> lk(globalMu);
-                        if (globalCount < kMaxGlobal) {
-                            node->next = globalHead;
-                            globalHead = node;
-                            ++globalCount;
-                            return;
-                        }
-                    }
+                    node->next = nullptr;
+                    if (pushBatch(node, 1)) return;
                     std::free(node);
                     return;
                 }
@@ -98,12 +94,15 @@ namespace YarnBall::detail {
 
     private:
         /**
-         * @brief Freelist link. Lives in the first @c sizeof(void*) bytes
-         *        of an unused slot; the slot is repurposed as @c Node when
-         *        free and as user data when allocated.
+         * @brief Freelist link (and, for the head of a batch in the shared pool, the batch header). Lives in the
+         *        first bytes of an unused slot; the slot is repurposed as @c Node when free and as user data when
+         *        allocated.
          */
         struct Node {
             Node *next;
+            /// Only in the first node of a batch parked in the shared pool: the next batch, and this batch's length.
+            Node *nextBatch;
+            std::size_t count;
         };
 
         /**
@@ -111,7 +110,7 @@ namespace YarnBall::detail {
          *        Larger amortises the shared-pool lock; smaller keeps the
          *        worst-case latency of a batch move bounded.
          */
-        static constexpr std::size_t kBatchSize = 16;
+        static constexpr std::size_t kBatchSize = Batch;
 
         /**
          * @brief Spill point: when @c tlsCount reaches this many slots,
@@ -143,15 +142,32 @@ namespace YarnBall::detail {
         static void refillFromGlobal() {
             if (tlsDead) return;
             armThreadExit();
-            std::lock_guard<std::mutex> lk(globalMu);
-            for (std::size_t i = 0; i < kBatchSize && globalHead != nullptr; ++i) {
-                Node *n = globalHead;
-                globalHead = n->next;
-                --globalCount;
-                n->next = tlsHead;
-                tlsHead = n;
-                ++tlsCount;
+            Node *batch;
+            {
+                std::lock_guard<std::mutex> lk(globalMu);
+                batch = globalHead;
+                if (batch == nullptr) return;
+                globalHead = batch->nextBatch;
+                globalCount -= batch->count;
             }
+            // A whole batch is adopted by relinking one pointer: the other blocks are not touched (they were freed by
+            // other threads, so their cache lines belong to other cores).
+            tlsHead = batch;
+            tlsCount = batch->count;
+        }
+
+        /**
+         * @brief Park the chain @p head (@p count blocks, null-terminated) in the shared pool.
+         * @return @c false when the pool is full and the caller must give the blocks back to the allocator.
+         */
+        static bool pushBatch(Node *head, std::size_t count) noexcept {
+            std::lock_guard<std::mutex> lk(globalMu);
+            if (globalCount + count > kMaxGlobal) return false;
+            head->nextBatch = globalHead;
+            head->count = count;
+            globalHead = head;
+            globalCount += count;
+            return true;
         }
 
         /**
@@ -159,9 +175,8 @@ namespace YarnBall::detail {
          *        shared pool. Called when the local cache overflows.
          */
         static void spillToGlobal() noexcept {
-            // Detach a kBatchSize-long sub-list from the front of the
-            // local cache, leaving the rest in place. Splice into the
-            // shared pool under its mutex.
+            // Detach a kBatchSize-long sub-list from the front of the local cache, leaving the rest in place, and
+            // park it in the shared pool as one batch.
             Node *batchHead = tlsHead;
             Node *batchTail = batchHead;
             for (std::size_t i = 1; i < kBatchSize; ++i) {
@@ -169,20 +184,9 @@ namespace YarnBall::detail {
             }
             tlsHead = batchTail->next;
             tlsCount -= kBatchSize;
-
-            {
-                std::lock_guard<std::mutex> lk(globalMu);
-                if (globalCount + kBatchSize <= kMaxGlobal) {
-                    batchTail->next = globalHead;
-                    globalHead = batchHead;
-                    globalCount += kBatchSize;
-                    return;
-                }
-            }
-            // Shared pool is full: give the surplus back to the allocator. Cut the chain first: the tail still links
-            // to the blocks that stay in the local cache.
             batchTail->next = nullptr;
-            freeChain(batchHead);
+            // Shared pool full: give the surplus back to the allocator.
+            if (!pushBatch(batchHead, kBatchSize)) freeChain(batchHead);
         }
 
         /**
@@ -196,18 +200,7 @@ namespace YarnBall::detail {
             tlsHead = nullptr;
             tlsCount = 0;
             if (!h) return;
-            Node *t = h;
-            while (t->next) t = t->next;
-            {
-                std::lock_guard<std::mutex> lk(globalMu);
-                if (globalCount + count <= kMaxGlobal) {
-                    t->next = globalHead;
-                    globalHead = h;
-                    globalCount += count;
-                    return;
-                }
-            }
-            freeChain(h);
+            if (!pushBatch(h, count)) freeChain(h);
         }
 
         struct ThreadExitFlush {
@@ -245,25 +238,25 @@ namespace YarnBall::detail {
         static std::mutex globalMu;
     };
 
-    template<std::size_t SlotSize>
-    thread_local typename SmallObjectPool<SlotSize>::Node *
-        SmallObjectPool<SlotSize>::tlsHead = nullptr;
+    template<std::size_t SlotSize, std::size_t Batch>
+    thread_local typename SmallObjectPool<SlotSize, Batch>::Node *
+        SmallObjectPool<SlotSize, Batch>::tlsHead = nullptr;
 
-    template<std::size_t SlotSize>
-    thread_local std::size_t SmallObjectPool<SlotSize>::tlsCount = 0;
+    template<std::size_t SlotSize, std::size_t Batch>
+    thread_local std::size_t SmallObjectPool<SlotSize, Batch>::tlsCount = 0;
 
-    template<std::size_t SlotSize>
-    thread_local bool SmallObjectPool<SlotSize>::tlsDead = false;
+    template<std::size_t SlotSize, std::size_t Batch>
+    thread_local bool SmallObjectPool<SlotSize, Batch>::tlsDead = false;
 
-    template<std::size_t SlotSize>
-    typename SmallObjectPool<SlotSize>::Node *
-        SmallObjectPool<SlotSize>::globalHead = nullptr;
+    template<std::size_t SlotSize, std::size_t Batch>
+    typename SmallObjectPool<SlotSize, Batch>::Node *
+        SmallObjectPool<SlotSize, Batch>::globalHead = nullptr;
 
-    template<std::size_t SlotSize>
-    std::size_t SmallObjectPool<SlotSize>::globalCount = 0;
+    template<std::size_t SlotSize, std::size_t Batch>
+    std::size_t SmallObjectPool<SlotSize, Batch>::globalCount = 0;
 
-    template<std::size_t SlotSize>
-    std::mutex SmallObjectPool<SlotSize>::globalMu;
+    template<std::size_t SlotSize, std::size_t Batch>
+    std::mutex SmallObjectPool<SlotSize, Batch>::globalMu;
 
 
     /**
@@ -297,6 +290,63 @@ namespace YarnBall::detail {
     template<typename T>
     inline void poolFree(void *p) noexcept {
         SmallObjectPool<poolSlotSize<sizeof(T), alignof(T)>()>::deallocate(p);
+    }
+
+    // ---- Coroutine frames ----------------------------------------------------------------------------------------
+
+    /// Frame pools move 64 blocks per lock hold: frames are allocated by the thread that awaits a Task and freed by
+    /// whichever worker finished it, which is the pattern a small batch handles worst.
+    template<std::size_t Slot>
+    using FramePool = SmallObjectPool<Slot, 64>;
+
+    // Under AddressSanitizer a recycled frame would hide a use-after-free of the frame, which is exactly what the
+    // sanitizer is run to find, so frames then go straight to the allocator (as they do with YARN_NO_FRAME_POOL).
+#if defined(YARN_NO_FRAME_POOL) || defined(__SANITIZE_ADDRESS__)
+#  define YARN_FRAME_POOL_DISABLED 1
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define YARN_FRAME_POOL_DISABLED 1
+#  endif
+#endif
+
+    /**
+     * @brief Allocate the frame of a Task coroutine. Frames up to 1 KiB come from the per-size thread-cached pools
+     *        (a frame is created and destroyed on every @c co_await of a Task, usually on different threads, which the
+     *        pools' shared spill handles); bigger ones go to the allocator. @ref frameFree must be given the same size.
+     */
+    inline void *frameAlloc(std::size_t n) {
+#ifdef YARN_FRAME_POOL_DISABLED
+        return ::operator new(n);
+#else
+        if (n <= 64) return FramePool<64>::allocate();
+        if (n <= 96) return FramePool<96>::allocate();
+        if (n <= 128) return FramePool<128>::allocate();
+        if (n <= 192) return FramePool<192>::allocate();
+        if (n <= 256) return FramePool<256>::allocate();
+        if (n <= 384) return FramePool<384>::allocate();
+        if (n <= 512) return FramePool<512>::allocate();
+        if (n <= 768) return FramePool<768>::allocate();
+        if (n <= 1024) return FramePool<1024>::allocate();
+        return ::operator new(n);
+#endif
+    }
+
+    inline void frameFree(void *p, std::size_t n) noexcept {
+#ifdef YARN_FRAME_POOL_DISABLED
+        ::operator delete(p);
+        (void) n;
+#else
+        if (n <= 64) return FramePool<64>::deallocate(p);
+        if (n <= 96) return FramePool<96>::deallocate(p);
+        if (n <= 128) return FramePool<128>::deallocate(p);
+        if (n <= 192) return FramePool<192>::deallocate(p);
+        if (n <= 256) return FramePool<256>::deallocate(p);
+        if (n <= 384) return FramePool<384>::deallocate(p);
+        if (n <= 512) return FramePool<512>::deallocate(p);
+        if (n <= 768) return FramePool<768>::deallocate(p);
+        if (n <= 1024) return FramePool<1024>::deallocate(p);
+        ::operator delete(p);
+#endif
     }
 
 }

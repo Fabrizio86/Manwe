@@ -952,26 +952,7 @@ namespace {
     }
 
     /**
-     * @brief Pull a permit, increment a counter, release the permit.
-     */
-    YarnBall::Task<void> takeReleaseSem(YarnBall::AsyncSemaphore *sem,
-                                            std::atomic<int> *concurrent,
-                                            std::atomic<int> *peak) {
-        co_await sem->acquire();
-        const int now = concurrent->fetch_add(1, std::memory_order_relaxed) + 1;
-        int prev = peak->load(std::memory_order_relaxed);
-        while (now > prev &&
-               !peak->compare_exchange_weak(prev, now, std::memory_order_relaxed)) {
-        }
-        // Yield long enough that the peak count is observable.
-        co_await YarnBall::sleepFor(5ms);
-        concurrent->fetch_sub(1, std::memory_order_relaxed);
-        sem->release();
-        co_return;
-    }
-
-    /**
-     * @brief Same as @ref takeReleaseSem but takes the counter atomics
+     * @brief Pull a permit, count the concurrent holders, release the permit; takes the counter atomics
      *        via @c shared_ptr. Used by the stress test where the
      *        @c whenAll chain may not have fully wound down by the
      *        time the outer test scope returns; the shared_ptr keeps
@@ -2213,7 +2194,7 @@ TEST(reactor_async_read_after_delay) {
 
     std::thread t([writer] {
         std::this_thread::sleep_for(20ms);
-        ::write(writer, "world", 5);
+        [[maybe_unused]] const auto rc = ::write(writer, "world", 5);
     });
 
     char buf[16] = {};
@@ -2273,7 +2254,7 @@ TEST(reactor_async_write_handles_backpressure) {
 static YarnBall::Task<void> readOneByte(int reader, std::atomic<int> *completed) {
     char buf[16];
     co_await YarnBall::io::waitReadable(reader);
-    ::read(reader, buf, sizeof(buf));
+    [[maybe_unused]] const auto rc = ::read(reader, buf, sizeof(buf));
     // Release, not relaxed: the test's counter lives on its stack, and the waiter must see this coroutine's last touch of
     // it as ordered before the stack slot is reused by the next test.
     completed->fetch_add(1, std::memory_order_release);
@@ -2292,7 +2273,7 @@ TEST(reactor_multiple_concurrent_coroutines) {
 
     // Feed every pair from the main thread.
     for (int i = N - 1; i >= 0; --i) {
-        ::write(pairs[i].fds[0], "x", 1);
+        [[maybe_unused]] const auto rc = ::write(pairs[i].fds[0], "x", 1);
     }
 
     EXPECT_TRUE(wait_for([&] { return completed.load() >= N; }, 10s));
@@ -2675,12 +2656,6 @@ TEST(soccer_unix_socket_round_trip) {
 #include <sys/types.h>
 #include <unistd.h>
 #include "../Yarn/includes/SignalSet.h"
-
-namespace {
-    YarnBall::Task<int> awaitOneSignal(YarnBall::SignalSet *sigs) {
-        co_return co_await sigs->next();
-    }
-}
 
 TEST(signal_set_captures_self_raised_signal) {
     YarnBall::SignalSet signals({SIGUSR1});

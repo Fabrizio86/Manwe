@@ -278,40 +278,78 @@ namespace YarnBall::metrics {
         }
     }
 
+    namespace {
+        /// Append the decimal digits of @p v (no locale involved).
+        void appendUnsigned(std::string &out, std::uint64_t v) {
+            char buf[24];
+            const auto res = std::to_chars(buf, buf + sizeof(buf), v);
+            out.append(buf, res.ptr);
+        }
+
+        void appendHelpAndType(std::string &out, const std::string &name, const std::string &help, const char *type) {
+            if (!help.empty()) {
+                out += "# HELP ";
+                out += name;
+                out += ' ';
+                out += escapeHelp(help);
+                out += '\n';
+            }
+            out += "# TYPE ";
+            out += name;
+            out += ' ';
+            out += type;
+            out += '\n';
+        }
+    }
+
     std::string Registry::scrape() const {
         std::lock_guard<std::mutex> lk(this->mu);
-        std::ostringstream os;
-        os.imbue(std::locale::classic());
+        std::string out;
+        out.reserve(this->registrationOrder.size() * 96);
         for (const auto &name : this->registrationOrder) {
             if (auto it = this->counters.find(name); it != this->counters.end()) {
                 const auto &c = *it->second;
-                if (!c.help().empty()) os << "# HELP " << name << " " << escapeHelp(c.help()) << "\n";
-                os << "# TYPE " << name << " counter\n";
-                os << name << " " << c.value() << "\n";
+                appendHelpAndType(out, name, c.help(), "counter");
+                out += name;
+                out += ' ';
+                appendUnsigned(out, c.value());
+                out += '\n';
                 continue;
             }
             if (auto it = this->gauges.find(name); it != this->gauges.end()) {
                 const auto &g = *it->second;
-                if (!g.help().empty()) os << "# HELP " << name << " " << escapeHelp(g.help()) << "\n";
-                os << "# TYPE " << name << " gauge\n";
-                os << name << " " << fmtDouble(g.value()) << "\n";
+                appendHelpAndType(out, name, g.help(), "gauge");
+                out += name;
+                out += ' ';
+                out += fmtDouble(g.value());
+                out += '\n';
                 continue;
             }
             if (auto it = this->histograms.find(name); it != this->histograms.end()) {
                 const auto &h = *it->second;
-                if (!h.help().empty()) os << "# HELP " << name << " " << escapeHelp(h.help()) << "\n";
-                os << "# TYPE " << name << " histogram\n";
+                appendHelpAndType(out, name, h.help(), "histogram");
                 auto snap = h.snapshot();
                 for (const auto &[bound, count] : snap) {
-                    os << name << "_bucket{le=\"" << fmtDouble(bound) << "\"} " << count << "\n";
+                    out += name;
+                    out += "_bucket{le=\"";
+                    out += fmtDouble(bound);
+                    out += "\"} ";
+                    appendUnsigned(out, count);
+                    out += '\n';
                 }
                 // _count must equal the +Inf bucket of this same snapshot, not a separately sampled counter.
-                os << name << "_count " << snap.back().second << "\n";
-                os << name << "_sum " << fmtDouble(h.sum()) << "\n";
+                out += name;
+                out += "_count ";
+                appendUnsigned(out, snap.back().second);
+                out += '\n';
+                out += name;
+                out += "_sum ";
+                out += fmtDouble(h.sum());
+                out += '\n';
                 continue;
             }
         }
-        return os.str();
+        return out;
     }
 
 }

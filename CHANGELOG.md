@@ -20,6 +20,38 @@ to [SemVer](https://semver.org/).
   are restored when the last set holding a signal is destroyed. A second set used to throw
   `SignalCaptureError`; it now succeeds.
 
+### Performance
+- **`withTimeout` runs on a direct Reactor timer.** The task runs in one runner and a timer frame stands
+  in for the sleeper coroutine, so a task that wins takes the timer back and nothing is thrown or
+  unwound. An early win costs ~0.7 µs instead of 4.3 µs (macOS, Apple silicon, Release, sequential);
+  `Task<void>` and `Task<T>` are one template. `deadlineToken` is a bare timer too: 11.5 µs → 0.24 µs to
+  create, and the new `deadlineToken(d, cancel)` withdrawal is a table erase that throws nothing.
+- **kqueue timers use one kernel timer.** As on epoll and io_uring, deadlines go into an ordered table and
+  a single `EVFILT_TIMER` knote is armed for the earliest, so registering or cancelling a sleep is no
+  syscall (it used to be a `kevent` add and delete per sleep).
+- **Task coroutine frames come from size-class pools** (64 B to 1 KiB, per-thread cache with a shared
+  spill) instead of the allocator: a `Task<int>` await 37 → 19 ns. Disabled under AddressSanitizer
+  (a recycled frame would hide a use-after-free of the frame) and with `YARN_NO_FRAME_POOL`.
+- The shared small-object pool hands whole batches between threads by relinking one pointer (it used to
+  walk every block), and takes a batch size per pool; the frame pools use 64. A producer/consumer pattern
+  (frames made on one thread, freed on workers) therefore costs no more than the allocator did.
+- `Registry::scrape` builds the text with string appends and `to_chars` instead of an `ostringstream`
+  (output is byte-identical).
+
+### Added
+- **`withTimeout(task, d, joinLosers)` and `whenAny(tasks, joinLosers)`**: resume the caller only after
+  every loser has finished unwinding, so what a branch borrows only has to outlive the call. Opt-in: the
+  default stays non-joining, because a loser that ignores cancellation would otherwise hold a timeout hostage.
+- **`deadlineToken(duration, cancel)`** withdraws the deadline when `cancel` is stopped first.
+- Embedded regression tests (`YarnTests/audit_embedded_tests.cpp`, POSIX; a pseudo-terminal stands in for
+  the hardware): `FdSlot` in-flight protocol, `close()` waking a parked reader, no stray close of a reused fd.
+
+### Changed (behaviour)
+- **`tcpServe` stops at once on macOS/BSD too.** `TcpListener::interruptAccept()` works on every POSIX
+  platform (a sticky flag on the socket slot plus `Reactor::cancelFd`); the loopback "knock" that could
+  block `request_stop` for up to 250 ms, and queued a stray connection, remains only on Windows.
+  A listener whose accept was interrupted fails every later `accept()` (`tryAccept` is unaffected).
+
 ### Fixed (code audit)
 - **Reactor / cancellation:** epoll `registerFd` no longer resumes a waiter twice when `EPOLL_CTL_MOD`
   fails; epoll timer registration is atomic against `cancelTimer` (no double delete / foreign fd close);

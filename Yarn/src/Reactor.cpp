@@ -240,41 +240,80 @@ namespace YarnBall {
         return woken.size();
     }
 
+    namespace {
+        /// Longest timer accepted: keeps `now + duration` (and the nanosecond count handed to the kernel) from overflowing.
+        inline constexpr long long kMaxTimerNs = 3'000'000'000'000'000'000LL;
+        /// Identifier of the single EVFILT_TIMER knote that serves every sleep (its own namespace, separate from fds).
+        inline constexpr std::uintptr_t kTimerIdent = 1;
+    }
+
+    void Reactor::armKernelTimerLocked(std::chrono::steady_clock::time_point deadline) noexcept {
+        auto rel = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - std::chrono::steady_clock::now()).count();
+        if (rel < 1) rel = 1; // a zero period would be rejected or fire unpredictably; one nanosecond is "now"
+        struct kevent change;
+        // Re-adding the same ident replaces the pending timer, so an earlier deadline simply re-arms it.
+        EV_SET(&change, kTimerIdent, EVFILT_TIMER, EV_ADD | EV_ONESHOT, NOTE_NSECONDS, static_cast<std::intptr_t>(rel), nullptr);
+        if (::kevent(this->kq, &change, 1, nullptr, 0, nullptr) == 0) {
+            this->timerArmed = true;
+            this->timerArmedFor = deadline;
+        } else {
+            // Cannot happen for a valid kqueue; if it does, poke the loop so it re-evaluates instead of sitting on a
+            // deadline nobody is waiting for.
+            this->timerArmed = false;
+            struct kevent poke;
+            EV_SET(&poke, /*ident=*/0, EVFILT_USER, 0, NOTE_TRIGGER, 0, nullptr);
+            (void) ::kevent(this->kq, &poke, 1, nullptr, 0, nullptr);
+        }
+    }
+
     void Reactor::registerTimer(std::chrono::nanoseconds duration,
                                  std::coroutine_handle<> h) noexcept {
-        // ident must be unique per active timer; the handle's address is
-        // perfect (it's also stored as udata so the run loop can recover
-        // the coroutine to resume).
-        const std::uintptr_t ident = reinterpret_cast<std::uintptr_t>(h.address());
-        const std::int64_t ns =
-            duration.count() > 0 ? duration.count() : 0;
-        struct kevent change;
+        // One kernel timer serves every sleep: the deadline goes into an ordered table and the timer is armed for the
+        // earliest. A register or cancel is then a table update, with no syscall unless the earliest deadline moves.
+        const long long ns = duration.count() < 0 ? 0 : (duration.count() > kMaxTimerNs ? kMaxTimerNs : duration.count());
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(ns);
         YARN_TSAN_RELEASE(h.address());
-        if (this->dead.load(std::memory_order_acquire)) {
-            this->schedule(h);
-            return;
+        bool armed = false;
+        try {
+            // Insert and arm under one hold of timerSetMu: a concurrent cancelTimer (a sleep's stop callback can fire
+            // as soon as it is armed, before this call returns) either runs before the entry exists (and finds nothing)
+            // or after it is fully registered, so it never sees a half-built entry.
+            std::lock_guard<std::mutex> lk(this->timerSetMu);
+            if (!this->dead.load(std::memory_order_acquire) && this->timerIndex.find(h.address()) == this->timerIndex.end()) {
+                auto it = this->timers.emplace(deadline, h.address());
+                try {
+                    this->timerIndex.emplace(h.address(), it);
+                    armed = true;
+                } catch (...) {
+                    this->timers.erase(it);
+                    throw;
+                }
+                if (it == this->timers.begin() && (!this->timerArmed || deadline < this->timerArmedFor)) {
+                    this->armKernelTimerLocked(deadline);
+                }
+            }
+        } catch (...) {
+            armed = false;
         }
-        // NOTE_NSECONDS lets us pass nanoseconds directly to the kernel.
-        EV_SET(&change, ident, EVFILT_TIMER,
-               EV_ADD | EV_ONESHOT, NOTE_NSECONDS, ns, h.address());
-        if (::kevent(this->kq, &change, 1, nullptr, 0, nullptr) < 0) {
-            this->schedule(h);
-            return;
-        }
-        // The loop may have died between the check above and the add: the timer then sits in a kqueue nobody reads.
-        // Take it back out; whoever deletes it owns the resume (the dead loop's sweep cannot enumerate timers).
-        if (this->dead.load(std::memory_order_acquire)) (void) this->cancelTimer(h, /*resume=*/true);
+        // Not tracked (loop dead, duplicate handle, out of memory): wake it now rather than strand it.
+        if (!armed) this->schedule(h);
     }
 
     bool Reactor::cancelTimer(std::coroutine_handle<> h, bool resume) noexcept {
-        // A one-shot timer that already fired is gone from the kqueue (ENOENT), so success here means this call, and
-        // not the run loop, owns the handle.
-        const std::uintptr_t ident = reinterpret_cast<std::uintptr_t>(h.address());
-        struct kevent change;
-        EV_SET(&change, ident, EVFILT_TIMER, EV_DELETE, 0, 0, nullptr);
-        if (::kevent(this->kq, &change, 1, nullptr, 0, nullptr) < 0) return false;
-        if (resume) this->schedule(h);
-        return true;
+        bool found = false;
+        {
+            // Whoever erases the index entry (this, the run loop on expiry, or abandonWaiters) owns the single resume.
+            // The kernel timer is left alone: if this was the earliest, the loop wakes once for nothing and re-arms.
+            std::lock_guard<std::mutex> lk(this->timerSetMu);
+            auto it = this->timerIndex.find(h.address());
+            if (it != this->timerIndex.end()) {
+                this->timers.erase(it->second);
+                this->timerIndex.erase(it);
+                found = true;
+            }
+        }
+        if (found && resume) this->schedule(h);
+        return found;
     }
 
     void Reactor::run() {
@@ -292,9 +331,28 @@ namespace YarnBall {
             }
             for (int i = 0; i < n; ++i) {
                 const struct kevent &ev = events[i];
-                if (ev.filter == EVFILT_USER) continue;
+                if (ev.filter == EVFILT_USER) {
+                    // A poke may mean arming the timer failed: make sure it is armed for the earliest deadline.
+                    std::lock_guard<std::mutex> lk(this->timerSetMu);
+                    if (!this->timers.empty() && (!this->timerArmed || this->timers.begin()->first < this->timerArmedFor)) {
+                        this->armKernelTimerLocked(this->timers.begin()->first);
+                    }
+                    continue;
+                }
                 if (ev.filter == EVFILT_TIMER) {
-                    this->schedule(std::coroutine_handle<>::from_address(ev.udata));
+                    due.clear();
+                    {
+                        std::lock_guard<std::mutex> lk(this->timerSetMu);
+                        const auto now = std::chrono::steady_clock::now();
+                        while (!this->timers.empty() && this->timers.begin()->first <= now) {
+                            due.push_back(this->timers.begin()->second);
+                            this->timerIndex.erase(this->timers.begin()->second);
+                            this->timers.erase(this->timers.begin());
+                        }
+                        this->timerArmed = false;
+                        if (!this->timers.empty()) this->armKernelTimerLocked(this->timers.begin()->first);
+                    }
+                    for (void *d : due) this->schedule(std::coroutine_handle<>::from_address(d));
                     continue;
                 }
                 const int fd = static_cast<int>(ev.ident);
@@ -323,7 +381,14 @@ namespace YarnBall {
             }
             this->fdWaiters.clear();
         }
-        // Armed kqueue timers cannot be enumerated from here; they are in the dead kqueue and never fire.
+        {
+            // The loop that would fire these is gone: resume the sleepers too rather than strand them.
+            std::lock_guard<std::mutex> lk(this->timerSetMu);
+            this->dead.store(true, std::memory_order_release); // also under this lock: see registerTimer
+            for (auto &kv : this->timers) woken.push_back(kv.second);
+            this->timers.clear();
+            this->timerIndex.clear();
+        }
         for (void *p : woken) this->schedule(std::coroutine_handle<>::from_address(p));
     }
 
@@ -429,7 +494,7 @@ namespace YarnBall {
     void Reactor::stop() {
         this->running.store(false, std::memory_order_release);
         std::uint64_t v = 1;
-        (void) ::write(this->wakefd, &v, sizeof(v));
+        [[maybe_unused]] const auto rc = ::write(this->wakefd, &v, sizeof(v));
     }
 
     namespace {
@@ -459,7 +524,7 @@ namespace YarnBall {
 
     void Reactor::pokeLoop() noexcept {
         std::uint64_t v = 1;
-        (void) ::write(this->wakefd, &v, sizeof(v));
+        [[maybe_unused]] const auto rc = ::write(this->wakefd, &v, sizeof(v));
     }
 
     io_uring_sqe *Reactor::getSqeLocked() noexcept {
@@ -692,7 +757,7 @@ namespace YarnBall {
                 // Wake event: drain the eventfd, re-arm the watch, loop
                 // will re-check running and exit if needed.
                 std::uint64_t buf;
-                (void) ::read(this->wakefd, &buf, sizeof(buf));
+                [[maybe_unused]] const auto rc = ::read(this->wakefd, &buf, sizeof(buf));
                 ::io_uring_cqe_seen(this->ring, cqe);
 
                 if (this->running.load(std::memory_order_acquire)) {
@@ -848,7 +913,7 @@ namespace YarnBall {
     void Reactor::stop() {
         this->running.store(false, std::memory_order_release);
         std::uint64_t v = 1;
-        (void) ::write(this->wakefd, &v, sizeof(v));
+        [[maybe_unused]] const auto rc = ::write(this->wakefd, &v, sizeof(v));
     }
 
     namespace {
@@ -960,7 +1025,7 @@ namespace YarnBall {
             // sitting on a deadline nobody is waiting for.
             this->timerArmed = false;
             const std::uint64_t one = 1;
-            (void) ::write(this->wakefd, &one, sizeof(one));
+            [[maybe_unused]] const auto rc = ::write(this->wakefd, &one, sizeof(one));
         }
     }
 
@@ -1029,7 +1094,7 @@ namespace YarnBall {
                 void *p = events[i].data.ptr;
                 if (reinterpret_cast<std::uintptr_t>(p) == kWakeupSentinel) {
                     std::uint64_t buf;
-                    (void) ::read(this->wakefd, &buf, sizeof(buf));
+                    [[maybe_unused]] const auto rc = ::read(this->wakefd, &buf, sizeof(buf));
                     {
                         // A poke may mean arming the timerfd failed: make sure it is armed for the earliest deadline.
                         std::lock_guard<std::mutex> lk(this->timerSetMu);
@@ -1041,7 +1106,7 @@ namespace YarnBall {
                 }
                 if (reinterpret_cast<std::uintptr_t>(p) == kTimerSentinel) {
                     std::uint64_t expirations;
-                    (void) ::read(this->timerfd, &expirations, sizeof(expirations));
+                    [[maybe_unused]] const auto rc = ::read(this->timerfd, &expirations, sizeof(expirations));
                     due.clear();
                     {
                         std::lock_guard<std::mutex> lk(this->timerSetMu);

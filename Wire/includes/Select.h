@@ -37,7 +37,7 @@
 namespace Telegraph {
 
     /**
-     * @struct SelectResult
+     * @class SelectResult
      * @brief Output of @ref channelSelect: the index of the channel
      *        that produced a value, plus the value itself.
      *        @c value == std::nullopt means every channel is closed and

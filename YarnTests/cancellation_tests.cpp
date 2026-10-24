@@ -125,11 +125,6 @@ namespace {
 
     Task<> sleepForever() { co_await YarnBall::sleepFor(10min); }
 
-    Task<> sleepForeverGuarded(std::shared_ptr<std::atomic<bool>> destroyed) {
-        DestroyGuard guard(destroyed);
-        co_await YarnBall::sleepFor(10min);
-    }
-
     Task<int> quickValue() {
         co_await YarnBall::sleepFor(5ms);
         co_return 7;
@@ -773,8 +768,6 @@ namespace {
         std::stop_source never;
         co_await YarnBall::withCancellation(never.get_token(), awaitNotified(n));
     }
-
-    Task<> awaitHeld(Task<> *t) { co_await std::move(*t); }
 }
 
 TEST(request_cancel_wakes_async_mutex_waiter) {

@@ -9,10 +9,10 @@
 // parked in a cancellable await runs to its natural end and its result is
 // dropped. withTimeout is the canonical consumer: whenAny(task, sleepFor(d)).
 //
-// LOSERS ARE NOT JOINED. whenAny resumes its caller as soon as the winner is
-// known; a cancelled loser is only *asked* to stop and may still be unwinding
-// (or, if it is not parked in a cancellable await, still running) after
-// whenAny has returned. Joining the losers was evaluated and rejected: a loser
+// LOSERS ARE NOT JOINED (by default). whenAny resumes its caller as soon as the
+// winner is known; a cancelled loser is only *asked* to stop and may still be
+// unwinding (or, if it is not parked in a cancellable await, still running)
+// after whenAny has returned. Joining was rejected as the default: a loser
 // that cannot be cancelled (computation, a foreign awaitable) would then hold
 // the winner hostage, and withTimeout would stop being a timeout. The
 // consequence is a lifetime rule for the caller: everything a branch touches
@@ -20,12 +20,15 @@
 // borrows a stack local or a caller-owned buffer/stream by reference
 // (withTimeout(client.read(buf), d) with `buf` a local, then returning): after
 // the timeout the cancelled read may still touch `buf`. Give such branches
-// shared ownership (std::shared_ptr to the buffer or the connection) or put the
+// shared ownership (std::shared_ptr to the buffer or the connection), put the
 // deadline inside the branch (a deadlineToken / withCancellation scope around
-// the I/O) and join it yourself. Likewise a value a losing branch produces at
-// the instant it loses is destroyed, not delivered: do not use a race to
-// receive from a channel or queue when no item may be lost; use the primitive's
-// own timed form.
+// the I/O) and join it yourself, or ask for the joined form:
+// whenAny(tasks, joinLosers) / withTimeout(task, d, joinLosers) resume the
+// caller only after every loser has finished, which makes borrowing safe at the
+// price of waiting for a loser that does not react to cancellation. Likewise a
+// value a losing branch produces at the instant it loses is destroyed, not
+// delivered: do not use a race to receive from a channel or queue when no item
+// may be lost; use the primitive's own timed form.
 //
 
 #ifndef YARN_WHEN_ANY_H
@@ -52,7 +55,7 @@ namespace YarnBall {
     namespace detail {
 
         /**
-         * @struct WhenAnyState
+         * @class WhenAnyState
          * @brief Shared state between @c whenAny and its per-task runners.
          *        First runner to win the @c finished flag stores its
          *        (index, value-or-exception) and resumes the awaiter; all
@@ -86,6 +89,10 @@ namespace YarnBall {
 
             /// Stopped by the winning runner: the cancellation scope of every branch.
             std::stop_source stop;
+
+            /// Joined mode: the caller resumes only when every runner has finished; the last one to do so publishes.
+            bool join = false;
+            std::atomic<std::size_t> remaining{0};
         };
 
         /**
@@ -100,7 +107,36 @@ namespace YarnBall {
             std::coroutine_handle<> waiter{};
             std::mutex mu;
             std::stop_source stop;
+            bool join = false;
+            std::atomic<std::size_t> remaining{0};
         };
+
+        /**
+         * @brief Publish the outcome and resume the parked caller, if it is parked already.
+         */
+        template<typename State>
+        void publishWhenAny(State &state) noexcept {
+            std::coroutine_handle<> w;
+            {
+                std::lock_guard<std::mutex> lk(state.mu);
+                state.published = true;
+                w = std::exchange(state.waiter, {});
+            }
+            if (w) w.resume();
+        }
+
+        /**
+         * @brief The end of a runner: publish at once when this runner won (default), or, in joined mode, when it is
+         *        the last runner to finish. The winner's writes happen before the publish through @c remaining.
+         */
+        template<typename State>
+        void settleRunner(State &state, bool won) noexcept {
+            if (!state.join) {
+                if (won) publishWhenAny(state);
+            } else if (state.remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                publishWhenAny(state);
+            }
+        }
 
         /**
          * @brief Per-subtask runner for value-bearing tasks. Awaits its
@@ -125,7 +161,8 @@ namespace YarnBall {
             } catch (...) {
                 error = std::current_exception();
             }
-            if (!state->finished.exchange(true, std::memory_order_acq_rel)) {
+            const bool won = !state->finished.exchange(true, std::memory_order_acq_rel);
+            if (won) {
                 state->stop.request_stop();
                 state->winning_index = idx;
                 if (error) {
@@ -137,14 +174,8 @@ namespace YarnBall {
                         state->exception = std::current_exception();
                     }
                 }
-                std::coroutine_handle<> w;
-                {
-                    std::lock_guard<std::mutex> lk(state->mu);
-                    state->published = true;
-                    w = std::exchange(state->waiter, {});
-                }
-                if (w) w.resume();
             }
+            settleRunner(*state, won);
             co_return;
         }
 
@@ -166,32 +197,39 @@ namespace YarnBall {
             } catch (...) {
                 error = std::current_exception();
             }
-            if (!state->finished.exchange(true, std::memory_order_acq_rel)) {
+            const bool won = !state->finished.exchange(true, std::memory_order_acq_rel);
+            if (won) {
                 state->stop.request_stop();
                 state->winning_index = idx;
                 if (error) state->exception = error;
-                std::coroutine_handle<> w;
-                {
-                    std::lock_guard<std::mutex> lk(state->mu);
-                    state->published = true;
-                    w = std::exchange(state->waiter, {});
-                }
-                if (w) w.resume();
             }
+            settleRunner(*state, won);
             co_return;
         }
 
         /**
          * @brief Settle the race with @p ex when spawning a runner failed, unless a runner has already won. The awaiter
-         *        has not parked yet at that point, so only the result is published.
+         *        has not parked yet at that point, so only the result is published. @p unspawned runners were never
+         *        started; in joined mode they no longer count, and when that leaves nothing running the result is
+         *        published here (otherwise the last running runner does it).
          */
         template<typename State>
-        void failWhenAny(State &state, std::exception_ptr ex) noexcept {
-            if (state.finished.exchange(true, std::memory_order_acq_rel)) return;
-            state.stop.request_stop();
-            state.exception = std::move(ex);
-            std::lock_guard<std::mutex> lk(state.mu);
-            state.published = true;
+        void failWhenAny(State &state, std::exception_ptr ex, std::size_t unspawned = 0) noexcept {
+            if (!state.finished.exchange(true, std::memory_order_acq_rel)) {
+                state.stop.request_stop();
+                state.exception = std::move(ex);
+                if (!state.join) {
+                    std::lock_guard<std::mutex> lk(state.mu);
+                    state.published = true;
+                    return;
+                }
+            } else if (!state.join) {
+                return;
+            }
+            if (state.remaining.fetch_sub(unspawned, std::memory_order_acq_rel) == unspawned) {
+                std::lock_guard<std::mutex> lk(state.mu);
+                state.published = true;
+            }
         }
 
         /**
@@ -255,7 +293,7 @@ namespace YarnBall {
 
 
     /**
-     * @struct WhenAnyResult
+     * @class WhenAnyResult
      * @brief Return type of value-bearing @ref whenAny: the winning
      *        subtask's index plus its result.
      */
@@ -264,6 +302,73 @@ namespace YarnBall {
         std::size_t index;
         T value;
     };
+
+    /**
+     * @brief Tag selecting the joined form of @ref whenAny and @ref withTimeout: the winner is still decided at once and
+     *        the losers are cancelled at once, but the caller is resumed only after every loser has finished unwinding.
+     *        What a branch borrows then needs to outlive the call only, and a value a losing branch produced is
+     *        destroyed before the caller resumes. The price is that a loser which cannot be cancelled (computation, a
+     *        foreign awaitable) delays the caller until it ends: with @ref withTimeout the timeout then fires late.
+     */
+    struct JoinLosers {
+        explicit JoinLosers() = default;
+    };
+
+    /// The tag value: @c whenAny(tasks, joinLosers).
+    inline constexpr JoinLosers joinLosers{};
+
+    namespace detail {
+
+        template<typename T>
+        Task<WhenAnyResult<T>> whenAnyImpl(std::vector<Task<T>> tasks, bool join) {
+            if (tasks.empty()) throw std::invalid_argument("whenAny: no tasks to race");
+            auto state = std::make_shared<WhenAnyState<T>>();
+            state->join = join;
+            state->remaining.store(tasks.size(), std::memory_order_relaxed);
+            TaskPromiseCore *outer = co_await CurrentScopeAwaiter{};
+            ScopeLink link;
+            link.follow(outer, state->stop);
+
+            const trace::Context traceCtx = outer ? outer->inheritedTrace() : trace::Context{};
+            std::size_t spawned = 0;
+            try {
+                for (; spawned < tasks.size(); ++spawned) {
+                    coSpawn(whenAnyRunner<T>(state, spawned, std::move(tasks[spawned]), traceCtx));
+                }
+            } catch (...) {
+                failWhenAny(*state, std::current_exception(), tasks.size() - spawned);
+            }
+
+            co_await WhenAnyAwaiter<WhenAnyState<T>>{state};
+
+            co_return WhenAnyResult<T>{state->winning_index, std::move(*state->result)};
+        }
+
+        inline Task<std::size_t> whenAnyVoidImpl(std::vector<Task<>> tasks, bool join) {
+            if (tasks.empty()) throw std::invalid_argument("whenAny: no tasks to race");
+            auto state = std::make_shared<WhenAnyVoidState>();
+            state->join = join;
+            state->remaining.store(tasks.size(), std::memory_order_relaxed);
+            TaskPromiseCore *outer = co_await CurrentScopeAwaiter{};
+            ScopeLink link;
+            link.follow(outer, state->stop);
+
+            const trace::Context traceCtx = outer ? outer->inheritedTrace() : trace::Context{};
+            std::size_t spawned = 0;
+            try {
+                for (; spawned < tasks.size(); ++spawned) {
+                    coSpawn(whenAnyRunnerVoid(state, spawned, std::move(tasks[spawned]), traceCtx));
+                }
+            } catch (...) {
+                failWhenAny(*state, std::current_exception(), tasks.size() - spawned);
+            }
+
+            co_await WhenAnyAwaiter<WhenAnyVoidState>{state};
+
+            co_return state->winning_index;
+        }
+
+    } // namespace detail
 
     /**
      * @brief Race @p tasks concurrently; resume with the index + value
@@ -287,25 +392,13 @@ namespace YarnBall {
      */
     template<typename T>
     Task<WhenAnyResult<T>> whenAny(std::vector<Task<T>> tasks) {
-        if (tasks.empty()) throw std::invalid_argument("whenAny: no tasks to race");
-        auto state = std::make_shared<detail::WhenAnyState<T>>();
-        detail::TaskPromiseCore *outer = co_await detail::CurrentScopeAwaiter{};
-        detail::ScopeLink link;
-        link.follow(outer, state->stop);
+        return detail::whenAnyImpl<T>(std::move(tasks), false);
+    }
 
-        const trace::Context traceCtx = outer ? outer->inheritedTrace() : trace::Context{};
-        try {
-            for (std::size_t i = 0; i < tasks.size(); ++i) {
-                coSpawn(detail::whenAnyRunner<T>(state, i, std::move(tasks[i]), traceCtx));
-            }
-        } catch (...) {
-            detail::failWhenAny(*state, std::current_exception());
-        }
-
-        co_await detail::WhenAnyAwaiter<detail::WhenAnyState<T>>{state};
-
-        co_return WhenAnyResult<T>{state->winning_index,
-                                   std::move(*state->result)};
+    /// @ref whenAny that resumes the caller only after every loser has finished; see @ref JoinLosers.
+    template<typename T>
+    Task<WhenAnyResult<T>> whenAny(std::vector<Task<T>> tasks, JoinLosers) {
+        return detail::whenAnyImpl<T>(std::move(tasks), true);
     }
 
     /**
@@ -313,24 +406,12 @@ namespace YarnBall {
      *        the winning subtask; rethrows its exception if it threw.
      */
     inline Task<std::size_t> whenAny(std::vector<Task<>> tasks) {
-        if (tasks.empty()) throw std::invalid_argument("whenAny: no tasks to race");
-        auto state = std::make_shared<detail::WhenAnyVoidState>();
-        detail::TaskPromiseCore *outer = co_await detail::CurrentScopeAwaiter{};
-        detail::ScopeLink link;
-        link.follow(outer, state->stop);
+        return detail::whenAnyVoidImpl(std::move(tasks), false);
+    }
 
-        const trace::Context traceCtx = outer ? outer->inheritedTrace() : trace::Context{};
-        try {
-            for (std::size_t i = 0; i < tasks.size(); ++i) {
-                coSpawn(detail::whenAnyRunnerVoid(state, i, std::move(tasks[i]), traceCtx));
-            }
-        } catch (...) {
-            detail::failWhenAny(*state, std::current_exception());
-        }
-
-        co_await detail::WhenAnyAwaiter<detail::WhenAnyVoidState>{state};
-
-        co_return state->winning_index;
+    /// @c void overload of the joined form; see @ref JoinLosers.
+    inline Task<std::size_t> whenAny(std::vector<Task<>> tasks, JoinLosers) {
+        return detail::whenAnyVoidImpl(std::move(tasks), true);
     }
 
 }

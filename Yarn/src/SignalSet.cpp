@@ -97,7 +97,9 @@ namespace YarnBall {
                 const int fd1 = slot.fd.load(std::memory_order_seq_cst);
                 // Ignore partial / EAGAIN: losing one notification under extreme pressure is acceptable.
                 if (fd1 != 0 && (slot.mask.load(std::memory_order_relaxed) & bit) != 0
-                    && slot.pid.load(std::memory_order_relaxed) == self) (void) ::write(fd1 - 1, &b, 1);
+                    && slot.pid.load(std::memory_order_relaxed) == self) {
+                    [[maybe_unused]] const auto rc = ::write(fd1 - 1, &b, 1);
+                }
             }
             g_handlersInFlight.fetch_sub(1, std::memory_order_seq_cst);
             errno = savedErrno;
@@ -146,7 +148,7 @@ namespace YarnBall {
             g_disp.erase(it);
         }
 
-        void markNonBlockingCloexec(int fd, bool nonBlocking) {
+        [[maybe_unused]] void markNonBlockingCloexec(int fd, bool nonBlocking) {
             int flags = ::fcntl(fd, F_GETFL, 0);
             if (flags < 0 || (nonBlocking && ::fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
                 || ::fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {

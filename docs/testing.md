@@ -163,7 +163,13 @@ runs only on Windows. Coverage:
 - **`coSpawn` / `scheduleOn`** — single spawn, 2k concurrent spawns,
   chained `co_await` inside a spawned task, hop to worker, null-pool no-op.
 - **`whenAll` / `whenAny` / `withTimeout` / `deadlineToken`** — empty,
-  aggregate, void, exception propagation, race wins/losses.
+  aggregate, void, exception propagation, race wins/losses; `withTimeout` on
+  its direct timer (rethrow, zero limit, outer-scope stop, concurrent early
+  wins and timeouts), the joined forms (`joinLosers`), and `deadlineToken`
+  withdrawal racing the timer registration.
+- **Embedded** (POSIX, `audit_embedded_tests.cpp`, a pseudo-terminal as the
+  hardware) — `FdSlot` in-flight protocol, `close()` waking a parked
+  reader, destruction with a parked reader, no stray close of a reused fd.
 - **AsyncSync** — `AsyncMutex`, `AsyncSemaphore`, `AsyncRwLock`,
   `AsyncEvent`, `AsyncOnce`, `AsyncBarrier`, `AsyncNotify`.
 - **`Stream<T>`** — basic generator, exceptions across `next()`,

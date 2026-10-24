@@ -55,7 +55,7 @@ namespace YarnBall {
         inline constexpr std::uintptr_t kJoinReadyBit = 1u;
 
         /**
-         * @struct JoinState
+         * @class JoinState
          * @brief Shared latch state between the spawned task and the
          *        joiner. Lock-free: a single atomic word coordinates
          *        the publish/park handshake, and the value/exception
@@ -140,7 +140,7 @@ namespace YarnBall {
         }
 
         /**
-         * @struct JoinAwaiter
+         * @class JoinAwaiter
          * @brief Awaiter for @c JoinHandle::join(). Fast-path: if the
          *        runner has already published, symmetric-transfer back
          *        to the joiner. Slow-path: CAS our handle into the
