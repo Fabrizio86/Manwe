@@ -135,3 +135,13 @@ TEST(audit3_wire_receive_for_reports_the_callers_cancellation_over_an_expired_de
         EXPECT_TRUE(wire_wait_for([&] { return ch->waiterCount() == 0; }, 2s));
     }
 }
+
+// Deterministic form of the above: the caller's scope is stopped before the call and the deadline is zero, so both are
+// true from the start and the caller's cancellation must be what is reported.
+TEST(audit3_wire_receive_for_with_a_stopped_scope_and_an_expired_deadline_reports_cancellation) {
+    auto ch = std::make_shared<Telegraph::Channel<int>>();
+    std::stop_source outer;
+    outer.request_stop();
+    EXPECT_EQ(YarnBall::syncWait(YarnBall::withCancellation(outer.get_token(), receiveForOutcome(ch, 0ms))), 4);
+    EXPECT_TRUE(wire_wait_for([&] { return ch->waiterCount() == 0; }, 2s));
+}

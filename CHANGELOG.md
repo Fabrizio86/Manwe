@@ -21,6 +21,15 @@ to [SemVer](https://semver.org/).
   `SignalCaptureError`; it now succeeds.
 
 ### Performance
+- **Cheaper external submission.** `Yarn::dispatch`, `wakeOneParked` and `stealFromPeers` read the per-thread
+  worker-list snapshot in place instead of copying a `shared_ptr` (every thread shared one control block, so each
+  submit and each steal attempt was a contended atomic on a line all workers touch); a refresh while a pin is held
+  parks the old list instead of freeing it. The submit counter and the watchdog flag sit on their own cache lines.
+  Consecutive submissions from one thread now go to the same worker's inbox in bursts of 8 (never to a parked
+  worker, and the burst ends when that inbox is full), so the ring cells and counters stay in the producer's
+  cache. External submit + drain 740 -> 285 ns, a 50-await request 730 -> 290 ns (Apple M1 Max, Release;
+  best-of-9 runs are within ~10% of those medians). Idle workers still steal from the inbox, so a burst of slow
+  tasks spreads over the pool (`audit3_core_a_burst_to_one_inbox_still_spreads_over_the_workers`).
 - **`withTimeout` runs on a direct Reactor timer.** The task runs in one runner and a timer frame stands
   in for the sleeper coroutine, so a task that wins takes the timer back and nothing is thrown or
   unwound. An early win costs ~0.7 µs instead of 4.3 µs (macOS, Apple silicon, Release, sequential);
@@ -59,7 +68,8 @@ to [SemVer](https://semver.org/).
   a dead Reactor reports `ReactorError` instead of a false `TimeoutException`; `fs::writeString`/`writeBytes`/
   `File::close` report a failed final flush; Windows timers clamp and reschedule duplicates; the io_uring wake
   poll can no longer be lost when the submission queue is full.
-- **Allocation:** Task frames honour over-alignment on Clang (GCC ignores aligned frame allocation: documented);
+- **Allocation:** Task frames honour over-alignment (Clang through the aligned operator new; GCC never calls it, so
+  there every frame is 64-byte aligned);
   the pool statics are immortal (no use of a destroyed mutex at exit), the pooled and plain paths are
   interchangeable, `poolAlloc` obeys the same sanitizer switch; metric registration is exception-safe.
 - **Sockets:** `IoDeadline` can no longer shut down an unrelated connection that reused a dead stream's fd

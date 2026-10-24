@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
 #include <new>
 #include <utility>
 #include <stop_token>
@@ -21,6 +22,7 @@
 #include "../Yarn/includes/Timeout.h"
 #include "../Yarn/includes/Timers.h"
 #include "../Yarn/includes/Yarn.hpp"
+#include "../Yarn/includes/YarnBall.hpp"
 
 using namespace std::chrono_literals;
 
@@ -31,7 +33,6 @@ namespace {
         char bytes[64];
     };
 
-#if defined(__clang__)
     /// Keeps an over-aligned local alive across a suspension and reports whether its address was 64-byte aligned.
     YarnBall::Task<bool> alignedAcrossSuspension() {
         CacheLine line{};
@@ -39,19 +40,15 @@ namespace {
         co_await YarnBall::sleepFor(1ms);
         co_return reinterpret_cast<std::uintptr_t>(const_cast<const CacheLine *>(escaped)) % alignof(CacheLine) == 0;
     }
-#endif
 }
 
-// Clang allocates a frame with an over-aligned local through the promise's aligned operator new. GCC never calls an
-// aligned operator new for a coroutine frame (it assumes the frame base is aligned and uses the plain one), so the check
-// would measure the allocator's luck there.
-#if defined(__clang__)
+// Clang allocates a frame with an over-aligned local through the promise's aligned operator new; GCC always calls the
+// plain one, so there every frame comes from 64-byte aligned blocks. Either way an alignas(64) local must be aligned.
 TEST(audit3_core_task_frame_honours_over_aligned_locals) {
     for (int i = 0; i < 50; ++i) {
         EXPECT_TRUE(YarnBall::syncWait(alignedAcrossSuspension()));
     }
 }
-#endif
 
 // ---- Frame pool ----------------------------------------------------------------------------
 
@@ -142,4 +139,94 @@ TEST(audit3_core_unjoined_timeout_fail_spawn_publishes_the_spawn_error) {
     bool isBadAlloc = false;
     try { std::rethrow_exception(st.exception); } catch (const std::bad_alloc &) { isBadAlloc = true; } catch (...) {}
     EXPECT_TRUE(isBadAlloc);
+}
+
+// ---- Submission bursts ---------------------------------------------------------------------
+
+namespace {
+    bool coreWaitUntil(const std::function<bool()> &p, std::chrono::milliseconds limit) {
+        const auto end = std::chrono::steady_clock::now() + limit;
+        while (std::chrono::steady_clock::now() < end) {
+            if (p()) return true;
+            std::this_thread::sleep_for(1ms);
+        }
+        return p();
+    }
+}
+
+TEST(audit3_core_a_burst_of_external_submissions_runs_every_task_exactly_once) {
+    constexpr int kTasks = 50000;
+    std::vector<std::atomic<int>> ran(kTasks);
+    for (auto &r : ran) r.store(0);
+    for (int i = 0; i < kTasks; ++i) {
+        YarnBall::run([&ran, i] { ran[i].fetch_add(1, std::memory_order_relaxed); });
+    }
+    EXPECT_TRUE(coreWaitUntil(
+        [&] {
+            for (auto &r : ran)
+                if (r.load() == 0) return false;
+            return true;
+        },
+        30000ms));
+    std::this_thread::sleep_for(20ms);
+    int wrong = 0;
+    for (auto &r : ran) wrong += r.load() != 1;
+    EXPECT_EQ(wrong, 0);
+}
+
+TEST(audit3_core_a_burst_to_one_inbox_still_spreads_over_the_workers) {
+    // Consecutive submissions from one thread are aimed at one worker's inbox; the other workers must still pick the
+    // tasks up (stealing from the inbox / being woken), or a burst of slow tasks would run one after the other.
+    const int workers = static_cast<int>(std::thread::hardware_concurrency());
+    if (workers < 4) return;
+    constexpr int kTasks = 48;
+    static constexpr auto kEach = 25ms;
+    std::atomic<int> done{0};
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < kTasks; ++i) {
+        YarnBall::run([&done] {
+            std::this_thread::sleep_for(kEach);
+            done.fetch_add(1);
+        });
+    }
+    EXPECT_TRUE(coreWaitUntil([&] { return done.load() == kTasks; }, 30000ms));
+    const auto elapsed = std::chrono::steady_clock::now() - t0;
+    const auto serial = kEach * kTasks;
+    EXPECT_TRUE(elapsed < serial / 3); // at least ~3-way parallelism, nowhere near one worker's pace
+}
+
+TEST(audit3_core_submitting_while_the_pool_grows_and_shrinks_is_safe) {
+    // Blocking tasks beyond the worker count make the pool add temp fibers (the worker list snapshot is replaced)
+    // while other threads keep submitting and stealing: the snapshot a submitter or stealer is reading must stay valid.
+    std::atomic<bool> stop{false};
+    std::atomic<long> ran{0};
+    std::atomic<long> submitted{0};
+    std::vector<std::thread> producers;
+    for (int p = 0; p < 3; ++p) {
+        producers.emplace_back([&] {
+            while (!stop.load()) {
+                for (int i = 0; i < 64; ++i) {
+                    submitted.fetch_add(1, std::memory_order_relaxed);
+                    YarnBall::run([&ran] { ran.fetch_add(1, std::memory_order_relaxed); });
+                }
+                std::this_thread::yield();
+            }
+        });
+    }
+    const int blockers = static_cast<int>(std::thread::hardware_concurrency()) * 2 + 2;
+    for (int round = 0; round < 6; ++round) {
+        std::atomic<int> blocked{0};
+        for (int i = 0; i < blockers; ++i) {
+            YarnBall::run([&blocked] {
+                std::this_thread::sleep_for(60ms);
+                blocked.fetch_add(1);
+            });
+        }
+        EXPECT_TRUE(coreWaitUntil([&] { return blocked.load() == blockers; }, 30000ms));
+    }
+    stop.store(true);
+    for (auto &t : producers) t.join();
+    // The tasks capture locals of this test: none may be left pending when it returns.
+    EXPECT_TRUE(coreWaitUntil([&] { return ran.load() == submitted.load(); }, 30000ms));
+    EXPECT_TRUE(ran.load() > 0);
 }

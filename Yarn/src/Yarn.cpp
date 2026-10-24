@@ -440,6 +440,38 @@ namespace YarnBall {
         this->dispatch(adapter.release());
     }
 
+    namespace {
+        /**
+         * @brief Per-thread cached snapshot used by @ref Yarn::currentSnapshot.
+         *        Lives at namespace scope (not inside the function) so worker
+         *        threads can explicitly release it via
+         *        @ref Yarn::releaseThreadSnapshotCache before they exit,
+         *        avoiding a self-join during thread_local teardown.
+         */
+        //
+        // The cache is refreshed only when this thread next asks for a snapshot after a version bump, so a thread that
+        // stops submitting keeps its last snapshot, and with it the retired Fibers in it, alive until it submits again
+        // or exits. That only delays the final ~Fiber (a joined, thread-less object) of a few retired temp fibers.
+        thread_local std::shared_ptr<const Fibers> tlsCachedSnapshot;
+        thread_local std::uint64_t tlsCachedSnapshotVersion = 0;
+    }
+
+    namespace {
+        /// Threads currently inside a SnapshotPin, and the lists a refresh retired meanwhile (freed when the last pin ends).
+        thread_local int tlsSnapshotPins = 0;
+        thread_local std::vector<std::shared_ptr<const Fibers>> tlsRetiredSnapshots;
+
+        /// Keeps the pointer from Yarn::pinnedSnapshot() valid for the pin's lifetime.
+        struct SnapshotPin {
+            SnapshotPin() noexcept { ++tlsSnapshotPins; }
+            SnapshotPin(const SnapshotPin &) = delete;
+            SnapshotPin &operator=(const SnapshotPin &) = delete;
+            ~SnapshotPin() {
+                if (--tlsSnapshotPins == 0 && !tlsRetiredSnapshots.empty()) tlsRetiredSnapshots.clear();
+            }
+        };
+    }
+
     void Yarn::dispatch(TaskPtr task) noexcept {
         // dispatch owns the task from here on and cannot fail: every step either publishes it (queue or inline run) or
         // is a best-effort extra (snapshot, wake, grow) whose failure only means the next step is tried. A throw out of
@@ -462,12 +494,28 @@ namespace YarnBall {
         // workers so the central injection queue's tail counter is not
         // contended with peer dequeues. Workers drain their inbox first
         // in their process loop.
-        std::shared_ptr<const Fibers> snap;
-        try { snap = this->currentSnapshot(); } catch (...) { }
+        const Fibers *snap = nullptr;
+        SnapshotPin pin;
+        try { snap = this->pinnedSnapshot(); } catch (...) { }
         if (snap && !snap->empty()) {
             const std::size_t n = snap->size();
-            const std::size_t base =
-                this->nextInboxIdx.fetch_add(1, std::memory_order_relaxed);
+            // Consecutive submissions from one thread go to the same inbox for a short burst: the ring cells and the
+            // queue counters then stay in the producer's cache instead of being fetched from a different core for
+            // every task. The burst only sticks to a worker that is awake (idle peers steal from its inbox); a parked
+            // target is left at once, so a fan-out still spreads its wake-ups over the pool.
+            constexpr unsigned kInboxBurst = 8;
+            thread_local std::size_t stickyBase = 0;
+            thread_local unsigned stickyLeft = 0;
+            if (stickyLeft != 0) {
+                const Fiber *current = (*snap)[stickyBase % n].get();
+                if (!current || current->isParked()) stickyLeft = 0;
+            }
+            if (stickyLeft == 0) {
+                stickyBase = this->nextInboxIdx.fetch_add(1, std::memory_order_relaxed);
+                stickyLeft = kInboxBurst;
+            }
+            --stickyLeft;
+            const std::size_t base = stickyBase;
             // Probe up to three workers starting at the round-robin index.
             // With 32-slot inboxes and typical worker drain rates this is
             // almost always enough; if every probed inbox is full we fall
@@ -479,6 +527,7 @@ namespace YarnBall {
                 } catch (...) {
                     return;
                 }
+                if (probe == 0) stickyLeft = 0; // the burst's inbox is full: move on
             }
         }
 
@@ -602,20 +651,12 @@ namespace YarnBall {
         return static_cast<int>(id);
     }
 
-    namespace {
-        /**
-         * @brief Per-thread cached snapshot used by @ref Yarn::currentSnapshot.
-         *        Lives at namespace scope (not inside the function) so worker
-         *        threads can explicitly release it via
-         *        @ref Yarn::releaseThreadSnapshotCache before they exit,
-         *        avoiding a self-join during thread_local teardown.
-         */
-        //
-        // The cache is refreshed only when this thread next asks for a snapshot after a version bump, so a thread that
-        // stops submitting keeps its last snapshot, and with it the retired Fibers in it, alive until it submits again
-        // or exits. That only delays the final ~Fiber (a joined, thread-less object) of a few retired temp fibers.
-        thread_local std::shared_ptr<const Fibers> tlsCachedSnapshot;
-        thread_local std::uint64_t tlsCachedSnapshotVersion = 0;
+
+    void Yarn::refreshThreadSnapshot() {
+        std::lock_guard<std::mutex> lk(this->cmu);
+        if (tlsSnapshotPins > 0 && tlsCachedSnapshot) tlsRetiredSnapshots.push_back(std::move(tlsCachedSnapshot));
+        tlsCachedSnapshot = this->fiberSnapshot;
+        tlsCachedSnapshotVersion = this->snapshotVersion.load(std::memory_order_relaxed);
     }
 
     std::shared_ptr<const Fibers> Yarn::currentSnapshot() {
@@ -624,17 +665,21 @@ namespace YarnBall {
         if (v == tlsCachedSnapshotVersion && tlsCachedSnapshot) {
             return tlsCachedSnapshot;
         }
-
-        std::lock_guard<std::mutex> lk(this->cmu);
-        tlsCachedSnapshot = this->fiberSnapshot;
-        tlsCachedSnapshotVersion =
-            this->snapshotVersion.load(std::memory_order_relaxed);
+        this->refreshThreadSnapshot();
         return tlsCachedSnapshot;
+    }
+
+    const Fibers *Yarn::pinnedSnapshot() {
+        const std::uint64_t v = this->snapshotVersion.load(std::memory_order_acquire);
+        if (!(v == tlsCachedSnapshotVersion && tlsCachedSnapshot)) this->refreshThreadSnapshot();
+        return tlsCachedSnapshot.get();
     }
 
     void Yarn::releaseThreadSnapshotCache() noexcept {
         tlsCachedSnapshot.reset();
         tlsCachedSnapshotVersion = 0;
+        // Only ever non-empty inside a pin; a thread leaving its pool loop holds none, but be explicit.
+        if (tlsSnapshotPins == 0) tlsRetiredSnapshots.clear();
     }
 
     bool Yarn::wakeOneParked() {
@@ -651,7 +696,8 @@ namespace YarnBall {
         if (this->parkedWorkers.load(std::memory_order_acquire) == 0) {
             return false;
         }
-        auto snap = this->currentSnapshot();
+        SnapshotPin pin;
+        const Fibers *snap = this->pinnedSnapshot();
         if (!snap) return false;
         for (const auto &f : *snap) {
             // A parked fiber stays "parked" until it actually runs again, so without the claim a burst of submissions
@@ -774,7 +820,8 @@ namespace YarnBall {
     }
 
     TaskPtr Yarn::stealFromPeers(FiberId selfId) {
-        auto snap = this->currentSnapshot();
+        SnapshotPin pin;
+        const Fibers *snap = this->pinnedSnapshot();
         if (!snap || snap->size() < 2) return nullptr;
 
         const int n = static_cast<int>(snap->size());

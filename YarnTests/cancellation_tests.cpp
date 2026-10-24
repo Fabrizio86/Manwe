@@ -1218,39 +1218,73 @@ TEST(destroying_a_frame_whose_bounded_channel_wake_is_in_flight_returns_the_valu
     EXPECT_EQ(*YarnBall::syncWait(recvOneBounded(c)), 2);
 }
 
+// The two tests below need the resume to be still queued when the frame is destroyed. The plug occupies the workers
+// that exist, but the stall detector may add a worker while the test waits, and an idle worker rightly runs whatever is
+// queued: when that happens before the destroy there is no in-flight resume to test, so the attempt is repeated.
+// An attempt that did not see the resume run before the destroy is conclusive.
 TEST(destroying_a_frame_whose_timer_has_fired_resumes_nothing) {
-    auto ran = std::make_shared<std::atomic<bool>>(false);
-    {
-        PoolPlug plug;
-        SKIP_IF_NO_PLUG(plug);
-        Task<> t = sleepThenFlag(ran);
-        startInline(t);
-        std::this_thread::sleep_for(120ms); // the Reactor fired the timer and queued the resume behind the plug
-        t = Task<>{};
+    bool conclusive = false;
+    for (int attempt = 0; attempt < 40 && !conclusive; ++attempt) {
+        auto ran = std::make_shared<std::atomic<bool>>(false);
+        bool ranBeforeDestroy = false;
+        {
+            PoolPlug plug;
+            SKIP_IF_NO_PLUG(plug);
+            Task<> t = sleepThenFlag(ran);
+            startInline(t);
+            std::this_thread::sleep_for(120ms); // the Reactor fired the timer and queued the resume behind the plug
+            ranBeforeDestroy = ran->load();
+            if (ranBeforeDestroy) {
+                // The frame was resumed and completed on another worker: nothing orders that against a destroy from
+                // here, so it is parked (reachable, never destroyed) instead.
+                static auto *const finishedFrames = new std::vector<Task<> *>; // immortal: stays reachable at exit
+                finishedFrames->push_back(new Task<>(std::move(t)));
+            } else {
+                t = Task<>{};
+            }
+        }
+        std::this_thread::sleep_for(100ms);
+        if (ranBeforeDestroy) continue;
+        conclusive = true;
+        EXPECT_FALSE(ran->load());
     }
-    std::this_thread::sleep_for(100ms);
-    EXPECT_FALSE(ran->load());
+    EXPECT_TRUE(conclusive);
 }
 
 #ifndef _WIN32
 TEST(destroying_a_frame_whose_fd_is_ready_resumes_nothing) {
-    Pipe p;
-    auto ran = std::make_shared<std::atomic<bool>>(false);
-    {
-        PoolPlug plug;
-        SKIP_IF_NO_PLUG(plug);
-        Task<> t = [](int fd, std::shared_ptr<std::atomic<bool>> r) -> Task<> {
-            co_await YarnBall::io::waitReadable(fd);
-            r->store(true);
-        }(p.fds[0], ran);
-        startInline(t);
-        const char b = 'x';
-        EXPECT_EQ(::write(p.fds[1], &b, 1), static_cast<ssize_t>(1));
-        std::this_thread::sleep_for(120ms); // readiness claimed the waiter; its resume is queued behind the plug
-        t = Task<>{};
+    bool conclusive = false;
+    for (int attempt = 0; attempt < 40 && !conclusive; ++attempt) {
+        Pipe p;
+        auto ran = std::make_shared<std::atomic<bool>>(false);
+        bool ranBeforeDestroy = false;
+        {
+            PoolPlug plug;
+            SKIP_IF_NO_PLUG(plug);
+            Task<> t = [](int fd, std::shared_ptr<std::atomic<bool>> r) -> Task<> {
+                co_await YarnBall::io::waitReadable(fd);
+                r->store(true);
+            }(p.fds[0], ran);
+            startInline(t);
+            const char b = 'x';
+            EXPECT_EQ(::write(p.fds[1], &b, 1), static_cast<ssize_t>(1));
+            std::this_thread::sleep_for(120ms); // readiness claimed the waiter; its resume is queued behind the plug
+            ranBeforeDestroy = ran->load();
+            if (ranBeforeDestroy) {
+                // The frame was resumed and completed on another worker: nothing orders that against a destroy from
+                // here, so it is parked (reachable, never destroyed) instead.
+                static auto *const finishedFrames = new std::vector<Task<> *>; // immortal: stays reachable at exit
+                finishedFrames->push_back(new Task<>(std::move(t)));
+            } else {
+                t = Task<>{};
+            }
+        }
+        std::this_thread::sleep_for(100ms);
+        if (ranBeforeDestroy) continue;
+        conclusive = true;
+        EXPECT_FALSE(ran->load());
     }
-    std::this_thread::sleep_for(100ms);
-    EXPECT_FALSE(ran->load());
+    EXPECT_TRUE(conclusive);
 }
 #endif
 

@@ -318,6 +318,17 @@ namespace YarnBall {
          */
         std::shared_ptr<const Fibers> currentSnapshot();
 
+        /**
+         * @brief Like @ref currentSnapshot but returns this thread's cached list itself, with no reference-count
+         *        traffic (every thread shares one control block, so a copy per submit or steal is a contended atomic
+         *        on a line all workers touch). Valid only while a @c SnapshotPin is alive on this thread: a refresh
+         *        that happens meanwhile parks the old list instead of freeing it.
+         */
+        const Fibers *pinnedSnapshot();
+
+        /// Replace this thread's cached snapshot with the current one. Takes @c cmu.
+        void refreshThreadSnapshot();
+
     public:
         /**
          * @brief Release this thread's cached snapshot, if any.
@@ -430,7 +441,9 @@ namespace YarnBall {
          *        guarantees beyond "spreads across workers over time" --
          *        good enough for partitioning MPMC contention.
          */
-        std::atomic<std::size_t> nextInboxIdx{0};
+        // Alone on a cache line: every external submit writes it, while the neighbouring counters are read by every
+        // worker on every steal attempt (false sharing made each submit fight the stealers for the line).
+        alignas(64) std::atomic<std::size_t> nextInboxIdx{0};
 
         /**
          * @brief Global injection queue. Internally lock-free MPMC, no
@@ -486,7 +499,7 @@ namespace YarnBall {
         std::condition_variable wdCv;
         std::thread wdThread;
         bool wdStop = false;
-        std::atomic<bool> wdArmed{false};
+        alignas(64) std::atomic<bool> wdArmed{false}; // read by every publisher: kept off the lines written above
 
     };
 

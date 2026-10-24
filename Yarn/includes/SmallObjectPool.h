@@ -13,6 +13,24 @@
 
 namespace YarnBall::detail {
 
+    // GCC never calls an aligned operator new for a coroutine frame: it always asks the plain one, so a frame holding an
+    // over-aligned local across a suspension would be only 16-byte aligned. Frames are therefore given cache-line (64
+    // byte) alignment on GCC, which covers alignas(64) and below; Clang requests the exact alignment itself.
+#if defined(__GNUC__) && !defined(__clang__) && !defined(_WIN32)
+#  define YARN_FRAME_ALIGN64 1
+#else
+#  define YARN_FRAME_ALIGN64 0
+#endif
+
+    /// A block of at least @p n bytes aligned to 64, released with @c std::free (POSIX @c aligned_alloc).
+    inline void *alignedBlock(std::size_t n) {
+#if defined(_WIN32)
+        return std::malloc(n);
+#else
+        return std::aligned_alloc(64, (n + 63) / 64 * 64);
+#endif
+    }
+
     /**
      * @class SmallObjectPool
      * @brief Per-process fixed-size freelist with a thread-local cache.
@@ -38,11 +56,12 @@ namespace YarnBall::detail {
      * @tparam SlotSize Size in bytes of each allocation. Must be at least
      *                  @c sizeof(void*) so an unused slot can hold the
      *                  freelist link.
+     * @tparam Aligned Blocks come from the allocator 64-byte aligned (see @ref alignedBlock).
      * @tparam Batch    Blocks moved between a thread's cache and the shared pool per lock hold. A pool whose blocks are
      *                  allocated on one thread and freed on others (coroutine frames) wants a large one, so that the
      *                  shared mutex is taken once per many blocks.
      */
-    template<std::size_t SlotSize, std::size_t Batch = 16>
+    template<std::size_t SlotSize, std::size_t Batch = 16, bool Aligned = false>
     class SmallObjectPool {
         static_assert(SlotSize >= 3 * sizeof(void *),
                       "SmallObjectPool slot must hold a batch header");
@@ -57,7 +76,7 @@ namespace YarnBall::detail {
             if (tlsHead == nullptr) {
                 refillFromGlobal();
                 if (tlsHead == nullptr) {
-                    void *p = std::malloc(SlotSize);
+                    void *p = Aligned ? alignedBlock(SlotSize) : std::malloc(SlotSize);
                     if (!p) throw std::bad_alloc();
                     return p;
                 }
@@ -254,15 +273,15 @@ namespace YarnBall::detail {
         }
     };
 
-    template<std::size_t SlotSize, std::size_t Batch>
-    thread_local typename SmallObjectPool<SlotSize, Batch>::Node *
-        SmallObjectPool<SlotSize, Batch>::tlsHead = nullptr;
+    template<std::size_t SlotSize, std::size_t Batch, bool Aligned>
+    thread_local typename SmallObjectPool<SlotSize, Batch, Aligned>::Node *
+        SmallObjectPool<SlotSize, Batch, Aligned>::tlsHead = nullptr;
 
-    template<std::size_t SlotSize, std::size_t Batch>
-    thread_local std::size_t SmallObjectPool<SlotSize, Batch>::tlsCount = 0;
+    template<std::size_t SlotSize, std::size_t Batch, bool Aligned>
+    thread_local std::size_t SmallObjectPool<SlotSize, Batch, Aligned>::tlsCount = 0;
 
-    template<std::size_t SlotSize, std::size_t Batch>
-    thread_local bool SmallObjectPool<SlotSize, Batch>::tlsDead = false;
+    template<std::size_t SlotSize, std::size_t Batch, bool Aligned>
+    thread_local bool SmallObjectPool<SlotSize, Batch, Aligned>::tlsDead = false;
 
 
     /**
@@ -331,11 +350,11 @@ namespace YarnBall::detail {
     /// Frame pools move 64 blocks per lock hold: frames are allocated by the thread that awaits a Task and freed by
     /// whichever worker finished it, which is the pattern a small batch handles worst.
     template<std::size_t Slot>
-    using FramePool = SmallObjectPool<Slot, 64>;
+    using FramePool = SmallObjectPool<Slot, 64, YARN_FRAME_ALIGN64 != 0>;
 
     /// malloc that reports failure the way operator new does.
     inline void *frameMalloc(std::size_t n) {
-        void *p = std::malloc(n);
+        void *p = YARN_FRAME_ALIGN64 ? alignedBlock(n) : std::malloc(n);
         if (!p) throw std::bad_alloc();
         return p;
     }

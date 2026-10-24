@@ -407,6 +407,10 @@ TEST(audit_core_timers_sleep_cancelled_while_racing_its_expiry_resumes_exactly_o
 // user's handler (or the log) once per discarded task.
 TEST(audit_core_shutdown_discard_of_callable_is_not_reported_as_unhandled) {
     std::atomic<int> reported{0};
+    // The handler captures a local by reference: restore the default on every exit path, including a failed EXPECT.
+    struct HandlerReset {
+        ~HandlerReset() { YarnBall::setUnhandledExceptionHandler({}); }
+    } handlerReset;
     YarnBall::setUnhandledExceptionHandler([&](std::exception_ptr) { reported.fetch_add(1); });
     using Fn = decltype([] {});
     YarnBall::detail::discardTask(new YarnBall::detail::CallableITask<Fn>(Fn{}));
@@ -415,7 +419,6 @@ TEST(audit_core_shutdown_discard_of_callable_is_not_reported_as_unhandled) {
     // A real failure still gets through.
     YarnBall::detail::reportDetachedException(std::make_exception_ptr(std::runtime_error("real")));
     EXPECT_EQ(reported.load(), 1);
-    YarnBall::setUnhandledExceptionHandler({});
 }
 
 // Audit (pass 2): a burst of submissions from one worker poked the same parked fiber, so K tasks ran on ~1 thread.
