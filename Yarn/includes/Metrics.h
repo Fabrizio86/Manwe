@@ -151,7 +151,8 @@ namespace YarnBall::metrics {
         /**
          * @brief Record one observation. Increments the count for every
          *        bucket whose upper bound is @c >= @p x (the cumulative
-         *        Prometheus convention), and the total sum.
+         *        Prometheus convention), and the total sum. NaN is dropped;
+         *        +/-Inf is counted in the buckets but left out of the sum.
          */
         void observe(double x) noexcept;
 
@@ -244,6 +245,15 @@ namespace YarnBall::metrics {
          * @brief Retrieve (or create) a counter named @p name. The
          *        first call sets the help string; subsequent calls
          *        ignore the help argument and return the same object.
+         * @throws std::invalid_argument (all three kinds) if @p name does not
+         *         match the Prometheus metric-name grammar
+         *         @c [a-zA-Z_:][a-zA-Z0-9_:]*.
+         * @throws std::logic_error (all three kinds) if the name collides with
+         *         another kind, or with a series a histogram exposes: a
+         *         histogram @c foo owns @c foo_bucket, @c foo_count and
+         *         @c foo_sum, so neither a metric of that name nor a histogram
+         *         whose series would be taken by an existing metric can be
+         *         registered (the exposition would contain duplicate series).
          */
         Counter &counter(const std::string &name, const std::string &help = {});
         Gauge &gauge(const std::string &name, const std::string &help = {});
@@ -266,6 +276,9 @@ namespace YarnBall::metrics {
 
     private:
         Registry() = default;
+
+        /// Throws if @p name would produce a duplicate exposition series (see counter()). Call with @c mu held.
+        void checkSuffixCollisionLocked(const std::string &name, bool isHistogram) const;
 
         mutable std::mutex mu;
         std::unordered_map<std::string, std::unique_ptr<Counter>> counters;

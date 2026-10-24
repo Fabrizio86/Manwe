@@ -11,6 +11,7 @@
 #include <utility>
 
 #include "Coroutines.h"
+#include "NetUtil.h"
 #include "SocketAddress.h"
 
 namespace Soccer {
@@ -47,22 +48,28 @@ namespace Soccer {
         static RawSocket open(int family, int ip_protocol);
 
         /**
-         * @brief Convenience: open an ICMP socket (@c IPPROTO_ICMP).
+         * @brief Convenience: open an ICMP socket (@c IPPROTO_ICMP for
+         *        @c AF_INET, @c IPPROTO_ICMPV6 for @c AF_INET6).
+         *
+         * @note @ref IcmpEcho builds and parses ICMPv4 only. ICMPv6 has other
+         *       type numbers and a pseudo-header checksum (which the kernel
+         *       fills in for ICMPv6 raw sockets); an IPv6 socket is for callers
+         *       that frame ICMPv6 themselves.
          */
         static RawSocket icmp(int family = AF_INET) {
-            return open(family, IPPROTO_ICMP);
+            return open(family, family == AF_INET6 ? IPPROTO_ICMPV6 : IPPROTO_ICMP);
         }
 
         RawSocket(const RawSocket &) = delete;
         RawSocket &operator=(const RawSocket &) = delete;
 
-        RawSocket(RawSocket &&other) noexcept : sock(std::exchange(other.sock, -1)) {
+        RawSocket(RawSocket &&other) noexcept : sock(std::move(other.sock)) {
         }
 
         RawSocket &operator=(RawSocket &&other) noexcept {
             if (this != &other) {
                 this->close();
-                this->sock = std::exchange(other.sock, -1);
+                this->sock.reset(other.sock.take());
             }
             return *this;
         }
@@ -82,7 +89,7 @@ namespace Soccer {
         YarnBall::Task<std::size_t> sendTo(std::span<const std::byte> buf,
                                             const SocketAddress &destination);
 
-        int fd() const noexcept { return this->sock; }
+        int fd() const noexcept { return this->sock.get(); }
 
         void close() noexcept;
 
@@ -90,7 +97,7 @@ namespace Soccer {
         explicit RawSocket(int fd) noexcept : sock(fd) {
         }
 
-        int sock = -1;
+        detail::SocketSlot sock;
     };
 
 }

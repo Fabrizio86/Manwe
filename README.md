@@ -72,12 +72,12 @@ Design rationale in [`PHILOSOPHY.md`](PHILOSOPHY.md).
 | **File I/O** | `YarnBall::fs::File` plus `readToString` / `readToBytes` / `writeString` / `writeBytes` / `remove`. Worker-hop for blocking syscalls on macOS/epoll; native `io_uring` / IOCP file paths are a planned follow-up. |
 | **Soccer** — networking | Coroutine TCP / UDP (with multicast) / Unix-domain / Raw / ICMP / TLS (libtls). WebSocket (RFC 6455, with continuation-frame reassembly). HTTP/1.1 (client + server + keep-alive pool). HTTP/2 (via nghttp2: client + server + multiplexed pool, with trailers for gRPC). `tcpServe` accept loop. `BufferedReader` for line protocols. Windows-native `asyncRecvOverlapped` / `asyncSendOverlapped` on IOCP. |
 | **Wire** — push notifications | Coroutine-aware `Telegraph::Signal<Args...>` multicast, unbounded `Channel<T>`, fixed-capacity `BoundedChannel<T>`, `channelSelect` (race N channels). |
-| **Signals** | `SignalSet({SIGINT, SIGTERM})` + `co_await sigs.next()` — POSIX signals as coroutine events via a self-pipe under `sigaction`. |
+| **Signals** | `SignalSet({SIGINT, SIGTERM})` + `co_await sigs.next()` — POSIX signals as coroutine events: `EVFILT_SIGNAL` on macOS/BSD, a self-pipe under `sigaction` elsewhere. Any number of sets may coexist. |
 | **Observability** | `YarnBall::metrics` — Counter / Gauge / Histogram + Prometheus text exposition. `YarnBall::log` — structured JSON logger with levels and typed fields. `YarnBall::trace` — W3C `traceparent` propagation carried on the coroutine promise so context survives suspend / resume across workers. |
 | **Embedded** | `SerialPort` (POSIX termios), `GpioChip` + `GpioLine` (Linux character-device `/dev/gpiochip*`, edge-triggered `co_await waitForEvent`). Same Reactor, same `co_await`; ~30 ns from kernel edge to handler. |
 | **Tests** | In-tree minimal harness. 157 declared cases, 155 enabled on macOS/Linux with TLS + nghttp2. Full suite runs in ~5 seconds. |
 | **Examples** | Echo server, HTTP GET, HTTP server, HTTP/2 GET, signal-driven chat, channel pipeline, ICMP ping, WebSocket echo, graceful-shutdown HTTP server. |
-| **Benchmarks** | `bench_yarn` (deque / MPMC / submit / Task chain), `bench_async_server` (end-to-end request shapes). |
+| **Benchmarks** | `bench_yarn` (deque / MPMC / submit / Task chain), `bench_async_server` (end-to-end request shapes), `bench_signal` (`Telegraph::Signal` emit cost). |
 
 ---
 

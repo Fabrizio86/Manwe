@@ -133,7 +133,7 @@ namespace YarnBall {
             WaitNode node;
             WaitProxy proxy;
             bool earlyCancel = false; // guarded by *mu
-            bool cancelled = false;   // written under *mu while queued; read after the wake
+            std::atomic<bool> cancelled{false}; // set before the node leaves the queue; read by abandon() without *mu
             CancelBinding bind;       // declared last: destroyed (and waited for) first
 
             void fixupLocked(std::vector<std::coroutine_handle<>> &) noexcept {}
@@ -151,7 +151,7 @@ namespace YarnBall {
                     {
                         std::lock_guard<std::mutex> lk(*this->mu);
                         if (this->earlyCancel) {
-                            this->cancelled = true;
+                            this->cancelled.store(true, std::memory_order_relaxed);
                             return h;
                         }
                         if (tryNow()) return h;
@@ -161,7 +161,7 @@ namespace YarnBall {
                             return std::noop_coroutine();
                         }
                         if (core->isCancellationRequested()) {
-                            this->cancelled = true;
+                            this->cancelled.store(true, std::memory_order_relaxed);
                             return h;
                         }
                     }
@@ -179,9 +179,11 @@ namespace YarnBall {
                     std::lock_guard<std::mutex> lk(*self->mu);
                     if (self->node.queued.load(std::memory_order_relaxed)) {
                         h = self->node.h;
+                        // Before remove(): its release store of queued = false is what abandon() acquires, so a
+                        // destroyed frame that sees the node unqueued also sees this was a cancel, not a grant.
+                        self->cancelled.store(true, std::memory_order_relaxed);
                         self->list->remove(&self->node);
                         self->fixupLocked(wake);
-                        self->cancelled = true;
                         withdrew = true;
                     } else {
                         self->earlyCancel = true;
@@ -206,12 +208,12 @@ namespace YarnBall {
                     }
                 }
                 // A wake that was handed this waiter but never ran: a cancel wake owes nothing, a grant is given back.
-                if (this->proxy.retire(removed) && !this->cancelled) static_cast<D *>(this)->revokeGrant();
+                if (this->proxy.retire(removed) && !this->cancelled.load(std::memory_order_relaxed)) static_cast<D *>(this)->revokeGrant();
                 for (auto w : wake) resumeOnPool(w);
             }
 
             void throwIfCancelled() const {
-                if (this->cancelled) throw CancelledException{};
+                if (this->cancelled.load(std::memory_order_relaxed)) throw CancelledException{};
             }
         };
 

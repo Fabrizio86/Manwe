@@ -148,10 +148,31 @@ namespace Soccer {
          * @param opts Optional client options; defaults verify the server
          *             certificate and hostname against the system trust
          *             store.
+         *
+         * @throws SocketException if @c clientCertFile is set without
+         *         @c clientKeyFile (or the reverse), or on connect / handshake
+         *         failure.
          */
         static YarnBall::Task<TlsStream> connect(std::string host,
                                                  std::uint16_t port,
                                                  TlsClientOptions opts = {});
+
+        /**
+         * @brief Complete the TLS handshake of a stream returned by
+         *        @c TlsListener::accept (which hands the connection back before
+         *        the handshake runs). A no-op once the handshake is done, and on
+         *        streams from @c connect, whose handshake is already complete.
+         *        @c read and @c write call it themselves, so it is only needed to
+         *        learn the outcome (or @ref alpnSelected) before the first I/O.
+         *
+         *        Bounded by the handshake timeout given to @c accept: a peer that
+         *        stalls past it has the connection shut down and this throws. A
+         *        failed handshake is final: every later call rethrows the same
+         *        error and the stream is closed. Concurrent callers are
+         *        serialised; the handshake runs once.
+         * @throws SocketException on timeout, protocol error or a closed stream.
+         */
+        YarnBall::Task<void> handshake();
 
         /**
          * @brief Read up to @p buf.size() decrypted bytes.
@@ -160,15 +181,26 @@ namespace Soccer {
         YarnBall::Task<std::size_t> read(std::span<std::byte> buf);
 
         /**
-         * @brief Encrypt and write the entire buffer.
+         * @brief Encrypt and write the entire buffer. Concurrent writers are
+         *        serialised: each call's bytes reach the wire contiguously, in
+         *        the order the calls acquired the stream.
+         * @throws SocketException on error, including a write that makes no
+         *         progress.
          */
         YarnBall::Task<std::size_t> write(std::span<const std::byte> buf);
 
+        /**
+         * @brief Close the stream: send the TLS close_notify (best effort, waiting
+         *        a short, bounded time for a stalled peer), free the context and
+         *        close the socket. Idempotent; may be called from any thread while
+         *        a @c read / @c write is parked -- those wake and throw.
+         */
         void close() noexcept;
 
         /**
          * @return The ALPN protocol negotiated with the peer, or an empty
-         *         string if none (or the stream is closed).
+         *         string if none (or the stream is closed, or a server-side
+         *         handshake has not run yet: call @ref handshake first).
          */
         std::string alpnSelected() const;
 
@@ -186,8 +218,17 @@ namespace Soccer {
          */
         TlsStream(::tls *ctx, ::tls_config *cfg, int fd) noexcept;
 
+        /**
+         * @brief Adopt an accepted server-side context whose handshake has not
+         *        run; the first @ref handshake / read / write drives it, bounded
+         *        by @p handshakeTimeout (zero or negative: unbounded).
+         */
+        TlsStream(::tls *ctx, int fd, std::chrono::milliseconds handshakeTimeout) noexcept;
+
         struct Impl;
-        std::unique_ptr<Impl> impl;
+        static YarnBall::Task<void> driveHandshake(std::shared_ptr<Impl> im);
+        // Shared with parked waiters so the descriptor outlives a close() until they leave.
+        std::shared_ptr<Impl> impl;
     };
 
 }

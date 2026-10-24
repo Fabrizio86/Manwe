@@ -12,6 +12,7 @@
 #include <utility>
 
 #include "Coroutines.h"
+#include "NetUtil.h"
 #include "SocketAddress.h"
 
 namespace Soccer {
@@ -25,6 +26,19 @@ namespace Soccer {
      * until the kernel reports readiness.
      *
      * Move-only. @c close() (or destruction) releases the fd.
+     *
+     * @c close() may be called from any thread while a @c read / @c write is
+     * parked or running: the parked operation wakes and throws, and the fd is
+     * not released until no syscall on it is in flight. Moving a stream that is
+     * being read or written is not supported.
+     *
+     * Writes do not raise SIGPIPE (@c MSG_NOSIGNAL, or @c SO_NOSIGPIPE set on the
+     * fd by the constructor), so a peer that went away yields a SocketException.
+     *
+     * The constructor also sets @c TCP_NODELAY on a TCP socket (a no-op on AF_UNIX),
+     * so every connection made or accepted through Soccer has Nagle's algorithm off:
+     * a reply written as several small sends is not held back for the peer's delayed
+     * ACK. Batch writes yourself if packet count matters.
      */
     class TcpStream final {
     public:
@@ -35,18 +49,22 @@ namespace Soccer {
          *        Used by @c TcpListener::accept and @c tcpConnect.
          */
         explicit TcpStream(int fd) noexcept : sock(fd) {
+            if (fd >= 0) {
+                detail::suppressSigpipe(fd);
+                detail::setNoDelay(fd);
+            }
         }
 
         TcpStream(const TcpStream &) = delete;
         TcpStream &operator=(const TcpStream &) = delete;
 
-        TcpStream(TcpStream &&other) noexcept : sock(std::exchange(other.sock, -1)) {
+        TcpStream(TcpStream &&other) noexcept : sock(std::move(other.sock)) {
         }
 
         TcpStream &operator=(TcpStream &&other) noexcept {
             if (this != &other) {
                 this->close();
-                this->sock = std::exchange(other.sock, -1);
+                this->sock.reset(other.sock.take());
             }
             return *this;
         }
@@ -56,7 +74,7 @@ namespace Soccer {
         /**
          * @return The underlying fd, or @c -1 if closed.
          */
-        int fd() const noexcept { return this->sock; }
+        int fd() const noexcept { return this->sock.get(); }
 
         /**
          * @brief Relinquish ownership of the fd. The stream is left empty
@@ -66,17 +84,15 @@ namespace Soccer {
          * Used when handing a connected socket to a higher-level wrapper
          * (e.g. @c TlsStream after the server-side handshake).
          */
-        int release() noexcept {
-            int f = this->sock;
-            this->sock = -1;
-            return f;
-        }
+        int release() noexcept { return this->sock.take(); }
 
         /**
          * @brief Read up to @p buf.size() bytes. Suspends until the kernel
          *        reports readability; then issues one @c ::recv.
          * @return Number of bytes read; @c 0 indicates the peer closed the
-         *         half. Throws @c SocketException on error.
+         *         half. Throws @c SocketException on error. An empty @p buf
+         *         returns @c 0 at once without touching the socket, so a
+         *         caller must not use an empty buffer to probe for EOF.
          */
         YarnBall::Task<std::size_t> read(std::span<std::byte> buf);
 
@@ -84,7 +100,8 @@ namespace Soccer {
          * @brief Write the entire @p buf. Loops with @c EAGAIN-driven
          *        @c co_await waitWritable until every byte is flushed.
          * @return The number of bytes written (== buf.size() on success).
-         *         Throws @c SocketException on error.
+         *         Throws @c SocketException on error, including a kernel that
+         *         accepts zero bytes of a non-empty buffer.
          */
         YarnBall::Task<std::size_t> write(std::span<const std::byte> buf);
 
@@ -93,8 +110,11 @@ namespace Soccer {
          */
         void close() noexcept;
 
+        /// The socket slot (internal: lets IoDeadline watch the descriptor safely).
+        const detail::SocketSlot &slot() const noexcept { return this->sock; }
+
     private:
-        int sock = -1;
+        detail::SocketSlot sock;
     };
 
     /**
@@ -108,7 +128,9 @@ namespace Soccer {
      *
      * @param timeout Longest the whole attempt (resolution plus every candidate
      *        address) may take; zero or negative means no limit beyond the
-     *        kernel's own connect timeout. The connect runs inside a
+     *        kernel's own connect timeout. With several candidate addresses each
+     *        gets a share of the budget (see @c detail::connectSlice), so an
+     *        unreachable first address does not use it all up. The connect runs inside a
      *        cancellation scope (see Cancellation.h) that the deadline stops, so
      *        a socket still in the middle of its SYN is abandoned and closed --
      *        shutting it down would not wake it on every platform.
@@ -128,9 +150,14 @@ namespace Soccer {
      * Available on POSIX and on Windows 10 1803+. The Unix family on
      * Windows supports stream sockets only.
      *
+     * @param busyRetry How long a connect that finds the server's accept backlog
+     *        full (@c EAGAIN on Linux) is retried, with a short back-off, before
+     *        it fails; zero or negative fails at once. The wait is cancellable.
+     *
      * @throws SocketException on socket / connect failure.
      */
-    YarnBall::Task<TcpStream> tcpConnectUnix(std::string socketPath);
+    YarnBall::Task<TcpStream> tcpConnectUnix(std::string socketPath,
+                                             std::chrono::milliseconds busyRetry = std::chrono::milliseconds{5000});
 
 }
 

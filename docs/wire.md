@@ -19,7 +19,10 @@ runtime.
 
 Per-instance signal hub (not a singleton). Internally holds:
 
-- A list of `(SlotId, Handler)` pairs for connected handlers.
+- A list of `(SlotId, Handler)` pairs for connected handlers. Emissions
+  work from a snapshot of it; `connect` / `disconnect` edit it in place
+  when no emission holds a snapshot and copy it otherwise, so registering
+  thousands of handlers stays cheap.
 - A list of one-shot `NextSlot` waiters for `co_await signal.next()`
   consumers.
 - A mutex guarding both lists; the lock is dropped before invoking
@@ -35,6 +38,20 @@ Three dispatch paths:
 
 `next()` is a single-fire awaitable: each `co_await` registers one slot,
 the next emit fires it and removes it. To keep receiving, await again.
+Destroying the signal wakes parked `next()` waiters with
+`CancelledException`, and a `next()` awaited after that throws it at once.
+
+Handler exceptions: `emit` runs every handler and rethrows the first
+exception once the last has run; `emitAsync` reports a throwing handler
+through `YarnBall::setUnhandledExceptionHandler` and does not affect the
+others.
+
+`connectScoped(handler)` returns a move-only `ScopedConnection` that
+disconnects the handler when it is destroyed (it may outlive the signal).
+Neither it nor `disconnect` waits for a call already in flight, so a handler
+that captures state by reference must not rely on disconnect alone to make
+that state safe to destroy. A removed handler is destroyed after the
+signal's lock is released, so its captures may call back into the signal.
 
 ### `Channel<T>`
 
@@ -49,6 +66,19 @@ Unbounded MPMC value channel:
   `close()` is called (returns `nullopt`).
 - **`close()`** wakes every pending receiver with `nullopt` and marks
   the channel closed; subsequent `send` calls return `false`.
+- **Soft cap.** `Channel(maxBuffered)` makes `send` return `false`
+  instead of buffering past the cap (it never blocks); zero, the default,
+  is unbounded. For producers that must be slowed down, use
+  `BoundedChannel`.
+- **`pushFront(T)`** puts a value back at the head of the channel (to the
+  oldest parked receiver if there is one). It ignores the cap and is
+  accepted by a closed channel, which still drains. `channelSelect` uses it
+  to return a value a losing receive obtained.
+- **`receiveFor(duration)`** is `receive()` with a deadline: it throws
+  `YarnBall::TimeoutException` if nothing arrived in time, and never loses
+  a value (see below).
+- A parked `receive()` is cancellable: inside a stopped cancellation scope
+  it leaves the waiter queue and throws `CancelledException`.
 
 The hand-off path skips the buffer when a receiver is already waiting,
 avoiding a buffer push + pop pair. Wake-ups schedule the parked
@@ -159,19 +189,62 @@ if (!v) /* closed */;
 Same `close()` semantics: pending senders observe `false`, pending
 receivers observe `nullopt`.
 
+Timed variants: `sendFor(value, duration)` and `receiveFor(duration)`
+throw `YarnBall::TimeoutException` when the deadline passes first. A
+`sendFor` is exactly-once: it either delivered (returns `true`, or `false`
+if the channel closed) or timed out having delivered nothing, in which case
+the value is dropped (copy it first to retry).
+
+## Timeouts: `receiveFor` / `sendFor`, not `withTimeout`
+
+`YarnBall::withTimeout(ch->receive(), d)` races the receive against a
+timer and discards the loser's result. If a sender hands the receive a
+value at the instant the timer wins, that value is dropped; around
+`BoundedChannel::send` the mirror case delivers the message while the
+caller sees a timeout, so a retry duplicates it. Use `receiveFor` /
+`sendFor`: they cancel the parked call (it leaves the queue without taking
+or leaving anything) and a value handed over at the same instant is
+returned, never dropped.
+
+```cpp
+try {
+    auto v = co_await ch->receiveFor(500ms);   // nullopt: closed and drained
+} catch (const YarnBall::TimeoutException &) {
+    // nothing arrived; the channel is untouched
+}
+```
+
+A task returned by `send` / `receive` reads the channel when it first runs,
+so await it while the channel is alive. If moving a `T` throws while a value
+is being handed over, the call that was moving it throws and the waiter it
+was serving stays queued.
+
 ## `channelSelect` — race N channels
 
 Pull from the first of N channels (mixed `Channel` and `BoundedChannel`
 overloads) to have a value available. Returns a `SelectResult<T>`
-carrying the winning index and value:
+carrying the winning index and the value:
 
 ```cpp
 auto r = co_await Telegraph::channelSelect(std::vector{eventsA, eventsB, eventsC});
-std::cout << "channel " << r.index << " produced " << r.value << "\n";
+if (r.value) std::cout << "channel " << r.index << " produced " << *r.value << "\n";
+else         std::cout << "every channel is closed and drained\n";
 ```
 
-The losers stay parked on their original channels — calling
-`channelSelect` again resumes the race from a fresh set of waiters.
+- `r.value` is an `std::optional<T>`: empty only when **every** channel is
+  closed and drained. A channel that is closed and empty just drops out of
+  the race while others are open or still hold data; to notice that one
+  source ended, check `closed()` yourself.
+- The losers are **cancelled**, not left parked: each loser's pending
+  receive leaves its channel's waiter queue. A loser that was handed a
+  value in the same instant puts it back at the **front** of its channel
+  (`pushFront`), and the select returns only once every put-back is done,
+  so no value is lost or reordered between consecutive selects. A fresh
+  `channelSelect` starts a fresh race.
+- When several channels are ready at once the start position rotates, so no
+  channel is favoured by its position in the vector.
+- If the caller is inside a stopped cancellation scope the select throws
+  `CancelledException`.
 
 ---
 

@@ -29,8 +29,10 @@
 
 #include <array>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <string_view>
+#include <thread>
 
 namespace YarnBall::trace {
 
@@ -51,13 +53,16 @@ namespace YarnBall::trace {
         bool sampled() const noexcept { return (this->flags & 0x01) != 0; }
 
         /**
-         * @return @c true when both ids are all-zero, the canonical
-         *         "no trace" state.
+         * @return @c true when the context is not valid for propagation:
+         *         the trace id or the span id is all-zero (the W3C spec
+         *         forbids either), which includes the default "no trace"
+         *         state.
          */
         bool empty() const noexcept {
-            for (auto b : this->traceId) if (b != 0) return false;
-            for (auto b : this->spanId)  if (b != 0) return false;
-            return true;
+            bool traceZero = true, spanZero = true;
+            for (auto b : this->traceId) if (b != 0) { traceZero = false; break; }
+            for (auto b : this->spanId)  if (b != 0) { spanZero = false; break; }
+            return traceZero || spanZero;
         }
     };
 
@@ -72,15 +77,17 @@ namespace YarnBall::trace {
     /**
      * @brief Child of @p parent: same @c traceId, new @c spanId,
      *        inherits @c flags. Used inside a handler when spawning
-     *        a downstream call so the child gets its own span.
+     *        a downstream call so the child gets its own span. An empty
+     *        @p parent yields a fresh @c newRoot().
      */
     Context newChild(const Context &parent);
 
     /**
      * @brief Parse a @c traceparent header value. Returns an empty
      *        @c Context (see @c empty()) when the header is missing,
-     *        malformed, or uses a version we do not support (we
-     *        accept only version @c 00 -- the W3C-stable level).
+     *        malformed (including uppercase hex, which W3C forbids), or
+     *        uses a version we do not support (we accept only version
+     *        @c 00 -- the W3C-stable level).
      */
     Context parseTraceparent(std::string_view header);
 
@@ -108,6 +115,11 @@ namespace YarnBall::trace {
      */
     const Context &current() noexcept;
 
+    namespace detail {
+        /// Shared between a Scope and the thread-local stack of the thread that created it (defined in Trace.cpp).
+        struct ScopeState;
+    }
+
     /**
      * @class Scope
      * @brief RAII guard that installs @p ctx as the thread-local
@@ -117,6 +129,15 @@ namespace YarnBall::trace {
      * Move-only is unnecessary -- usage is always lexical-scope.
      * Non-copyable to prevent the "two scopes pointing at the same
      * saved value" race.
+     *
+     * Thread affinity: the guard belongs to the thread that created it. If
+     * it is destroyed on another thread (a coroutine frame that resumed on a
+     * different worker), that thread's context is left alone, and the owning
+     * thread restores its previous context lazily: the next @c current() or
+     * @c Scope construction on it sees the release and unwinds. Until then the
+     * owner is not touched (a thread-local of a running thread cannot be
+     * written safely from outside), so only code that reads the context
+     * through @c current() sees the restored value.
      */
     class Scope final {
     public:
@@ -130,6 +151,8 @@ namespace YarnBall::trace {
 
     private:
         Context saved;
+        std::thread::id owner;
+        std::shared_ptr<detail::ScopeState> state;
     };
 
 }

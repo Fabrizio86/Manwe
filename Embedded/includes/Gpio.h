@@ -20,6 +20,11 @@
 //     auto event  = co_await button.waitForEvent(); // suspends on
 //                                                   // the line fd
 //
+// This uses the GPIO character-device uAPI v1 (GPIO_GET_LINEHANDLE_IOCTL /
+// GPIO_GET_LINEEVENT_IOCTL). The kernel deprecated v1 in 5.10 in favour of
+// v2 (GPIO_V2_GET_LINE_IOCTL); v1 is still served by current kernels, but
+// a port to v2 is due once it can be tested on hardware.
+//
 // Non-Linux platforms (macOS, Windows, *BSD): every entry point
 // throws @c GpioError. There is no portable user-space GPIO ABI
 // outside the Linux character device, so this round does not stub
@@ -29,12 +34,14 @@
 #ifndef EMBEDDED_GPIO_H
 #define EMBEDDED_GPIO_H
 
+#include <memory>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
 #include <utility>
 
 #include "Coroutines.h"
+#include "FdSlot.h"
 
 namespace Embedded {
 
@@ -95,15 +102,15 @@ namespace Embedded {
         GpioLine &operator=(const GpioLine &) = delete;
 
         GpioLine(GpioLine &&other) noexcept
-            : lineFd(std::exchange(other.lineFd, -1)),
-              isOutput(other.isOutput) {
+            : slot(std::move(other.slot)),
+              isOutput(std::exchange(other.isOutput, false)) {
         }
 
         GpioLine &operator=(GpioLine &&other) noexcept {
             if (this != &other) {
                 this->close();
-                this->lineFd = std::exchange(other.lineFd, -1);
-                this->isOutput = other.isOutput;
+                this->slot = std::move(other.slot);
+                this->isOutput = std::exchange(other.isOutput, false);
             }
             return *this;
         }
@@ -124,26 +131,36 @@ namespace Embedded {
          * Implemented as @c waitReadable on the line fd followed by
          * a small @c read of the kernel's gpioevent_data struct.
          *
+         * The event fd is non-blocking: a wake-up that finds no event
+         * (a spurious one) waits again instead of blocking a worker.
+         * Closing the line while a call is parked makes it throw
+         * @c GpioError.
+         *
          * @throws GpioError if the line was configured for output,
          *         or on read failure.
          */
         YarnBall::Task<GpioEvent> waitForEvent();
 
-        int fd() const noexcept { return this->lineFd; }
+        int fd() const noexcept { return this->slot ? this->slot->get() : -1; }
 
         /**
-         * @brief Release the line back to the kernel. Idempotent.
+         * @brief Release the line back to the kernel. Idempotent, any
+         *        thread. A parked @c waitForEvent is woken and throws; the
+         *        descriptor itself is released once no call is in flight,
+         *        so it cannot be reused under a woken call.
          */
         void close() noexcept;
 
     private:
         friend class GpioChip;
 
-        GpioLine(int fd, bool output) noexcept
-            : lineFd(fd), isOutput(output) {
+        // Takes ownership of @p fd: closed again if the slot cannot be allocated.
+        GpioLine(int fd, bool output) : slot(detail::FdSlot::adopt(fd)), isOutput(output) {
         }
 
-        int lineFd = -1;
+        static YarnBall::Task<GpioEvent> waitForEventOn(std::shared_ptr<detail::FdSlot> slot, bool output);
+
+        std::shared_ptr<detail::FdSlot> slot; // null once moved from
         bool isOutput = false;
     };
 
@@ -167,13 +184,15 @@ namespace Embedded {
         GpioChip &operator=(const GpioChip &) = delete;
 
         GpioChip(GpioChip &&other) noexcept
-            : chipFd(std::exchange(other.chipFd, -1)) {
+            : slot(std::move(other.slot)),
+              lineCount(std::exchange(other.lineCount, 0)) {
         }
 
         GpioChip &operator=(GpioChip &&other) noexcept {
             if (this != &other) {
                 this->close();
-                this->chipFd = std::exchange(other.chipFd, -1);
+                this->slot = std::move(other.slot);
+                this->lineCount = std::exchange(other.lineCount, 0);
             }
             return *this;
         }
@@ -184,6 +203,7 @@ namespace Embedded {
          * @brief Request @p pin as an output. @p initialHigh sets the
          *        starting level. Returns a @c GpioLine that owns a
          *        new fd; subsequent @c set calls drive the line.
+         *        Throws @c GpioError for a pin the chip does not have.
          */
         GpioLine requestOutput(int pin, bool initialHigh = false);
 
@@ -195,15 +215,25 @@ namespace Embedded {
          */
         GpioLine requestInputEdge(int pin, Edge edge);
 
-        int fd() const noexcept { return this->chipFd; }
+        int fd() const noexcept { return this->slot ? this->slot->get() : -1; }
 
+        /**
+         * @brief Close the chip. Idempotent, any thread: like
+         *        @c GpioLine::close, the descriptor is released once no
+         *        @c requestOutput / @c requestInputEdge is in flight on it.
+         *        Lines already requested are unaffected.
+         */
         void close() noexcept;
 
     private:
-        explicit GpioChip(int fd) noexcept : chipFd(fd) {
+        // Takes ownership of @p fd: closed again if the slot cannot be allocated.
+        GpioChip(int fd, std::uint32_t lines) : slot(detail::FdSlot::adopt(fd)), lineCount(lines) {
         }
 
-        int chipFd = -1;
+        void checkPin(const char *what, int pin) const; // Linux only: throws for a pin outside the chip
+
+        std::shared_ptr<detail::FdSlot> slot; // null once moved from
+        std::uint32_t lineCount = 0; // number of lines the chip exposes; pins are validated against it
     };
 
 }

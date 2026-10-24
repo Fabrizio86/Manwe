@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <memory>
 #include <stop_token>
 #include <utility>
 
@@ -38,10 +39,14 @@ constexpr std::uint16_t kDefaultPort = 8080;
  * @brief Bridge coroutine: await the next captured signal, log it,
  *        then flip the supplied stop_source. The HttpServer's accept
  *        loop checks the matching stop_token and returns once it
- *        observes the request.
+ *        observes the request. The watcher owns the SignalSet (it is
+ *        detached and may outlive runServer's frame), and
+ *        HttpServer::serve wakes a blocked accept itself when the token
+ *        is stopped, so no signal ever has to arrive for the server to
+ *        exit.
  */
-YarnBall::Task<void> watchSignals(YarnBall::SignalSet *sigs,
-                                    std::stop_source src) {
+YarnBall::Task<> watchSignals(std::shared_ptr<YarnBall::SignalSet> sigs,
+                                std::stop_source src) {
     int sig = co_await sigs->next();
     std::cerr << "graceful_http: caught signal " << sig
               << ", draining\n";
@@ -50,7 +55,7 @@ YarnBall::Task<void> watchSignals(YarnBall::SignalSet *sigs,
 }
 #endif
 
-YarnBall::Task<void> runServer(std::uint16_t port) {
+YarnBall::Task<> runServer(std::uint16_t port) {
     Soccer::HttpServer server("0.0.0.0", port);
 
     server.route("GET", "/", [](Soccer::HttpRequest)
@@ -72,9 +77,9 @@ YarnBall::Task<void> runServer(std::uint16_t port) {
     std::cout << "graceful_http listening on 0.0.0.0:" << port << "\n";
 
 #if !defined(_WIN32)
-    YarnBall::SignalSet sigs({SIGINT, SIGTERM});
+    auto sigs = std::make_shared<YarnBall::SignalSet>(std::initializer_list<int>{SIGINT, SIGTERM});
     std::stop_source src;
-    YarnBall::coSpawn(watchSignals(&sigs, src));
+    YarnBall::coSpawn(watchSignals(sigs, src));
     co_await server.serve(src.get_token());
 #else
     // Windows: SignalSet not implemented yet. Server runs until the

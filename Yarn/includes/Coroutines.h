@@ -97,10 +97,12 @@ namespace YarnBall {
 
         /**
          * @brief Lock guarding the hook list of the chain rooted at @p root
-         *        (striped: roots hash onto a fixed set of mutexes). Lock
-         *        order: this lock, then the mutex of whatever primitive a
-         *        hook's callback takes; no code arms or disarms a hook while
-         *        holding such a primitive mutex.
+         *        (striped: roots hash onto a fixed set of mutexes). Hook
+         *        callbacks run after this lock is released (see
+         *        @ref runTakenHooks), so the lock is a leaf: code that holds a
+         *        primitive's mutex may not arm or disarm a hook, because a
+         *        callback running on another thread takes that mutex while a
+         *        disarm waits for it.
          */
         inline std::mutex &chainCancelLock(const void *root) noexcept {
             // Immortal: a detached coroutine can still be torn down by a worker while static destructors run.
@@ -269,7 +271,10 @@ namespace YarnBall {
          *        armed is a no-op.
          */
         inline void disarmCancelHook(CancelHook &h) noexcept {
-            if (TaskPromiseCore *root = h.root.load(std::memory_order_relaxed)) {
+            // Acquire pairs with the release store of root = nullptr in takeChainHooks, which comes after firing = true: a
+            // disarm that sees the hook unlinked therefore also sees it firing and waits below instead of returning
+            // while the callback is about to run.
+            if (TaskPromiseCore *root = h.root.load(std::memory_order_acquire)) {
                 std::lock_guard<std::mutex> lk(chainCancelLock(root));
                 if (h.root.load(std::memory_order_relaxed) == root) {
                     if (h.prev) h.prev->next = h.next; else root->hooks = h.next;
@@ -304,10 +309,11 @@ namespace YarnBall {
                 if (h->leaf->inChainOf(x)) {
                     if (h->prev) h->prev->next = h->next; else root->hooks = h->next;
                     if (h->next) h->next->prev = h->prev;
-                    h->root.store(nullptr, std::memory_order_relaxed);
                     h->firer = std::this_thread::get_id();
                     h->abandoned = nullptr;
                     h->firing.store(true, std::memory_order_release);
+                    // Last: publishes the unlinked state only once firing is visible (see disarmCancelHook).
+                    h->root.store(nullptr, std::memory_order_release);
                     h->prev = nullptr;
                     h->next = taken;
                     taken = h;
@@ -321,17 +327,46 @@ namespace YarnBall {
          * @brief Run the callbacks of hooks returned by @ref takeChainHooks.
          *        Each hook fires at most once; a hook's owner may be freed
          *        as soon as its callback has run (its disarm waits for it).
+         *
+         * Two phases. A callback can resume its coroutine inline (the pool
+         * refused the task) and unwind a chain that owns the *other* taken
+         * hooks, freeing them while they still sit in the list. So first,
+         * with no user code running, every hook's fn/ctx is copied into a
+         * local slot and its @c abandoned pointer aimed at that slot; only
+         * then are the callbacks invoked. A same-thread disarm during a
+         * callback marks the victim's slot, and that hook is skipped (its
+         * owner is gone) and never touched again.
          */
         inline void runTakenHooks(CancelHook *taken) noexcept {
+            struct Slot {
+                CancelHook *h;
+                void (*fn)(void *);
+                void *ctx;
+                bool abandoned;
+            };
+            constexpr std::size_t kInline = 16;
             while (taken) {
-                CancelHook *h = taken;
-                taken = h->next;
-                bool abandoned = false;
-                h->abandoned = &abandoned;
-                const auto fn = h->fn;
-                void *const ctx = h->ctx;
-                fn(ctx);
-                if (!abandoned) h->firing.store(false, std::memory_order_release);
+                std::size_t n = 0;
+                for (CancelHook *h = taken; h; h = h->next) ++n;
+                Slot inlineSlots[kInline];
+                std::unique_ptr<Slot[]> heapSlots;
+                Slot *slots = inlineSlots;
+                if (n > kInline) {
+                    heapSlots.reset(new (std::nothrow) Slot[n]);
+                    if (heapSlots) slots = heapSlots.get(); else n = kInline; // out of memory: handle a chunk at a time
+                }
+                std::size_t cnt = 0;
+                for (; cnt < n; ++cnt) {
+                    CancelHook *h = taken;
+                    taken = h->next;
+                    slots[cnt] = Slot{h, h->fn, h->ctx, false};
+                    h->abandoned = &slots[cnt].abandoned;
+                }
+                for (std::size_t i = 0; i < cnt; ++i) {
+                    if (slots[i].abandoned) continue; // owner destroyed by an earlier callback
+                    slots[i].fn(slots[i].ctx);
+                    if (!slots[i].abandoned) slots[i].h->firing.store(false, std::memory_order_release);
+                }
             }
         }
 
@@ -638,12 +673,15 @@ namespace YarnBall {
                 return this->handle;
             }
 
-            decltype(auto) await_resume() {
+            /// Returns the result by value, not as a reference into the promise: the awaited Task is usually a temporary
+            /// that dies at the end of the full-expression, so `for (x : co_await f())` or `auto &&r = co_await f();`
+            /// would otherwise keep a reference into a destroyed frame.
+            T await_resume() {
                 if (!this->handle) throw std::logic_error("co_await on an empty Task");
                 if constexpr (std::is_void_v<T>) {
                     this->handle.promise().result();
                 } else {
-                    return this->handle.promise().result();
+                    return std::move(this->handle.promise().result());
                 }
             }
         };
@@ -884,11 +922,22 @@ namespace YarnBall {
          *  - Awaited tasks are kept alive by the Task wrapper higher up the
          *    call chain (e.g. @c syncWait's helper).
          * This keeps the reactor's resumption path identical to the initial
-         * resume — no per-call ownership flag, no double-destroy hazards.
+         * resume — no double-destroy hazards.
+         *
+         * The one exception is the initial submission of a detached task
+         * (@c coSpawn), which passes @c ownsFrame: that task owns a frame that
+         * nobody else can free until it has run once. If it is destroyed
+         * without ever running (the pool refused it, or shut down first), the
+         * destructor destroys the never-started frame instead of leaking it.
          */
         class CoroutineITask final : public ITask {
         public:
-            explicit CoroutineITask(std::coroutine_handle<> h) noexcept : handle(h) {
+            explicit CoroutineITask(std::coroutine_handle<> h, bool ownsFrame = false) noexcept
+                : handle(h), owns(ownsFrame) {
+            }
+
+            ~CoroutineITask() override {
+                if (this->owns && this->handle) this->handle.destroy();
             }
 
             void run() override {
@@ -920,6 +969,7 @@ namespace YarnBall {
 
         private:
             std::coroutine_handle<> handle;
+            bool owns{false};
         };
 
     } // namespace detail
@@ -1119,7 +1169,16 @@ namespace YarnBall {
         // Spelled as unique_ptr<ITask> to disambiguate from the sITask
         // overload (unique_ptr<Derived> can implicit-convert to both
         // unique_ptr<ITask> and shared_ptr<ITask>).
-        std::unique_ptr<ITask> owned{new detail::CoroutineITask(handle)};
+        std::unique_ptr<ITask> owned;
+        try {
+            owned.reset(new detail::CoroutineITask(handle, /*ownsFrame=*/true));
+        } catch (...) {
+            // The frame is ours alone until the ITask exists: destroy it instead of leaking it.
+            handle.destroy();
+            throw;
+        }
+        // From here the ITask owns the frame: if run() throws it destroys the task (and so the never-started frame),
+        // and if the pool drops the task unrun at shutdown the same happens.
         Yarn::instance()->run(std::move(owned));
     }
 
@@ -1149,15 +1208,17 @@ namespace YarnBall {
 
         bool await_ready() const noexcept { return this->pool == nullptr; }
 
-        void await_suspend(std::coroutine_handle<> h) noexcept {
+        bool await_suspend(std::coroutine_handle<> h) noexcept {
             try {
                 std::unique_ptr<ITask> ct{new detail::CoroutineITask(h)};
                 this->pool->run(std::move(ct));
+                return true;
             } catch (...) {
-                // Last-resort fallback: resume inline on the caller. Loses
-                // the "bounce to worker" guarantee but does not leak the
-                // coroutine.
-                h.resume();
+                // Last-resort fallback: do not suspend, so the coroutine continues inline on the caller (returning
+                // false instead of calling h.resume() here keeps the resumed body out of await_suspend, where it
+                // would run on top of this frame and could destroy the awaiter under it). Loses the "bounce to
+                // worker" guarantee but does not leak the coroutine.
+                return false;
             }
         }
 

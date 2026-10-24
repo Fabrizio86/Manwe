@@ -91,17 +91,19 @@ namespace Soccer {
     /**
      * @struct Http2ServerOptions
      * @brief Resource limits for @ref Http2Server. Durations and sizes treat zero
-     *        as "unlimited".
+     *        as "unlimited" (an explicit opt-out; the defaults are finite).
      */
     struct Http2ServerOptions {
         /// A request (headers and body) must be complete within this long of its first
         /// byte, and a connection with an unfinished request must keep making progress
         /// at least this often. Cuts off slow-header / slow-body (slowloris) peers.
         std::chrono::milliseconds requestTimeout{30000};
-        /// A connection with nothing in flight and no bytes arriving is closed after this long.
-        std::chrono::milliseconds idleTimeout{120000};
-        /// Connections served at once; further ones are closed on accept.
-        std::size_t maxConnections{0};
+        /// A connection with nothing in flight is closed after this long without progress (a
+        /// request begun or finished); PING, SETTINGS and other frames that carry no work do
+        /// not restart the clock.
+        std::chrono::milliseconds idleTimeout{60000};
+        /// Connections served at once; further ones are closed on accept. Zero: unlimited.
+        std::size_t maxConnections{1024};
         /// Open streams per connection (advertised as SETTINGS_MAX_CONCURRENT_STREAMS and
         /// enforced: extra streams are refused with REFUSED_STREAM).
         std::size_t maxConcurrentStreams{100};
@@ -119,6 +121,10 @@ namespace Soccer {
         /// is closed with GOAWAY(ENHANCE_YOUR_CALM) -- the "rapid reset" attack opens and
         /// cancels streams as fast as it can.
         std::size_t maxResetsPerSecond{200};
+        /// Frames that carry no work -- PING, SETTINGS, PRIORITY, WINDOW_UPDATE with no stream
+        /// open -- tolerated per second before the connection is closed with
+        /// GOAWAY(ENHANCE_YOUR_CALM). Zero: unlimited.
+        std::size_t maxControlFramesPerSecond{50};
     };
 
 #ifdef SOCCER_HAS_HTTP2
@@ -161,6 +167,17 @@ namespace Soccer {
             bool headersRejected{false};
             // Set when the connection ended before the stream completed.
             bool connectionLost{false};
+            // Set when the request's deadline passed before the stream completed.
+            bool timedOut{false};
+            // Ownership hand-off (all guarded by the connection's stream-map mutex).
+            // nghttp2 keeps raw pointers into this object -- the body provider's
+            // source -- for as long as the stream is open in the session, so the
+            // object is freed only once the session has closed the stream
+            // (@c sessionClosed, from on_stream_close) AND the awaiter has taken
+            // the response (@c consumed); otherwise it lives until the connection
+            // state is destroyed, which deletes the session first.
+            bool sessionClosed{false};
+            bool consumed{false};
         };
     } // namespace detail
 
@@ -208,15 +225,26 @@ namespace Soccer {
             std::chrono::milliseconds connectTimeout = std::chrono::milliseconds{10000});
 
         /**
+         * @brief Default longest one request may take, from submission until its
+         *        response (headers, body and trailers) is complete.
+         */
+        static constexpr std::chrono::milliseconds kDefaultRequestTimeout{120000};
+
+        /**
          * @brief Issue one HTTP/2 request on a fresh stream. Suspends
          *        until @c on_stream_close fires for the assigned
          *        stream id.
+         *
+         * @param timeout Deadline for the whole exchange. When it passes the stream
+         *        is reset (CANCEL) and the call throws a @c SocketException; other
+         *        streams of the connection are unaffected. Zero: no deadline.
          */
         YarnBall::Task<Http2Response> request(
             std::string method,
             std::string path,
             std::vector<HttpHeader> headers = {},
-            std::string body = {});
+            std::string body = {},
+            std::chrono::milliseconds timeout = kDefaultRequestTimeout);
 
         /**
          * @brief Send a GOAWAY frame and close the connection. Pending
@@ -294,7 +322,9 @@ namespace Soccer {
 
         /**
          * @brief Register a route. Exact match on @p method + @p path.
-         *        Last-write-wins on duplicate registration. The
+         *        Last-write-wins on duplicate registration. Routes are
+         *        snapshotted by @ref serve: register them first, a later call
+         *        does not affect a running server. The
          *        @c HttpRouteHandler type comes from HttpServer so
          *        a route definition can be shared between the h1 and
          *        h2 servers verbatim.
@@ -306,7 +336,8 @@ namespace Soccer {
         /**
          * @brief Run the accept loop. Returns when @p stop is
          *        requested. In-flight handlers keep running until
-         *        they complete cooperatively.
+         *        they complete cooperatively. Callable once: it consumes
+         *        the listener, a second call throws a @c SocketException.
          */
         YarnBall::Task<void> serve(std::stop_token stop = {});
 
@@ -381,7 +412,16 @@ namespace Soccer {
          */
         std::size_t size() const;
 
+        /// Most distinct connections kept at once; past it, finished ones are dropped
+        /// and, if all are live, a new connection is returned without being cached.
+        static constexpr std::size_t kMaxEntries = 256;
+
     private:
+        /// Store @p conn under @p k (caller holds @c mu) unless a live connection is already
+        /// there; returns the connection to use.
+        std::shared_ptr<Http2Connection> insertLocked(const std::string &k,
+                                                      std::shared_ptr<Http2Connection> conn);
+
         mutable std::mutex mu;
         std::unordered_map<std::string,
                             std::shared_ptr<Http2Connection>> entries;
@@ -419,7 +459,8 @@ namespace Soccer {
             co_return Http2Connection{};
         }
         YarnBall::Task<Http2Response> request(
-            std::string, std::string, std::vector<HttpHeader> = {}, std::string = {}) {
+            std::string, std::string, std::vector<HttpHeader> = {}, std::string = {},
+            std::chrono::milliseconds = std::chrono::milliseconds{120000}) {
             throw Http2NotImplemented{};
             co_return Http2Response{};
         }

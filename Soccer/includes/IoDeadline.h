@@ -17,7 +17,11 @@
 // before the owner closes or releases the fd (the destructor does it too), and
 // the watchdog re-checks that flag under the same mutex before it calls
 // shutdown(). A late timer therefore never touches a descriptor that has been
-// closed and handed to another connection.
+// closed and handed to another connection -- provided the IoDeadline is destroyed
+// (or disarmed) before its owner closes the fd, which is the contract of the
+// raw-fd overloads. The overloads taking a TcpStream do not depend on it: they
+// hold a weak reference to the stream's socket slot and shut the descriptor down
+// only while the slot still owns it.
 //
 // Cost model: one sweeper coroutine for the whole process, alive only while some
 // deadline is armed. It wakes every kSweepInterval, shuts down expired sockets
@@ -30,6 +34,7 @@
 #define SOCCER_IODEADLINE_H
 
 #include <atomic>
+#include <algorithm>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -38,6 +43,7 @@
 
 #include "Coroutines.h"
 #include "NetUtil.h"
+#include "TcpStream.h"
 #include "Timers.h"
 
 namespace Soccer {
@@ -73,17 +79,33 @@ namespace Soccer {
             }
 
             void add(std::shared_ptr<DeadlineGuard> g, int fd,
-                     std::chrono::steady_clock::time_point when) {
+                     std::chrono::steady_clock::time_point when,
+                     SocketSlot::Watch watch = {}) {
                 bool spawn = false;
+                const DeadlineGuard *mine = g.get();
                 {
                     std::lock_guard<std::mutex> lk(this->mu);
-                    this->entries.push_back(Entry{std::move(g), fd, when});
+                    this->entries.push_back(Entry{std::move(g), fd, when, std::move(watch)});
                     if (!this->running) {
                         this->running = true;
                         spawn = true;
                     }
                 }
-                if (spawn) YarnBall::coSpawn(sweepLoop());
+                if (spawn) {
+                    try {
+                        YarnBall::coSpawn(sweepLoop());
+                    } catch (...) {
+                        // No sweeper started: let the next add() try again instead of
+                        // leaving `running` set with nobody to clear it, which would
+                        // park every later deadline forever.
+                        std::lock_guard<std::mutex> lk(this->mu);
+                        this->running = false;
+                        // And take our entry back out: nobody will ever sweep it, and the
+                        // caller sees the throw and holds no deadline.
+                        std::erase_if(this->entries, [mine](const Entry &e) { return e.g.get() == mine; });
+                        throw;
+                    }
+                }
             }
 
         private:
@@ -91,6 +113,7 @@ namespace Soccer {
                 std::shared_ptr<DeadlineGuard> g;
                 int fd;
                 std::chrono::steady_clock::time_point when;
+                SocketSlot::Watch watch; ///< empty for a raw fd
             };
 
             static YarnBall::Task<void> sweepLoop() {
@@ -115,7 +138,10 @@ namespace Soccer {
                             drop = true;
                         } else if (e.when <= now) {
                             e.g->fired.store(true, std::memory_order_release);
-                            shutdownSocket(e.fd); // wakes the parked wait; the operation then fails
+                            // Wakes the parked wait; the operation then fails. Through the slot when we
+                            // have one, so a descriptor the owner already closed is left alone.
+                            if (e.watch) (void) e.watch.shutdownIf(e.fd);
+                            else shutdownSocket(e.fd);
                             drop = true;
                         }
                     }
@@ -153,18 +179,24 @@ namespace Soccer {
 
         IoDeadline(int fd, std::chrono::milliseconds limit) { this->arm(fd, limit); }
 
+        /// Deadline on a stream's socket that stays safe if the stream is closed first.
+        /// Arm it once the stream has reached its final place: moving the stream detaches it.
+        IoDeadline(const TcpStream &s, std::chrono::milliseconds limit) { this->arm(s, limit); }
+
         IoDeadline(const IoDeadline &) = delete;
         IoDeadline &operator=(const IoDeadline &) = delete;
 
         IoDeadline(IoDeadline &&o) noexcept
             : guard(std::move(o.guard)), firedBefore(o.firedBefore) {
+            o.firedBefore = false;
         }
 
         IoDeadline &operator=(IoDeadline &&o) noexcept {
             if (this != &o) {
-                this->disarm();
+                this->disarm(); // folds a fired deadline of ours into firedBefore
                 this->guard = std::move(o.guard);
-                this->firedBefore = o.firedBefore;
+                this->firedBefore = this->firedBefore || o.firedBefore;
+                o.firedBefore = false;
             }
             return *this;
         }
@@ -180,8 +212,28 @@ namespace Soccer {
             this->disarm();
             if (limit.count() <= 0 || fd < 0) return;
             this->guard = std::make_shared<detail::DeadlineGuard>();
-            detail::DeadlineSweeper::instance().add(
-                this->guard, fd, std::chrono::steady_clock::now() + limit);
+            try {
+                detail::DeadlineSweeper::instance().add(
+                    this->guard, fd, std::chrono::steady_clock::now() + limit);
+            } catch (...) {
+                this->guard.reset(); // nothing armed
+                throw;
+            }
+        }
+
+        /// @copydoc IoDeadline(const TcpStream &, std::chrono::milliseconds)
+        void arm(const TcpStream &s, std::chrono::milliseconds limit) {
+            this->disarm();
+            const int fd = s.fd();
+            if (limit.count() <= 0 || fd < 0) return;
+            this->guard = std::make_shared<detail::DeadlineGuard>();
+            try {
+                detail::DeadlineSweeper::instance().add(
+                    this->guard, fd, std::chrono::steady_clock::now() + limit, s.slot().watch());
+            } catch (...) {
+                this->guard.reset();
+                throw;
+            }
         }
 
         /**

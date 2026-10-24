@@ -14,3 +14,7 @@ add_executable(bench_async_server bench_async_server.cpp)
 target_link_libraries(bench_async_server PRIVATE Yarn)
 
 # A future bench_soccer can be added the same way and link Soccer.
+
+# Telegraph::Signal emit cost (handler snapshot / contention). Header-only Wire plus Yarn.
+add_executable(bench_signal bench_signal.cpp)
+target_link_libraries(bench_signal PRIVATE Wire Yarn)

@@ -66,11 +66,12 @@ namespace YarnBall {
             std::atomic<size_t> remaining{0};
 
             /**
-             * @brief Handle to resume when the latch reaches zero. Written
-             *        once by the awaiter under the latch protocol; readers
-             *        observe the write via the @c fetch_sub acq_rel ordering.
+             * @brief Handle (a WaitProxy's, see Cancellation.h) to resume when
+             *        the latch reaches zero, or null. Taken by the runner that
+             *        brings the latch to zero, or by the awaiter's destructor
+             *        when its frame dies while parked.
              */
-            std::coroutine_handle<> waiter{};
+            std::atomic<void *> waiterAddr{nullptr};
 
             /**
              * @brief Cancellation scope handed to the subtasks when whenAll
@@ -102,15 +103,11 @@ namespace YarnBall {
                 return this->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1;
             }
 
-            /**
-             * @brief Register the awaiter's handle and consume its latch
-             *        slot. Returns @c true iff every subtask had already
-             *        completed by the time we registered; the caller should
-             *        resume inline.
-             */
-            bool registerWaiter(std::coroutine_handle<> h) noexcept {
-                this->waiter = h;
-                return this->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1;
+            /// Resume the parked awaiter (if it is still there). Called by the runner that completed the latch.
+            void resumeWaiter() noexcept {
+                if (void *a = this->waiterAddr.exchange(nullptr, std::memory_order_acq_rel)) {
+                    std::coroutine_handle<>::from_address(a).resume();
+                }
             }
         };
 
@@ -122,7 +119,7 @@ namespace YarnBall {
             std::exception_ptr exception{};
             std::mutex ex_mu;
             std::atomic<size_t> remaining{0};
-            std::coroutine_handle<> waiter{};
+            std::atomic<void *> waiterAddr{nullptr};
             std::stop_source stop{std::nostopstate};
             bool scoped = false;
 
@@ -138,9 +135,10 @@ namespace YarnBall {
                 return this->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1;
             }
 
-            bool registerWaiter(std::coroutine_handle<> h) noexcept {
-                this->waiter = h;
-                return this->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1;
+            void resumeWaiter() noexcept {
+                if (void *a = this->waiterAddr.exchange(nullptr, std::memory_order_acq_rel)) {
+                    std::coroutine_handle<>::from_address(a).resume();
+                }
             }
         };
 
@@ -153,22 +151,23 @@ namespace YarnBall {
         template<typename T>
         Task<> whenAllRunner(std::shared_ptr<WhenAllState<T>> state,
                                    size_t idx,
-                                   Task<T> task) {
+                                   Task<T> task,
+                                   trace::Context traceCtx) {
             std::stop_token scope;
             if (state->scoped) {
                 scope = state->stop.get_token();
                 co_await InstallScopeAwaiter{&scope};
             }
+            if (!traceCtx.empty()) co_await trace::installCurrent(traceCtx);
             try {
-                auto value = co_await std::move(task);
-                state->results[idx].emplace(std::move(value));
+                // The child's frame dies with this block, before the latch is released (see joinRunner).
+                Task<T> work = std::move(task);
+                state->results[idx].emplace(co_await std::move(work));
             } catch (...) {
                 state->recordException(std::current_exception());
             }
-            if (state->completeOne()) {
-                // We were the last to complete; resume the awaiter.
-                if (state->waiter) state->waiter.resume();
-            }
+            // The last to complete resumes the awaiter.
+            if (state->completeOne()) state->resumeWaiter();
             co_return;
         }
 
@@ -176,33 +175,50 @@ namespace YarnBall {
          * @brief Per-subtask wrapper for @c Task<void>.
          */
         inline Task<> whenAllRunnerVoid(std::shared_ptr<WhenAllVoidState> state,
-                                               Task<> task) {
+                                               Task<> task,
+                                               trace::Context traceCtx) {
             std::stop_token scope;
             if (state->scoped) {
                 scope = state->stop.get_token();
                 co_await InstallScopeAwaiter{&scope};
             }
+            if (!traceCtx.empty()) co_await trace::installCurrent(traceCtx);
             try {
-                co_await std::move(task);
+                Task<> work = std::move(task);
+                co_await std::move(work);
             } catch (...) {
                 state->recordException(std::current_exception());
             }
-            if (state->completeOne()) {
-                if (state->waiter) state->waiter.resume();
-            }
+            if (state->completeOne()) state->resumeWaiter();
             co_return;
         }
 
         /**
-         * @brief Awaiter returned to the @c whenAll coroutine. Registers
-         *        the coroutine handle as the latch waiter; if the latch
-         *        was already at 1 (all subtasks done), resumes the awaiter
-         *        inline by reporting @c await_ready=false but returning
-         *        from @c await_suspend in a way that yields right back.
+         * @brief Awaiter returned to the @c whenAll coroutine. Parks behind a
+         *        WaitProxy (see Cancellation.h) so that a frame destroyed while
+         *        parked is never resumed by a late runner; its destructor then
+         *        also stops the subtasks' scope, if there is one.
          */
         template<typename State>
         struct WhenAllAwaiter {
             std::shared_ptr<State> state;
+            WaitProxy proxy;
+            bool parked = false;  // the proxy is published in state->waiterAddr
+            bool resumed = false; // await_resume ran, i.e. the frame was not destroyed while parked
+
+            explicit WhenAllAwaiter(std::shared_ptr<State> s) noexcept : state(std::move(s)) {}
+            WhenAllAwaiter(const WhenAllAwaiter &) = delete;
+            WhenAllAwaiter &operator=(const WhenAllAwaiter &) = delete;
+
+            ~WhenAllAwaiter() {
+                if (!this->parked) return;
+                void *expected = this->proxy.handle().address();
+                const bool removed = this->state->waiterAddr.compare_exchange_strong(
+                    expected, nullptr, std::memory_order_acq_rel);
+                this->proxy.retire(removed);
+                // Destroyed while parked: nobody will look at the results, stop the subtasks that can be stopped.
+                if (!this->resumed) this->state->stop.request_stop();
+            }
 
             bool await_ready() const noexcept {
                 // Fast-path: zero-subtask whenAll. Counter starts at 1
@@ -211,21 +227,26 @@ namespace YarnBall {
                 return this->state->remaining.load(std::memory_order_acquire) <= 1;
             }
 
-            std::coroutine_handle<> await_suspend(std::coroutine_handle<> h) noexcept {
-                if (this->state->registerWaiter(h)) {
-                    // Every subtask had already completed by the time we
-                    // got here. Symmetric-transfer back to @c h so the
-                    // resume happens AFTER await_suspend has returned.
-                    // Calling h.resume() inline here would re-enter the
-                    // very coroutine that is still suspending -- a known
-                    // recursion / lifetime hazard that manifested as a
-                    // SIGSEGV on macOS-arm64 under load.
+            std::coroutine_handle<> await_suspend(std::coroutine_handle<> h) {
+                const auto ph = this->proxy.publish(h);
+                this->parked = true;
+                this->state->waiterAddr.store(ph.address(), std::memory_order_release);
+                // Nothing below may touch *this unless we return h: once the latch can reach zero a runner may resume
+                // the proxy, and the resumed frame may destroy this awaiter.
+                if (this->state->remaining.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+                    // Every subtask had already completed, so no runner will ever take the proxy. Symmetric-transfer
+                    // back to @c h so the resume happens AFTER await_suspend has returned (calling h.resume() inline
+                    // would re-enter the coroutine that is still suspending: a SIGSEGV on macOS-arm64 under load).
+                    this->state->waiterAddr.store(nullptr, std::memory_order_relaxed);
+                    this->proxy.reclaim();
+                    this->parked = false;
                     return h;
                 }
                 return std::noop_coroutine();
             }
 
-            void await_resume() const {
+            void await_resume() {
+                this->resumed = true;
                 if (this->state->exception) {
                     std::rethrow_exception(this->state->exception);
                 }
@@ -247,6 +268,13 @@ namespace YarnBall {
      * every subtask runs in a scope that follows it, so stopping the outer
      * scope cancels their parked awaits.
      *
+     * There is no fail-fast: every subtask runs to completion (or to its next
+     *        cancellable await, when an outer scope stops) even after another
+     *        one threw; only the first exception is reported. Destroying the
+     *        awaiting frame while it is parked detaches it: the subtasks run on
+     *        with their results dropped (and are stopped, if whenAll runs inside
+     *        a cancellation scope).
+     *
      * @tparam T Per-subtask result type (must not be @c void; see the
      *           dedicated overload below).
      */
@@ -261,8 +289,17 @@ namespace YarnBall {
             link.follow(outer, state->stop);
         }
 
-        for (size_t i = 0; i < tasks.size(); ++i) {
-            coSpawn(detail::whenAllRunner<T>(state, i, std::move(tasks[i])));
+        const trace::Context traceCtx = outer ? outer->inheritedTrace() : trace::Context{};
+        size_t spawned = 0;
+        try {
+            for (; spawned < tasks.size(); ++spawned) {
+                coSpawn(detail::whenAllRunner<T>(state, spawned, std::move(tasks[spawned]), traceCtx));
+            }
+        } catch (...) {
+            // Spawning failed part-way: settle the latch slots of the runners that will never exist (the awaiter's own
+            // slot keeps it from reaching zero here), wait for the ones that do, then report the failure.
+            state->recordException(std::current_exception());
+            for (size_t j = spawned; j < tasks.size(); ++j) state->completeOne();
         }
 
         co_await detail::WhenAllAwaiter<detail::WhenAllState<T>>{state};
@@ -290,8 +327,15 @@ namespace YarnBall {
             link.follow(outer, state->stop);
         }
 
-        for (auto &t : tasks) {
-            coSpawn(detail::whenAllRunnerVoid(state, std::move(t)));
+        const trace::Context traceCtx = outer ? outer->inheritedTrace() : trace::Context{};
+        size_t spawned = 0;
+        try {
+            for (; spawned < tasks.size(); ++spawned) {
+                coSpawn(detail::whenAllRunnerVoid(state, std::move(tasks[spawned]), traceCtx));
+            }
+        } catch (...) {
+            state->recordException(std::current_exception());
+            for (size_t j = spawned; j < tasks.size(); ++j) state->completeOne();
         }
 
         co_await detail::WhenAllAwaiter<detail::WhenAllVoidState>{state};

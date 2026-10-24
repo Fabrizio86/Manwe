@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <coroutine>
 #include <cstddef>
 #include <deque>
@@ -27,6 +28,7 @@
 
 #include "Cancellation.h"
 #include "Coroutines.h"
+#include "Deadline.h"
 
 namespace Telegraph {
 
@@ -50,6 +52,26 @@ namespace Telegraph {
      * leaves its queue (a value already handed to it goes back to the channel). @ref pushFront returns a value to the head of the
      * channel (see @c channelSelect).
      *
+     * Timeouts: use @ref sendFor / @ref receiveFor, not
+     * @c YarnBall::withTimeout around @c send / @c receive. @c withTimeout
+     * races the call against a timer and discards the loser's result, so a
+     * receive can lose the value it was handed when the timer wins, and a
+     * send can deliver while its caller sees a timeout (a retry then
+     * duplicates the message). The @c ...For helpers cancel the parked call
+     * instead.
+     *
+     * A task returned by @c send / @c receive reads the channel when it
+     * first runs: await it while the channel is alive. (A call that is
+     * already parked is safe against the channel being destroyed, see
+     * below.)
+     *
+     * If moving a @c T throws while a value is being handed over, the call
+     * that was moving it throws and the waiter it was serving stays queued.
+     *
+     * The channel's state is shared with the parked waiters, so a waiter
+     * frame that outlives the channel (woken by the destructor's @c close
+     * and not destroyed yet) never touches freed memory.
+     *
      * @tparam T Value type. Must be move-constructible.
      */
     template<typename T>
@@ -61,8 +83,8 @@ namespace Telegraph {
          *        every @c send pairs directly with a waiting receiver,
          *        and either side suspends until the other arrives.
          */
-        explicit BoundedChannel(std::size_t capacity) noexcept
-            : capacityVal(capacity) {
+        explicit BoundedChannel(std::size_t capacity)
+            : core(std::make_shared<Core>(capacity)) {
         }
 
         BoundedChannel(const BoundedChannel &) = delete;
@@ -82,18 +104,24 @@ namespace Telegraph {
         YarnBall::Task<bool> send(T value) {
             // Fast path: hand-off to a waiting receiver, or push into a
             // non-full buffer. Both happen synchronously under the lock.
+            // Works on the channel's core directly: the shared_ptr is copied only when about to park.
+            Core &c = *this->core;
+            std::shared_ptr<Core> held;
             {
                 std::shared_ptr<RecvWaiter> receiver;
                 {
-                    std::lock_guard<std::mutex> lk(this->mu);
-                    if (this->closedFlag) co_return false;
-                    if (!this->receivers.empty()) {
-                        receiver = this->popReceiverLocked();
+                    std::lock_guard<std::mutex> lk(c.mu);
+                    if (c.closedFlag) co_return false;
+                    if (!c.receivers.empty()) {
+                        // Hand over first, then dequeue: if moving the value throws, the receiver is still parked.
                         // Under the lock, so a receiver destroyed before the wake runs can take the value back.
-                        receiver->slot.emplace(std::move(value));
-                    } else if (this->buffer.size() < this->capacityVal) {
-                        this->buffer.push_back(std::move(value));
+                        c.receivers.front()->slot.emplace(std::move(value));
+                        receiver = c.popReceiverLocked();
+                    } else if (c.buffer.size() < c.capacityVal) {
+                        c.buffer.push_back(std::move(value));
                         co_return true;
+                    } else {
+                        held = this->core;
                     }
                 }
                 if (receiver) {
@@ -105,10 +133,9 @@ namespace Telegraph {
             // Slow path: buffer full, no receiver waiting. Park the
             // sender on the senders queue; a receiver will wake us
             // once a slot frees up (or close() will fail the send).
-            auto sender = std::make_shared<SendWaiter>();
-            sender->value.emplace(std::move(value));
-            co_await SendAwaiter{this, sender};
-            co_return sender->ok;
+            // The awaiter owns the waiter and hands back the outcome, so the frame holds no second reference to it
+            // (every byte of a coroutine frame is paid for on every call, parked or not). `held` keeps the core alive.
+            co_return co_await SendAwaiter{held.get(), std::move(value)};
         }
 
         /**
@@ -119,32 +146,33 @@ namespace Telegraph {
          */
         YarnBall::Task<std::optional<T>> receive() {
             // Fast path: buffer non-empty, a sender is parked, or channel already closed.
+            // Works on the channel's core directly: the shared_ptr is copied only when about to park.
+            Core &c = *this->core;
+            std::shared_ptr<Core> held;
             std::optional<T> got;
             std::coroutine_handle<> wake{};
             bool drainedClosed = false;
             {
-                std::lock_guard<std::mutex> lk(this->mu);
-                if (!this->buffer.empty()) {
-                    got.emplace(std::move(this->buffer.front()));
-                    this->buffer.pop_front();
-                    // Pull one parked sender into the now-empty slot if
-                    // there is one queued. The sender's value goes into
-                    // the buffer; the sender is woken after the unlock.
-                    if (!this->senders.empty()) {
-                        auto sender = this->popSenderLocked();
-                        this->buffer.push_back(std::move(*sender->value));
-                        sender->ok = true;
-                        wake = sender->handle;
+                std::lock_guard<std::mutex> lk(c.mu);
+                if (!c.buffer.empty()) {
+                    got.emplace(std::move(c.buffer.front()));
+                    c.buffer.pop_front();
+                    // Pull one parked sender into the freed slot, if there is a free slot (a pushFront can leave the
+                    // buffer at or over capacity, and a rendezvous channel has no slot at all). The sender's value goes
+                    // into the buffer; the sender is woken after the unlock.
+                    if (c.buffer.size() < c.capacityVal && !c.senders.empty()) {
+                        c.buffer.push_back(std::move(*c.senders.front()->value));
+                        wake = c.popSenderLocked()->takeOk();
                     }
-                } else if (!this->senders.empty()) {
+                } else if (!c.senders.empty()) {
                     // Rendezvous (capacity 0): a parked sender hands its value
                     // straight to us, since the buffer can never hold it.
-                    auto sender = this->popSenderLocked();
-                    got.emplace(std::move(*sender->value));
-                    sender->ok = true;
-                    wake = sender->handle;
-                } else if (this->closedFlag) {
+                    got.emplace(std::move(*c.senders.front()->value));
+                    wake = c.popSenderLocked()->takeOk();
+                } else if (c.closedFlag) {
                     drainedClosed = true;
+                } else {
+                    held = this->core;
                 }
             }
             // Never resume a coroutine under the channel mutex: dispatch() may fall back to an inline resume.
@@ -153,34 +181,65 @@ namespace Telegraph {
             if (drainedClosed) co_return std::nullopt;
 
             // Slow path: buffer empty, no sender waiting.
-            auto receiver = std::make_shared<RecvWaiter>();
-            co_await ReceiveAwaiter{this, receiver};
-            if (!receiver->slot.has_value()) co_return std::nullopt;
-            co_return std::move(*receiver->slot);
+            co_return co_await ReceiveAwaiter{held.get()};
+        }
+
+        /**
+         * @brief @ref send with a deadline. Exactly once: either the value
+         *        was delivered (the result is @c true, or @c false if the
+         *        channel closed), or the deadline passed first, the parked
+         *        send left the queue, the value was NOT delivered and is
+         *        dropped (copy it first if the caller wants to retry). A
+         *        send that completes at the same instant as the deadline
+         *        reports success, so a retry never duplicates a message.
+         * @throws YarnBall::TimeoutException if @p timeout elapsed first;
+         *         @c YarnBall::CancelledException if the caller's own scope
+         *         was stopped.
+         */
+        template<typename Rep, typename Period>
+        YarnBall::Task<bool> sendFor(T value, std::chrono::duration<Rep, Period> timeout) {
+            detail::DeadlineGuard guard(timeout);
+            try {
+                co_return co_await YarnBall::withCancellation(guard.token(), this->send(std::move(value)));
+            } catch (const YarnBall::CancelledException &) {
+                if (guard.expired()) throw YarnBall::TimeoutException("BoundedChannel::sendFor");
+                throw;
+            }
+        }
+
+        /**
+         * @brief @ref receive with a deadline. Lossless: a receive that
+         *        times out leaves the queue without taking a value, and a
+         *        value handed over at the same instant is returned (or put
+         *        back).
+         * @throws YarnBall::TimeoutException if @p timeout elapsed first;
+         *         @c YarnBall::CancelledException if the caller's own scope
+         *         was stopped.
+         */
+        template<typename Rep, typename Period>
+        YarnBall::Task<std::optional<T>> receiveFor(std::chrono::duration<Rep, Period> timeout) {
+            detail::DeadlineGuard guard(timeout);
+            try {
+                co_return co_await YarnBall::withCancellation(guard.token(), this->receive());
+            } catch (const YarnBall::CancelledException &) {
+                if (guard.expired()) throw YarnBall::TimeoutException("BoundedChannel::receiveFor");
+                throw;
+            }
         }
 
         /**
          * @brief Put @p value back at the head of the channel, ahead of
-         *        anything buffered (it may briefly exceed the capacity by
-         *        one): it goes straight to the oldest parked receiver if
-         *        there is one. Returns @c false (dropping the value) if the
-         *        channel is closed.
+         *        anything buffered: it goes straight to the oldest parked
+         *        receiver if there is one. The buffer may exceed the
+         *        capacity by one per value pushed back (including on a
+         *        rendezvous channel, where it holds the value until a
+         *        receiver takes it); parked senders are released only once
+         *        it has drained below the capacity again. On a closed
+         *        channel the value goes to the buffer, which receivers
+         *        still drain. Always returns @c true.
          */
         bool pushFront(T value) {
-            std::shared_ptr<RecvWaiter> receiver;
-            {
-                std::lock_guard<std::mutex> lk(this->mu);
-                if (this->closedFlag) return false;
-                if (!this->receivers.empty()) {
-                    receiver = this->popReceiverLocked();
-                    receiver->slot.emplace(std::move(value));
-                } else {
-                    this->buffer.push_front(std::move(value));
-                    return true;
-                }
-            }
-            dispatch(receiver->handle);
-            return true;
+            return pushFrontCore(*this->core, std::move(value));
         }
 
         /**
@@ -189,16 +248,17 @@ namespace Telegraph {
          *        Idempotent.
          */
         void close() {
+            Core &c = *this->core;
             std::deque<std::shared_ptr<RecvWaiter>> wakeRecv;
             std::deque<std::shared_ptr<SendWaiter>> wakeSend;
             {
-                std::lock_guard<std::mutex> lk(this->mu);
-                if (this->closedFlag) return;
-                this->closedFlag = true;
-                wakeRecv = std::move(this->receivers);
-                this->receivers.clear();
-                wakeSend = std::move(this->senders);
-                this->senders.clear();
+                std::lock_guard<std::mutex> lk(c.mu);
+                if (c.closedFlag) return;
+                c.closedFlag = true;
+                wakeRecv = std::move(c.receivers);
+                c.receivers.clear();
+                wakeSend = std::move(c.senders);
+                c.senders.clear();
                 for (auto &r : wakeRecv) r->queued.store(false, std::memory_order_release);
                 for (auto &w : wakeSend) w->queued.store(false, std::memory_order_release);
             }
@@ -210,16 +270,28 @@ namespace Telegraph {
         }
 
         bool closed() const noexcept {
-            std::lock_guard<std::mutex> lk(this->mu);
-            return this->closedFlag;
+            std::lock_guard<std::mutex> lk(this->core->mu);
+            return this->core->closedFlag;
         }
 
         std::size_t size() const noexcept {
-            std::lock_guard<std::mutex> lk(this->mu);
-            return this->buffer.size();
+            std::lock_guard<std::mutex> lk(this->core->mu);
+            return this->core->buffer.size();
         }
 
-        std::size_t capacity() const noexcept { return this->capacityVal; }
+        std::size_t capacity() const noexcept { return this->core->capacityVal; }
+
+        /// @return Number of receivers currently parked (snapshot).
+        std::size_t receiverCount() const noexcept {
+            std::lock_guard<std::mutex> lk(this->core->mu);
+            return this->core->receivers.size();
+        }
+
+        /// @return Number of senders currently parked (snapshot).
+        std::size_t senderCount() const noexcept {
+            std::lock_guard<std::mutex> lk(this->core->mu);
+            return this->core->senders.size();
+        }
 
     private:
         struct RecvWaiter {
@@ -242,20 +314,59 @@ namespace Telegraph {
             std::optional<T> value;
             bool ok = false;
             std::atomic<bool> queued{false};
+
+            /// Mark the send delivered; returns the handle to wake.
+            std::coroutine_handle<> takeOk() noexcept {
+                this->ok = true;
+                return this->handle;
+            }
         };
 
-        std::shared_ptr<RecvWaiter> popReceiverLocked() {
-            auto r = std::move(this->receivers.front());
-            this->receivers.pop_front();
-            r->queued.store(false, std::memory_order_release);
-            return r;
-        }
+        /**
+         * @brief Everything the channel guards. Shared with every parked
+         *        waiter, so a waiter frame destroyed after the channel is
+         *        gone still finds a live mutex and queues.
+         */
+        struct Core {
+            explicit Core(std::size_t capacity) noexcept : capacityVal(capacity) {
+            }
 
-        std::shared_ptr<SendWaiter> popSenderLocked() {
-            auto w = std::move(this->senders.front());
-            this->senders.pop_front();
-            w->queued.store(false, std::memory_order_release);
-            return w;
+            std::shared_ptr<RecvWaiter> popReceiverLocked() {
+                auto r = std::move(this->receivers.front());
+                this->receivers.pop_front();
+                r->queued.store(false, std::memory_order_release);
+                return r;
+            }
+
+            std::shared_ptr<SendWaiter> popSenderLocked() {
+                auto w = std::move(this->senders.front());
+                this->senders.pop_front();
+                w->queued.store(false, std::memory_order_release);
+                return w;
+            }
+
+            mutable std::mutex mu;
+            std::deque<T> buffer;
+            std::deque<std::shared_ptr<RecvWaiter>> receivers;
+            std::deque<std::shared_ptr<SendWaiter>> senders;
+            const std::size_t capacityVal;
+            bool closedFlag = false;
+        };
+
+        static bool pushFrontCore(Core &c, T value) {
+            std::shared_ptr<RecvWaiter> receiver;
+            {
+                std::lock_guard<std::mutex> lk(c.mu);
+                if (!c.closedFlag && !c.receivers.empty()) {
+                    c.receivers.front()->slot.emplace(std::move(value));
+                    receiver = c.popReceiverLocked();
+                } else {
+                    c.buffer.push_front(std::move(value));
+                    return true;
+                }
+            }
+            dispatch(receiver->handle);
+            return true;
         }
 
         /**
@@ -266,16 +377,16 @@ namespace Telegraph {
          */
         template<typename Waiter, typename Queue, typename Self>
         struct ParkedWait {
-            BoundedChannel *ch;
+            // Not owning: the coroutine frame that awaits this holds a reference to the core for the awaiter's whole life.
+            Core *ch;
             std::shared_ptr<Waiter> waiter;
-            Queue BoundedChannel::*queue;
             bool earlyCancel = false; // guarded by ch->mu
             bool cancelled = false;
             YarnBall::detail::WaitProxy proxy;
             YarnBall::detail::CancelBinding bind;
 
-            ParkedWait(BoundedChannel *c, std::shared_ptr<Waiter> w, Queue BoundedChannel::*q) noexcept
-                : ch(c), waiter(std::move(w)), queue(q) {
+            ParkedWait(Core *c, std::shared_ptr<Waiter> w) noexcept
+                : ch(c), waiter(std::move(w)) {
             }
             ParkedWait(const ParkedWait &) = delete;
             ParkedWait &operator=(const ParkedWait &) = delete;
@@ -296,7 +407,7 @@ namespace Telegraph {
             }
 
             void unlinkLocked() noexcept {
-                auto &q = this->ch->*(this->queue);
+                auto &q = Self::queueOf(*this->ch);
                 auto it = std::find(q.begin(), q.end(), this->waiter);
                 if (it != q.end()) q.erase(it);
                 this->waiter->queued.store(false, std::memory_order_release);
@@ -305,7 +416,7 @@ namespace Telegraph {
             void park(std::coroutine_handle<> h) {
                 this->waiter->handle = this->proxy.publish(h);
                 this->waiter->queued.store(true, std::memory_order_release);
-                (this->ch->*(this->queue)).push_back(this->waiter);
+                Self::queueOf(*this->ch).push_back(this->waiter);
             }
 
             static void cancelThunk(void *p) noexcept {
@@ -332,9 +443,11 @@ namespace Telegraph {
         struct ReceiveAwaiter : ParkedWait<RecvWaiter, std::deque<std::shared_ptr<RecvWaiter>>, ReceiveAwaiter> {
             using Base = ParkedWait<RecvWaiter, std::deque<std::shared_ptr<RecvWaiter>>, ReceiveAwaiter>;
 
-            ReceiveAwaiter(BoundedChannel *c, std::shared_ptr<RecvWaiter> w) noexcept
-                : Base(c, std::move(w), &BoundedChannel::receivers) {
+            explicit ReceiveAwaiter(Core *c)
+                : Base(c, std::make_shared<RecvWaiter>()) {
             }
+
+            static std::deque<std::shared_ptr<RecvWaiter>> &queueOf(Core &c) noexcept { return c.receivers; }
             ~ReceiveAwaiter() {
                 this->bind.disarm();
                 if (!this->proxy) return;
@@ -353,7 +466,7 @@ namespace Telegraph {
                         this->waiter->slot.reset();
                     }
                 }
-                if (orphan) this->ch->pushFront(std::move(*orphan));
+                if (orphan) pushFrontCore(*this->ch, std::move(*orphan));
             }
 
             bool await_ready() const noexcept { return false; }
@@ -374,17 +487,13 @@ namespace Telegraph {
                         if (!this->ch->buffer.empty()) {
                             this->waiter->slot.emplace(std::move(this->ch->buffer.front()));
                             this->ch->buffer.pop_front();
-                            if (!this->ch->senders.empty()) {
-                                auto sender = this->ch->popSenderLocked();
-                                this->ch->buffer.push_back(std::move(*sender->value));
-                                sender->ok = true;
-                                wake = sender->handle;
+                            if (this->ch->buffer.size() < this->ch->capacityVal && !this->ch->senders.empty()) {
+                                this->ch->buffer.push_back(std::move(*this->ch->senders.front()->value));
+                                wake = this->ch->popSenderLocked()->takeOk();
                             }
                         } else if (!this->ch->senders.empty()) {
-                            auto sender = this->ch->popSenderLocked();
-                            this->waiter->slot.emplace(std::move(*sender->value));
-                            sender->ok = true;
-                            wake = sender->handle;
+                            this->waiter->slot.emplace(std::move(*this->ch->senders.front()->value));
+                            wake = this->ch->popSenderLocked()->takeOk();
                         } else if (this->ch->closedFlag) {
                             return false;
                         } else if (!core || armed) {
@@ -405,15 +514,23 @@ namespace Telegraph {
                 }
             }
 
-            void await_resume() { this->throwIfCancelled(); }
+            std::optional<T> await_resume() {
+                this->throwIfCancelled();
+                std::optional<T> result = std::move(this->waiter->slot);
+                this->waiter->slot.reset();
+                return result;
+            }
         };
 
         struct SendAwaiter : ParkedWait<SendWaiter, std::deque<std::shared_ptr<SendWaiter>>, SendAwaiter> {
             using Base = ParkedWait<SendWaiter, std::deque<std::shared_ptr<SendWaiter>>, SendAwaiter>;
 
-            SendAwaiter(BoundedChannel *c, std::shared_ptr<SendWaiter> w) noexcept
-                : Base(c, std::move(w), &BoundedChannel::senders) {
+            SendAwaiter(Core *c, T &&value)
+                : Base(c, std::make_shared<SendWaiter>()) {
+                this->waiter->value.emplace(std::move(value));
             }
+
+            static std::deque<std::shared_ptr<SendWaiter>> &queueOf(Core &c) noexcept { return c.senders; }
             ~SendAwaiter() { this->abandon(); }
 
             bool await_ready() const noexcept { return false; }
@@ -439,9 +556,8 @@ namespace Telegraph {
                         // gave up. Take it if so; this also handles the zero-
                         // capacity rendezvous case.
                         if (!this->ch->receivers.empty()) {
-                            auto receiver = this->ch->popReceiverLocked();
-                            receiver->slot.emplace(std::move(*this->waiter->value));
-                            wake = receiver->handle;
+                            this->ch->receivers.front()->slot.emplace(std::move(*this->waiter->value));
+                            wake = this->ch->popReceiverLocked()->handle;
                             delivered = true;
                         } else if (this->ch->buffer.size() < this->ch->capacityVal) {
                             this->ch->buffer.push_back(std::move(*this->waiter->value));
@@ -464,7 +580,10 @@ namespace Telegraph {
                 }
             }
 
-            void await_resume() { this->throwIfCancelled(); }
+            bool await_resume() {
+                this->throwIfCancelled();
+                return this->waiter->ok;
+            }
         };
 
         /**
@@ -483,12 +602,7 @@ namespace Telegraph {
             }
         }
 
-        mutable std::mutex mu;
-        std::deque<T> buffer;
-        std::deque<std::shared_ptr<RecvWaiter>> receivers;
-        std::deque<std::shared_ptr<SendWaiter>> senders;
-        const std::size_t capacityVal;
-        bool closedFlag = false;
+        std::shared_ptr<Core> core;
     };
 
 }

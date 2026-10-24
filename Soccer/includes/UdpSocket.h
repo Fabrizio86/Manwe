@@ -12,6 +12,7 @@
 #include <utility>
 
 #include "Coroutines.h"
+#include "NetUtil.h"
 #include "SocketAddress.h"
 
 namespace Soccer {
@@ -36,20 +37,25 @@ namespace Soccer {
          *        to let the kernel assign one; read it back via
          *        @c localAddress().
          *
+         * @param dualStack Only for an IPv6 socket (e.g. @p host @c "::"): @c true
+         *        also receives IPv4 datagrams (v4-mapped), @c false makes it
+         *        IPv6-only. Set explicitly with @c IPV6_V6ONLY, like
+         *        @c TcpListener::bind, because the OS defaults differ.
+         *
          * @throws SocketException on resolution / socket / bind failure.
          */
-        static UdpSocket bind(const std::string &host, std::uint16_t port);
+        static UdpSocket bind(const std::string &host, std::uint16_t port, bool dualStack = true);
 
         UdpSocket(const UdpSocket &) = delete;
         UdpSocket &operator=(const UdpSocket &) = delete;
 
-        UdpSocket(UdpSocket &&other) noexcept : sock(std::exchange(other.sock, -1)) {
+        UdpSocket(UdpSocket &&other) noexcept : sock(std::move(other.sock)) {
         }
 
         UdpSocket &operator=(UdpSocket &&other) noexcept {
             if (this != &other) {
                 this->close();
-                this->sock = std::exchange(other.sock, -1);
+                this->sock.reset(other.sock.take());
             }
             return *this;
         }
@@ -109,9 +115,13 @@ namespace Soccer {
          * NIC you want to receive on) to scope the join to one
          * interface — common for multi-NIC machines (Pi: eth0 vs wlan0)
          * and required on macOS for loopback delivery. The default
-         * empty string asks the kernel to pick.
+         * empty string asks the kernel to pick. For an IPv6 group the
+         * interface is named by its OS name (e.g. @c "eth0") instead, since
+         * IPv6 selects interfaces by index; that is unsupported on Windows,
+         * where a non-empty value throws.
          *
-         * @throws SocketException on parse / setsockopt failure.
+         * @throws SocketException on parse / setsockopt failure, or an
+         *         interface that cannot be resolved.
          */
         void joinGroup(const std::string &groupAddress,
                         const std::string &interfaceAddress = "");
@@ -128,6 +138,9 @@ namespace Soccer {
          * @brief Time-to-live for outgoing multicast datagrams (IPv4) or
          *        hop limit (IPv6). Range 0-255. Default 1 (link-local
          *        only). 0 means the loopback only.
+         *
+         * @throws SocketException if @p ttl is outside 0-255 or the kernel
+         *         rejects it.
          */
         void setMulticastTtl(int ttl);
 
@@ -135,6 +148,8 @@ namespace Soccer {
          * @brief Whether this socket should receive its own multicast
          *        sends on the local loopback. Default off; turn on for
          *        single-host testing.
+         *
+         * @throws SocketException if the kernel rejects the option.
          */
         void setMulticastLoop(bool enable);
 
@@ -159,7 +174,7 @@ namespace Soccer {
          */
         SocketAddress localAddress() const;
 
-        int fd() const noexcept { return this->sock; }
+        int fd() const noexcept { return this->sock.get(); }
 
         /**
          * @brief Close the socket. Idempotent.
@@ -170,7 +185,7 @@ namespace Soccer {
         explicit UdpSocket(int fd) noexcept : sock(fd) {
         }
 
-        int sock = -1;
+        detail::SocketSlot sock;
     };
 
 }

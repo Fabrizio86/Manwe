@@ -6,12 +6,15 @@
 #define SOCCER_ICMP_ECHO_H
 
 #include <array>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <optional>
 #include <span>
 #include <vector>
+
+#include "SocketException.h"
 
 namespace Soccer {
 
@@ -61,7 +64,8 @@ namespace Soccer {
      * @class IcmpEcho
      * @brief Stateless helpers to build and parse ICMPv4 Echo Request /
      *        Reply packets. The actual send / receive happens through a
-     *        @c RawSocket opened with @c IPPROTO_ICMP.
+     *        @c RawSocket opened with @c IPPROTO_ICMP. IPv4 only: ICMPv6 uses
+     *        other type numbers and a pseudo-header checksum.
      */
     class IcmpEcho {
     public:
@@ -71,18 +75,11 @@ namespace Soccer {
          *        as-is (the checksum field is computed before byte-swap).
          */
         static std::uint16_t checksum(std::span<const std::byte> data) noexcept {
-            std::uint32_t sum = 0;
-            const auto *p = reinterpret_cast<const std::uint8_t *>(data.data());
-            std::size_t len = data.size();
-            while (len >= 2) {
-                sum += (static_cast<std::uint16_t>(p[0]) << 8) | p[1];
-                p += 2;
-                len -= 2;
-            }
-            if (len == 1) sum += static_cast<std::uint16_t>(p[0]) << 8;
-            while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
-            return static_cast<std::uint16_t>(~sum & 0xFFFF);
+            return finish(accumulate(0, data));
         }
+
+        /// Largest echo payload that still fits one IPv4 datagram (65535 - 20 - 8).
+        static constexpr std::size_t kMaxPayload = 65507;
 
         /**
          * @brief Build an ICMP Echo Request packet (header + payload).
@@ -91,10 +88,14 @@ namespace Soccer {
          * @param sequence   16-bit echo sequence number (caller-incremented).
          * @param payload    Optional payload bytes (RFC 792 allows any).
          * @return A heap-allocated byte vector ready for @c sendto.
+         * @throws SocketException if @p payload is longer than @ref kMaxPayload.
          */
         static std::vector<std::byte> buildRequest(std::uint16_t identifier,
                                                     std::uint16_t sequence,
                                                     std::span<const std::byte> payload = {}) {
+            if (payload.size() > kMaxPayload) {
+                throw SocketException("IcmpEcho::buildRequest: payload too large");
+            }
             std::vector<std::byte> packet(sizeof(IcmpEchoHeader) + payload.size());
 
             auto *hdr = reinterpret_cast<IcmpEchoHeader *>(packet.data());
@@ -137,7 +138,11 @@ namespace Soccer {
          * @param skip_ip    If true, skips the IPv4 header by reading IHL
          *                   from the first byte. Use on Linux SOCK_RAW.
          *                   macOS SOCK_DGRAM ICMP sockets strip it already.
-         * @return std::nullopt if the packet is too short to be valid.
+         * @return std::nullopt if the packet is too short to be valid, is not
+         *         IPv4 ICMP when @p skip_ip is set, or is not an Echo Request /
+         *         Reply (other ICMP types, such as Destination Unreachable, do
+         *         not have the echo layout). Compare @c type with
+         *         @c IcmpType::EchoReply before treating it as an answer.
          */
         static std::optional<ParsedReply> parse(std::span<const std::byte> data,
                                                 bool skip_ip = false) {
@@ -145,12 +150,18 @@ namespace Soccer {
                 if (data.empty()) return std::nullopt;
                 const auto first = static_cast<std::uint8_t>(data[0]);
                 const std::size_t ihl = (first & 0x0F) * 4;
+                if ((first >> 4) != 4) return std::nullopt; // not IPv4
                 if (ihl < 20 || data.size() < ihl) return std::nullopt;
+                if (static_cast<std::uint8_t>(data[9]) != 1) return std::nullopt; // not ICMP
                 data = data.subspan(ihl);
             }
             if (data.size() < sizeof(IcmpEchoHeader)) return std::nullopt;
 
             const auto *hdr = reinterpret_cast<const IcmpEchoHeader *>(data.data());
+            if (hdr->type != static_cast<std::uint8_t>(IcmpType::EchoReply) &&
+                hdr->type != static_cast<std::uint8_t>(IcmpType::EchoRequest)) {
+                return std::nullopt;
+            }
             ParsedReply out;
             out.type = static_cast<IcmpType>(hdr->type);
             out.code = hdr->code;
@@ -158,24 +169,48 @@ namespace Soccer {
             out.sequence = ntohs_u16(hdr->sequence);
             out.payload = data.subspan(sizeof(IcmpEchoHeader));
 
-            // Re-verify checksum by zeroing it and recomputing.
-            std::vector<std::byte> tmp(data.begin(), data.end());
-            auto *tmp_hdr = reinterpret_cast<IcmpEchoHeader *>(tmp.data());
-            const std::uint16_t wire = ntohs_u16(tmp_hdr->checksum);
-            tmp_hdr->checksum = 0;
-            const std::uint16_t computed = checksum(std::span<const std::byte>(tmp));
-            out.checksum_valid = (wire == computed);
+            // Re-verify the checksum with its own field counted as zero (bytes 2-3),
+            // without copying the packet.
+            const std::uint16_t wire = ntohs_u16(hdr->checksum);
+            std::uint64_t sum = accumulate(0, data.first(2));
+            sum = accumulate(sum, data.subspan(4));
+            out.checksum_valid = (wire == finish(sum));
             return out;
         }
 
     private:
+        /// Add @p data, read as big-endian 16-bit words (an odd tail byte is padded with
+        /// zero), to @p sum. 64-bit, so no packet length can overflow it.
+        static std::uint64_t accumulate(std::uint64_t sum, std::span<const std::byte> data) noexcept {
+            const auto *p = reinterpret_cast<const std::uint8_t *>(data.data());
+            std::size_t len = data.size();
+            while (len >= 2) {
+                sum += (static_cast<std::uint32_t>(p[0]) << 8) | p[1];
+                p += 2;
+                len -= 2;
+            }
+            if (len == 1) sum += static_cast<std::uint32_t>(p[0]) << 8;
+            return sum;
+        }
+
+        /// Fold the carries back in and complement.
+        static std::uint16_t finish(std::uint64_t sum) noexcept {
+            while (sum >> 16) sum = (sum & 0xFFFF) + (sum >> 16);
+            return static_cast<std::uint16_t>(~sum & 0xFFFF);
+        }
+
         /**
          * @brief Host -> network byte order for a 16-bit value, without
-         *        pulling in @c <arpa/inet.h> from this header.
+         *        pulling in @c <arpa/inet.h> from this header. A swap on
+         *        little-endian hosts, the identity on big-endian ones.
          */
         static constexpr std::uint16_t htons_u16(std::uint16_t v) noexcept {
-            return static_cast<std::uint16_t>(
-                ((v & 0x00FFu) << 8) | ((v & 0xFF00u) >> 8));
+            if constexpr (std::endian::native == std::endian::little) {
+                return static_cast<std::uint16_t>(
+                    ((v & 0x00FFu) << 8) | ((v & 0xFF00u) >> 8));
+            } else {
+                return v;
+            }
         }
 
         static constexpr std::uint16_t ntohs_u16(std::uint16_t v) noexcept {

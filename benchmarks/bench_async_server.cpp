@@ -221,15 +221,12 @@ int main() {
     benchFanOut("spawn+join fan-out, W=16",
                 kFanOutWidth, kRequestsFanOut);
 
-    // The completion counters above flip when each coroutine bumps
-    // them just before its final-suspend; the frame itself is freed
-    // a few instructions later, on the worker thread. Sleeping
-    // briefly here lets every worker reach a parked state before
-    // static destruction begins tearing down the SmallObjectPool's
-    // global mutex (which the frame's operator delete would
-    // otherwise hit on the way out).
-    constexpr auto kPostBenchDrainGrace = std::chrono::milliseconds(100);
-    std::this_thread::sleep_for(kPostBenchDrainGrace);
+    // The completion counters above flip when each coroutine bumps them just before its final-suspend; the frame
+    // itself is released a few instructions later, on the worker thread, and must not race the teardown of the
+    // SmallObjectPool's global mutex in static destruction. Wait for the pool to go idle, which includes those tails.
+    if (!YarnBall::Yarn::instance()->awaitQuiescence()) {
+        std::fprintf(stderr, "warning: the pool did not go idle before exit\n");
+    }
 
     return 0;
 }

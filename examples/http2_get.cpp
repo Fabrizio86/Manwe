@@ -78,6 +78,18 @@ namespace {
 #endif // SOCCER_HAS_HTTP2
 }
 
+/// Parse a TCP port (0-65535); exits with a message on bad input instead
+/// of silently truncating through a narrowing cast.
+[[maybe_unused]] static std::uint16_t parsePort(const char *text) {
+    char *end = nullptr;
+    const long v = std::strtol(text, &end, 10);
+    if (end == text || *end != '\0' || v < 0 || v > 65535) {
+        std::cerr << "invalid port: " << text << "\n";
+        std::exit(1);
+    }
+    return static_cast<std::uint16_t>(v);
+}
+
 int main(int argc, char **argv) {
 #ifndef SOCCER_HAS_HTTP2
     (void) argc; (void) argv;
@@ -89,7 +101,7 @@ int main(int argc, char **argv) {
 #ifdef SOCCER_HAS_TLS
         const std::string host = (argc > 2) ? argv[2] : "nghttp2.org";
         const std::uint16_t port = (argc > 3)
-            ? static_cast<std::uint16_t>(std::atoi(argv[3]))
+            ? parsePort(argv[3])
             : 443;
         const std::string path = (argc > 4) ? argv[4] : "/";
         return YarnBall::syncWait(doH2(host, port, path));
@@ -100,7 +112,7 @@ int main(int argc, char **argv) {
     }
     const std::string host = (argc > 1) ? argv[1] : "127.0.0.1";
     const std::uint16_t port = (argc > 2)
-        ? static_cast<std::uint16_t>(std::atoi(argv[2]))
+        ? parsePort(argv[2])
         : 8080;
     const std::string path = (argc > 3) ? argv[3] : "/";
     return YarnBall::syncWait(doH2c(host, port, path));

@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <coroutine>
 #include <deque>
 #include <memory>
@@ -16,6 +17,7 @@
 
 #include "Cancellation.h"
 #include "Coroutines.h"
+#include "Deadline.h"
 
 namespace Telegraph {
 
@@ -25,8 +27,8 @@ namespace Telegraph {
      *        and synchronous @c send.
      *
      * Semantics:
-     *  - @c send is non-blocking and always succeeds (unless the channel
-     *    is closed, in which case it returns @c false).
+     *  - @c send is non-blocking and succeeds unless the channel is
+     *    closed or its optional soft cap is reached (it returns @c false).
      *  - @c receive is a coroutine that resumes with the next value, or
      *    with @c nullopt if the channel was closed and is now empty.
      *  - @c close wakes every pending receiver with @c nullopt.
@@ -36,8 +38,11 @@ namespace Telegraph {
      * resumed on a Yarn worker (no buffer hop, no extra copy beyond the
      * one already required by `T value` being passed by value to send()).
      *
-     * Bounded variants and explicit backpressure can be added later;
-     * v1 is unbounded to keep the protocol simple.
+     * The buffer is unbounded unless a soft cap is given to the
+     * constructor: with a cap, @c send returns @c false instead of
+     * buffering past it (it never blocks). For producers that must be
+     * slowed down rather than refused, use @c BoundedChannel, whose
+     * @c send suspends.
      *
      * A parked @c receive is cancellable (see @c Cancellation.h): inside
      * a stopped cancellation scope it leaves the waiter queue and throws
@@ -45,12 +50,36 @@ namespace Telegraph {
      * the next receiver or the buffer, not to the abandoned one. A frame
      * destroyed while parked also leaves the queue. @ref pushFront puts a
      * value back at the head, for a receiver that obtained a value it
-     * can no longer use (see @c channelSelect).
+     * can no longer use (see @c channelSelect); it is accepted by a closed
+     * channel too (a closed channel still drains).
+     *
+     * Timeouts: wrap @c receive in @ref receiveFor, not in
+     * @c YarnBall::withTimeout. @c withTimeout races the receive against a
+     * timer and discards the loser's result, so a value handed to the
+     * receive at the instant the timer wins is dropped (and the same
+     * holds for @c whenAny). @c receiveFor cancels the parked receive
+     * instead, so every value is either returned or stays in the channel.
+     *
+     * A task returned by @c receive or @c receiveFor reads the channel when
+     * it first runs: await it while the channel is alive. (A receive that is
+     * already parked is safe against the channel being destroyed, see
+     * below.)
+     *
+     * The channel's state is shared with the parked receivers, so a
+     * receiver frame that outlives the channel (it was woken by the
+     * destructor's @c close and has not been destroyed yet) never touches
+     * freed memory.
      */
     template<typename T>
     class Channel {
     public:
-        Channel() = default;
+        /**
+         * @param maxBuffered Soft cap on buffered values; @c send returns
+         *        @c false when it is reached. Zero (the default) means
+         *        unbounded. @ref pushFront ignores the cap.
+         */
+        explicit Channel(std::size_t maxBuffered = 0) : core(std::make_shared<Core>(maxBuffered)) {
+        }
 
         Channel(const Channel &) = delete;
         Channel(Channel &&) = delete;
@@ -63,22 +92,24 @@ namespace Telegraph {
 
         /**
          * @brief Push a value into the channel.
-         * @return @c true on success; @c false if the channel was closed.
+         * @return @c true on success; @c false if the channel was closed or
+         *         its soft cap is reached (the value is dropped).
          */
         bool send(T value) {
+            Core &c = *this->core;
             std::shared_ptr<Waiter> receiver;
             {
-                std::lock_guard<std::mutex> lk(this->mu);
-                if (this->closed_) return false;
+                std::lock_guard<std::mutex> lk(c.mu);
+                if (c.closed_) return false;
 
-                if (!this->waiters.empty()) {
-                    receiver = std::move(this->waiters.front());
-                    this->waiters.pop_front();
-                    receiver->queued.store(false, std::memory_order_release);
+                if (!c.waiters.empty()) {
+                    // Hand over first, then dequeue: if moving the value throws, the receiver is still parked.
                     // Under the lock, so a receiver frame destroyed before the wake runs can take the value back.
-                    receiver->slot.emplace(std::move(value));
+                    c.waiters.front()->slot.emplace(std::move(value));
+                    receiver = popWaiterLocked(c);
                 } else {
-                    this->buffer.push_back(std::move(value));
+                    if (c.maxBuffered != 0 && c.buffer.size() >= c.maxBuffered) return false;
+                    c.buffer.push_back(std::move(value));
                     return true;
                 }
             }
@@ -91,26 +122,12 @@ namespace Telegraph {
         /**
          * @brief Put @p value back at the head of the channel, ahead of
          *        anything buffered: it goes straight to the oldest parked
-         *        receiver if there is one. Returns @c false (dropping the
-         *        value) if the channel is closed.
+         *        receiver if there is one. On a closed channel the value
+         *        goes to the buffer, which receivers still drain. Always
+         *        returns @c true.
          */
         bool pushFront(T value) {
-            std::shared_ptr<Waiter> receiver;
-            {
-                std::lock_guard<std::mutex> lk(this->mu);
-                if (this->closed_) return false;
-                if (!this->waiters.empty()) {
-                    receiver = std::move(this->waiters.front());
-                    this->waiters.pop_front();
-                    receiver->queued.store(false, std::memory_order_release);
-                    receiver->slot.emplace(std::move(value));
-                } else {
-                    this->buffer.push_front(std::move(value));
-                    return true;
-                }
-            }
-            dispatch(receiver->handle);
-            return true;
+            return pushFrontCore(*this->core, std::move(value));
         }
 
         /**
@@ -120,21 +137,25 @@ namespace Telegraph {
          *         and is now drained.
          */
         YarnBall::Task<std::optional<T>> receive() {
-            // Fast path: a value is already buffered, or channel is closed.
+            // Fast path: a value is already buffered, or channel is closed. Works on the channel's core directly:
+            // the shared_ptr is copied (two atomic RMWs) only when about to park.
+            Core &c = *this->core;
+            std::shared_ptr<Core> held;
             {
-                std::lock_guard<std::mutex> lk(this->mu);
-                if (!this->buffer.empty()) {
-                    T value = std::move(this->buffer.front());
-                    this->buffer.pop_front();
+                std::lock_guard<std::mutex> lk(c.mu);
+                if (!c.buffer.empty()) {
+                    T value = std::move(c.buffer.front());
+                    c.buffer.pop_front();
                     co_return std::optional<T>(std::move(value));
                 }
-                if (this->closed_) {
+                if (c.closed_) {
                     co_return std::nullopt;
                 }
+                held = this->core;
             }
 
             auto waiter = std::make_shared<Waiter>();
-            co_await ReceiveAwaiter{this, waiter};
+            co_await ReceiveAwaiter{std::move(held), waiter};
 
             if (!waiter->slot.has_value()) {
                 co_return std::nullopt;
@@ -143,17 +164,41 @@ namespace Telegraph {
         }
 
         /**
+         * @brief @ref receive with a deadline. Lossless: if the deadline
+         *        passes first the parked receive is cancelled and leaves
+         *        the queue, so a value sent afterwards goes to the next
+         *        receiver or the buffer; a value handed over at the same
+         *        instant is returned (or put back), never dropped.
+         * @return The value, or @c std::nullopt if the channel was closed
+         *         and is drained.
+         * @throws YarnBall::TimeoutException if @p timeout elapsed first;
+         *         @c YarnBall::CancelledException if the caller's own scope
+         *         was stopped.
+         */
+        template<typename Rep, typename Period>
+        YarnBall::Task<std::optional<T>> receiveFor(std::chrono::duration<Rep, Period> timeout) {
+            detail::DeadlineGuard guard(timeout);
+            try {
+                co_return co_await YarnBall::withCancellation(guard.token(), this->receive());
+            } catch (const YarnBall::CancelledException &) {
+                if (guard.expired()) throw YarnBall::TimeoutException("Channel::receiveFor");
+                throw;
+            }
+        }
+
+        /**
          * @brief Mark the channel closed and wake every pending receiver
          *        with @c nullopt. Idempotent.
          */
         void close() {
+            Core &c = *this->core;
             std::deque<std::shared_ptr<Waiter>> to_wake;
             {
-                std::lock_guard<std::mutex> lk(this->mu);
-                if (this->closed_) return;
-                this->closed_ = true;
-                to_wake = std::move(this->waiters);
-                this->waiters.clear();
+                std::lock_guard<std::mutex> lk(c.mu);
+                if (c.closed_) return;
+                c.closed_ = true;
+                to_wake = std::move(c.waiters);
+                c.waiters.clear();
                 for (auto &w : to_wake) w->queued.store(false, std::memory_order_release);
             }
             for (auto &w : to_wake) {
@@ -166,19 +211,45 @@ namespace Telegraph {
          * @return @c true if @c close has been called.
          */
         bool closed() const noexcept {
-            std::lock_guard<std::mutex> lk(this->mu);
-            return this->closed_;
+            std::lock_guard<std::mutex> lk(this->core->mu);
+            return this->core->closed_;
         }
 
         /**
          * @return Approximate number of buffered values (snapshot).
          */
         std::size_t size() const noexcept {
-            std::lock_guard<std::mutex> lk(this->mu);
-            return this->buffer.size();
+            std::lock_guard<std::mutex> lk(this->core->mu);
+            return this->core->buffer.size();
+        }
+
+        /**
+         * @return Number of receivers currently parked (snapshot).
+         */
+        std::size_t waiterCount() const noexcept {
+            std::lock_guard<std::mutex> lk(this->core->mu);
+            return this->core->waiters.size();
         }
 
     private:
+        struct Waiter;
+
+        /**
+         * @brief Everything the channel guards. Shared with every parked
+         *        receiver, so a receiver frame destroyed after the channel
+         *        is gone still finds a live mutex and queue.
+         */
+        struct Core {
+            explicit Core(std::size_t cap) noexcept : maxBuffered(cap) {
+            }
+
+            mutable std::mutex mu;
+            std::deque<T> buffer;
+            std::deque<std::shared_ptr<Waiter>> waiters;
+            const std::size_t maxBuffered;
+            bool closed_ = false;
+        };
+
         /**
          * @brief Suspended-receiver state. The slot holds the value once
          *        a sender hands one off (or stays empty on close).
@@ -195,11 +266,11 @@ namespace Telegraph {
          *        protocol as in @c YarnBall::detail::ParkBase.
          */
         struct ReceiveAwaiter {
-            Channel *ch;
+            std::shared_ptr<Core> ch;
             std::shared_ptr<Waiter> waiter;
 
-            ReceiveAwaiter(Channel *c, std::shared_ptr<Waiter> w) noexcept
-                : ch(c), waiter(std::move(w)) {
+            ReceiveAwaiter(std::shared_ptr<Core> c, std::shared_ptr<Waiter> w) noexcept
+                : ch(std::move(c)), waiter(std::move(w)) {
             }
             ReceiveAwaiter(const ReceiveAwaiter &) = delete;
             ReceiveAwaiter &operator=(const ReceiveAwaiter &) = delete;
@@ -222,7 +293,7 @@ namespace Telegraph {
                         this->waiter->slot.reset();
                     }
                 }
-                if (orphan) this->ch->pushFront(std::move(*orphan));
+                if (orphan) pushFrontCore(*this->ch, std::move(*orphan));
             }
 
             bool await_ready() const noexcept { return false; }
@@ -310,10 +381,31 @@ namespace Telegraph {
             }
         }
 
-        mutable std::mutex mu;
-        std::deque<T> buffer;
-        std::deque<std::shared_ptr<Waiter>> waiters;
-        bool closed_ = false;
+        static std::shared_ptr<Waiter> popWaiterLocked(Core &c) {
+            auto w = std::move(c.waiters.front());
+            c.waiters.pop_front();
+            w->queued.store(false, std::memory_order_release);
+            return w;
+        }
+
+        static bool pushFrontCore(Core &c, T value) {
+            std::shared_ptr<Waiter> receiver;
+            {
+                std::lock_guard<std::mutex> lk(c.mu);
+                if (!c.closed_ && !c.waiters.empty()) {
+                    c.waiters.front()->slot.emplace(std::move(value));
+                    receiver = popWaiterLocked(c);
+                } else {
+                    // Closed: no receiver is parked, and the buffer is still drained by later receives.
+                    c.buffer.push_front(std::move(value));
+                    return true;
+                }
+            }
+            dispatch(receiver->handle);
+            return true;
+        }
+
+        std::shared_ptr<Core> core;
     };
 
 }

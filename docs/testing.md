@@ -196,8 +196,10 @@ runs only on Windows. Coverage:
 - **Wire** — Signal connect/disconnect/emit, async emit dispatch,
   coroutine `next()` resume, Channel send/receive, blocking receive,
   close wakes pending receivers, BoundedChannel + `channelSelect`.
-- **Signals** — `SignalSet` captures self-raised signal, second
-  instance throws.
+- **Signals** — `SignalSet` captures a self-raised signal, several
+  instances each receive it, the original disposition is restored after
+  the last instance, uncatchable signals are rejected, destroying a set
+  wakes a parked `next()`.
 - **Observability** — Counter inc, Gauge set/inc/dec, Histogram
   observe + snapshot, Prometheus scrape, `ScopeTimer`, structured-log
   JSON emission + level filtering + escaping, trace new-root,

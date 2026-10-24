@@ -722,7 +722,9 @@ TEST(limits_h2_server_caps_request_bodies_buffered_across_a_connection) {
 namespace {
     YarnBall::Task<std::string> h2MixedCaseHeaders(std::uint16_t port) {
         auto conn = co_await Soccer::Http2Connection::connectPlain("127.0.0.1", port);
-        auto r = co_await conn.request("GET", "/echo", {{"X-Test", "hello"}});
+        // Named, not a braced temporary inside the co_await: GCC 14 ICEs on that.
+        std::vector<Soccer::HttpHeader> hdrs{{"X-Test", "hello"}};
+        auto r = co_await conn.request("GET", "/echo", std::move(hdrs));
         co_return r.header("x-echo") + "/" + r.body;
     }
 }

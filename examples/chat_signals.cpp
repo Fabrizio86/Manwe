@@ -6,6 +6,8 @@
 
 #include <chrono>
 #include <iostream>
+#include <latch>
+#include <mutex>
 #include <string>
 #include <thread>
 
@@ -13,49 +15,61 @@
 #include "Wire.h"
 #include "Yarn.hpp"
 
+/// Handlers run on several threads: print each line whole.
+static void say(const std::string &line) {
+    static std::mutex m;
+    std::lock_guard<std::mutex> lk(m);
+    std::cout << line << "\n";
+}
+
 /**
  * @brief A coroutine that awaits the next signal emission and prints its
  *        payload. Defined as a free function so the Signal pointer lives
  *        in the coroutine frame (avoids the lambda-coroutine lifetime
  *        trap).
  */
-YarnBall::Task<void> await_one_message(Telegraph::Signal<std::string, int> *sig) {
+YarnBall::Task<> await_one_message(Telegraph::Signal<std::string, int> *sig, std::latch *done) {
     auto [text, room] = co_await sig->next();
-    std::cout << "[awaiter] room=" << room << " text=" << text << "\n";
+    say("[awaiter] room=" + std::to_string(room) + " text=" + text);
+    done->count_down();
     co_return;
 }
 
 int main() {
     Telegraph::Signal<std::string, int> chat;
+    std::latch awaiterDone(1);   // the next() awaiter has printed
+    std::latch asyncHandled(2);  // both handlers have run for the emitAsync() message (room 2)
 
     // Synchronous logger.
-    auto logger_id = chat.connect([](std::string text, int room) {
-        std::cout << "[sync logger] room=" << room << " text=" << text << "\n";
+    auto logger_id = chat.connect([&asyncHandled](std::string text, int room) {
+        say("[logger] room=" + std::to_string(room) + " text=" + text);
+        if (room == 2) asyncHandled.count_down();
     });
 
-    // Slow historian: plain handlers run inline on emit(), and on a Yarn
-    // worker per emission only when fired through emitAsync().
-    auto historian_id = chat.connect([](std::string text, int room) {
+    // Slow historian: every handler runs inline on the emitting thread under
+    // emit(), and as its own task on a Yarn worker under emitAsync().
+    auto historian_id = chat.connect([&asyncHandled](std::string text, int room) {
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
-        std::cout << "[async historian] persisted room=" << room
-                  << " text=" << text << "\n";
+        say("[historian] persisted room=" + std::to_string(room) + " text=" + text);
+        if (room == 2) asyncHandled.count_down();
     });
 
     // Coroutine awaiter for a single message.
-    YarnBall::coSpawn(await_one_message(&chat));
+    YarnBall::coSpawn(await_one_message(&chat, &awaiterDone));
 
-    // Give the spawned awaiter time to register: next() only catches
-    // emissions that happen after it has suspended.
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // next() only catches emissions that happen after it has suspended, so
+    // wait until the awaiter shows up in the signal's waiter list.
+    while (chat.waiterCount() == 0) std::this_thread::yield();
 
     std::cout << "-- emit (sync) --\n";
     chat.emit("hello", 1);
+    awaiterDone.wait();
 
     std::cout << "-- emitAsync --\n";
     chat.emitAsync("world", 2);
 
-    // Wait for the async handlers + awaiter to complete.
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // Wait for both async handlers to finish.
+    asyncHandled.wait();
 
     // Drop the historian so the next emit is synchronous-only.
     chat.disconnect(historian_id);

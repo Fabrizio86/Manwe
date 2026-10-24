@@ -43,7 +43,29 @@ namespace Soccer {
          *        never include the delimiter.
          */
         inline constexpr std::size_t kBufferedReaderMaxLine = 64 * 1024;
+
+        /**
+         * @brief Default ceiling on the @c n a single @c readExact will accept.
+         *        The result is held in memory, so an unchecked length taken from
+         *        the wire is a memory-exhaustion lever.
+         */
+        inline constexpr std::size_t kBufferedReaderMaxExact = 64 * 1024 * 1024;
     }
+
+
+    /**
+     * @class LineTooLongException
+     * @brief Thrown by @ref BufferedReader::readUntilDelim / @c readLine when a
+     *        record grows past the reader's @c maxLine without its delimiter.
+     *        Distinct from other SocketExceptions so a protocol parser can map
+     *        it to a "too large" reply instead of a generic I/O failure.
+     */
+    class LineTooLongException : public SocketException {
+    public:
+        explicit LineTooLongException(std::string message)
+            : SocketException(std::move(message)) {
+        }
+    };
 
 
     /**
@@ -65,10 +87,15 @@ namespace Soccer {
     template<typename Stream>
     class BufferedReader final {
     public:
+        /**
+         * @param maxLine Longest line / delimited record @ref readUntilDelim
+         *        will return; a longer one throws. Default 64 KiB.
+         */
         explicit BufferedReader(Stream *stream,
                                 std::size_t capacity =
-                                detail::kBufferedReaderDefaultCapacity)
-            : stream(stream), buf(capacity), readPos(0), writePos(0) {
+                                detail::kBufferedReaderDefaultCapacity,
+                                std::size_t maxLine = detail::kBufferedReaderMaxLine)
+            : stream(stream), buf(capacity), readPos(0), writePos(0), maxLineBytes(maxLine) {
             // A zero-capacity buffer gives refill() zero headroom, so
             // it would return without ever calling stream->read() and
             // without setting eofObserved -- every subsequent
@@ -90,6 +117,7 @@ namespace Soccer {
               buf(std::move(other.buf)),
               readPos(other.readPos),
               writePos(other.writePos),
+              maxLineBytes(other.maxLineBytes),
               eofObserved(other.eofObserved) {
             other.readPos = 0;
             other.writePos = 0;
@@ -102,6 +130,7 @@ namespace Soccer {
                 this->buf = std::move(other.buf);
                 this->readPos = other.readPos;
                 this->writePos = other.writePos;
+                this->maxLineBytes = other.maxLineBytes;
                 this->eofObserved = other.eofObserved;
                 other.readPos = 0;
                 other.writePos = 0;
@@ -118,15 +147,28 @@ namespace Soccer {
         Stream *raw() const noexcept { return this->stream; }
 
         /**
+         * @return Longest line / delimited record readUntilDelim will return.
+         */
+        std::size_t maxLine() const noexcept { return this->maxLineBytes; }
+
+        /**
          * @brief Read exactly @p n bytes. Suspends as many times as
          *        necessary until the buffer is full. If the peer
          *        half-closes before @p n bytes arrive, returns the
          *        bytes it did receive (caller compares
          *        @c result.size() with @p n to detect a short read).
          *
+         * @param maxBytes Largest @p n accepted (default 64 MiB). The result
+         *        is buffered in memory, so a length taken from untrusted input
+         *        must not be passed through unchecked.
          * @return Vector containing the bytes read.
+         * @throws SocketException if @p n exceeds @p maxBytes (nothing is read).
          */
-        YarnBall::Task<std::vector<std::byte>> readExact(std::size_t n) {
+        YarnBall::Task<std::vector<std::byte>> readExact(
+            std::size_t n, std::size_t maxBytes = detail::kBufferedReaderMaxExact) {
+            if (n > maxBytes) {
+                throw SocketException("BufferedReader::readExact: length exceeds bound");
+            }
             std::vector<std::byte> out;
             // Do not trust n up front: a peer that announces a huge length and
             // then sends nothing must not pin n bytes per connection.
@@ -151,15 +193,22 @@ namespace Soccer {
         /**
          * @brief Read bytes up to and including the first @p delim. The
          *        returned string contains the data including the
-         *        delimiter byte. Throws if the buffer would have to
-         *        grow past @ref detail::kBufferedReaderMaxLine
-         *        (prevents an adversarial peer from forcing unbounded
-         *        memory use by never sending the delimiter).
+         *        delimiter byte. Throws if the result would grow past the
+         *        reader's @c maxLine() (constructor option, default
+         *        @ref detail::kBufferedReaderMaxLine; prevents an
+         *        adversarial peer from forcing unbounded memory use by never
+         *        sending the delimiter).
          *
+         * @param terminated Optional. Set to @c true when the result ends in
+         *        @p delim and @c false when the stream hit EOF first: a
+         *        non-empty result with @c *terminated == false is a partial
+         *        record the peer never finished, which a protocol parser
+         *        should usually reject rather than treat as complete.
          * @return The line as a @c std::string. Empty string on EOF
          *         before any byte arrived.
          */
-        YarnBall::Task<std::string> readUntilDelim(std::byte delim) {
+        YarnBall::Task<std::string> readUntilDelim(std::byte delim, bool *terminated = nullptr) {
+            if (terminated) *terminated = false;
             std::string out;
             while (true) {
                 if (this->readPos == this->writePos) {
@@ -174,14 +223,17 @@ namespace Soccer {
                 while (i < avail && base[i] != delim) ++i;
 
                 const std::size_t take = (i < avail) ? (i + 1) : i;
-                if (out.size() + take > detail::kBufferedReaderMaxLine) {
-                    throw SocketException(
+                if (out.size() + take > this->maxLineBytes) {
+                    throw LineTooLongException(
                         "BufferedReader::readUntilDelim: line exceeds bound");
                 }
                 out.append(reinterpret_cast<const char *>(base), take);
                 this->readPos += take;
 
-                if (i < avail) co_return out; // delimiter consumed
+                if (i < avail) { // delimiter consumed
+                    if (terminated) *terminated = true;
+                    co_return out;
+                }
                 // Else fall through and refill on next iteration.
             }
         }
@@ -190,10 +242,11 @@ namespace Soccer {
          * @brief Convenience: read a line terminated by @c '\\n'. The
          *        terminator is included in the result (callers that
          *        want it stripped should pop it themselves). Empty on
-         *        EOF before any byte arrived.
+         *        EOF before any byte arrived. See @ref readUntilDelim for
+         *        @p terminated.
          */
-        YarnBall::Task<std::string> readLine() {
-            return this->readUntilDelim(std::byte{'\n'});
+        YarnBall::Task<std::string> readLine(bool *terminated = nullptr) {
+            return this->readUntilDelim(std::byte{'\n'}, terminated);
         }
 
         /**
@@ -249,6 +302,9 @@ namespace Soccer {
         std::size_t readPos;
         /// One past the last written byte in @c buf.
         std::size_t writePos;
+
+        /// Longest record readUntilDelim returns.
+        std::size_t maxLineBytes;
 
         bool eofObserved = false;
     };

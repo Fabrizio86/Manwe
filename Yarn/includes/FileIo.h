@@ -23,6 +23,11 @@
 //   - Windows IOCP: supports OVERLAPPED ReadFile / WriteFile on file
 //     handles. Same story as Linux io_uring: planned follow-up.
 //
+// Every operation here blocks a Yarn worker for the duration of the file
+// system call, and none of them is cancellable (a scope stopped meanwhile is
+// only seen at the next cancellable await): keep them short, and bound the
+// one-shot reads with the maxBytes parameter when the file is not trusted.
+//
 // At very large scale a dedicated "blocking I/O" pool sized for the
 // expected file-IO concurrency would be a better fit than sharing
 // Yarn's compute workers; that's also future work.
@@ -34,6 +39,7 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstdint>
+#include <limits>
 #include <fstream>
 #include <ios>
 #include <iterator>
@@ -194,43 +200,64 @@ namespace YarnBall::fs {
 
     // ---- Convenience one-shot helpers --------------------------------
 
+    /// Default for the @c maxBytes parameter of the one-shot readers: no cap.
+    inline constexpr std::size_t kNoSizeLimit = (std::numeric_limits<std::size_t>::max)();
+
+    namespace detail {
+        /// Read @p f to EOF in chunks into @p out (a std::string or a vector of bytes), failing once more than @p maxBytes would be held.
+        template<typename Container>
+        void slurp(std::ifstream &f, Container &out, std::size_t maxBytes, const char *what,
+                   const std::string &path) {
+            constexpr std::size_t kChunk = 64 * 1024;
+            for (;;) {
+                const std::size_t room = maxBytes - out.size();
+                // One byte beyond the cap is enough to tell "exactly maxBytes" from "more".
+                const std::size_t want = room < kChunk ? room + 1 : kChunk;
+                const std::size_t at = out.size();
+                out.resize(at + want);
+                f.read(reinterpret_cast<char *>(out.data() + at), static_cast<std::streamsize>(want));
+                const auto got = static_cast<std::size_t>(f.gcount());
+                out.resize(at + got);
+                if (out.size() > maxBytes) {
+                    throw FileIoError(std::string(what) + "(" + path + "): larger than " + std::to_string(maxBytes)
+                                      + " bytes");
+                }
+                if (f.bad()) throw FileIoError(std::string(what) + "(" + path + "): read failed");
+                if (got < want) return; // EOF
+            }
+        }
+    }
+
     /**
      * @brief Read @p path in full, returning the bytes as a string.
      *        Useful for small files (config, etc.). Throws on
-     *        open / read failure.
+     *        open / read failure, or if the file holds more than
+     *        @p maxBytes (default: no limit). Blocks a worker; not
+     *        cancellable.
      */
-    inline YarnBall::Task<std::string> readToString(std::string path) {
+    inline YarnBall::Task<std::string> readToString(std::string path, std::size_t maxBytes = kNoSizeLimit) {
         co_await YarnBall::scheduleOn(YarnBall::Yarn::instance());
         std::ifstream f(path, std::ios::binary);
         if (!f.is_open()) {
             throw FileIoError("readToString(" + path + "): open failed");
         }
-        std::string out((std::istreambuf_iterator<char>(f)),
-                        std::istreambuf_iterator<char>());
-        if (f.bad()) {
-            throw FileIoError("readToString(" + path + "): read failed");
-        }
+        std::string out; // read straight into the result: no second copy of the file at the end
+        detail::slurp(f, out, maxBytes, "readToString", path);
         co_return out;
     }
 
     /**
      * @brief Read @p path in full, returning the bytes as a vector.
+     *        Same @p maxBytes contract as @ref readToString.
      */
-    inline YarnBall::Task<std::vector<std::byte>> readToBytes(std::string path) {
+    inline YarnBall::Task<std::vector<std::byte>> readToBytes(std::string path, std::size_t maxBytes = kNoSizeLimit) {
         co_await YarnBall::scheduleOn(YarnBall::Yarn::instance());
         std::ifstream f(path, std::ios::binary);
         if (!f.is_open()) {
             throw FileIoError("readToBytes(" + path + "): open failed");
         }
-        std::vector<char> raw((std::istreambuf_iterator<char>(f)),
-                              std::istreambuf_iterator<char>());
-        if (f.bad()) {
-            throw FileIoError("readToBytes(" + path + "): read failed");
-        }
-        std::vector<std::byte> out(raw.size());
-        for (std::size_t i = 0; i < raw.size(); ++i) {
-            out[i] = static_cast<std::byte>(raw[i]);
-        }
+        std::vector<std::byte> out;
+        detail::slurp(f, out, maxBytes, "readToBytes", path);
         co_return out;
     }
 

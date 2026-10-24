@@ -91,6 +91,7 @@ namespace YarnBall {
             struct promise_type {
                 std::atomic<int> refs{2};
                 std::atomic<int> state{0}; // 0 parked, 1 resumed, 2 awaiter destroyed first
+                std::atomic<int> gate{0};  // scratch for the awaiter's arm-versus-cancel race (see WaitProxy::Pin)
                 std::coroutine_handle<> target{};
 
                 ProxyCoro get_return_object() noexcept {
@@ -146,6 +147,40 @@ namespace YarnBall {
             }
 
             std::coroutine_handle<> handle() const noexcept { return this->h; }
+
+            /**
+             * @brief An extra reference on the proxy frame, taken by an
+             *        await_suspend that must still look at the proxy after
+             *        handing it to a system that may resume it (and so
+             *        destroy the awaiter). While pinned the frame cannot be
+             *        freed, so its address cannot be reused by another
+             *        waiter, and its @c gate (a plain atomic the awaiter and
+             *        its cancel callback use to decide who cancels) stays
+             *        readable. Never pin across @ref reclaim.
+             */
+            class Pin {
+            public:
+                explicit Pin(std::coroutine_handle<ProxyCoro::promise_type> p) noexcept : p(p) {
+                    this->p.promise().refs.fetch_add(1, std::memory_order_relaxed);
+                }
+
+                Pin(const Pin &) = delete;
+                Pin &operator=(const Pin &) = delete;
+
+                ~Pin() {
+                    if (this->p.promise().refs.fetch_sub(1, std::memory_order_acq_rel) == 1) this->p.destroy();
+                }
+
+                std::atomic<int> &gate() const noexcept { return this->p.promise().gate; }
+
+            private:
+                std::coroutine_handle<ProxyCoro::promise_type> p;
+            };
+
+            Pin pin() noexcept { return Pin{this->h}; }
+
+            /// The awaiter's own view of the gate (valid while it holds the proxy).
+            std::atomic<int> &gate() const noexcept { return this->h.promise().gate; }
 
             /// The proxy was removed from its queue by this awaiter: nobody else can resume it. Frees it.
             void reclaim() noexcept {
@@ -325,12 +360,23 @@ namespace YarnBall {
         };
 
         /**
+         * @brief Stop @p target through a copy. A stop callback may resume (and unwind) the very coroutine that owns
+         *        @p target while request_stop is still running, e.g. when the pool refuses the wake task and the resume
+         *        falls back to inline; request_stop on a source destroyed under it is a use-after-free. The copy holds
+         *        its own reference to the shared stop state until the call is over.
+         */
+        inline void stopThroughCopy(std::stop_source *target) noexcept {
+            std::stop_source keep = *target;
+            keep.request_stop();
+        }
+
+        /**
          * @brief Forwards a stop request from one token to a stop source.
          */
         struct StopForward {
             std::stop_source *target;
 
-            void operator()() const noexcept { this->target->request_stop(); }
+            void operator()() const noexcept { stopThroughCopy(this->target); }
         };
 
         /**
@@ -370,7 +416,7 @@ namespace YarnBall {
             }
 
         private:
-            static void forward(void *p) noexcept { static_cast<std::stop_source *>(p)->request_stop(); }
+            static void forward(void *p) noexcept { stopThroughCopy(static_cast<std::stop_source *>(p)); }
 
             std::optional<std::stop_callback<StopForward>> a;
             std::optional<std::stop_callback<StopForward>> b;

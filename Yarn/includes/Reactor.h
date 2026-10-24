@@ -8,8 +8,10 @@
 #include <atomic>
 #include <chrono>
 #include <coroutine>
+#include <cstdint>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -21,6 +23,7 @@
 // every translation unit that includes this header. The full type lives
 // in Reactor.cpp where the backend is implemented.
 struct io_uring;
+struct io_uring_sqe;
 #endif
 
 namespace YarnBall {
@@ -99,6 +102,17 @@ namespace YarnBall {
     } // namespace detail
 
     /**
+     * @brief Thrown by Yarn's own fd-wait and sleep awaiters when the
+     *        Reactor's event loop has died (see @ref Reactor::isDead): the
+     *        wake they got was a "loop is gone" resume, not readiness or a
+     *        timer.
+     */
+    class ReactorError : public std::runtime_error {
+    public:
+        ReactorError() : std::runtime_error("Reactor: event loop terminated") {}
+    };
+
+    /**
      * @class Reactor
      * @brief Single-thread event loop that suspends coroutines on I/O
      *        readiness and resumes them on the Yarn pool.
@@ -125,7 +139,9 @@ namespace YarnBall {
      * Thread-safety: registerReadable / registerWritable are callable
      * from any thread, including the reactor's own loop. The io_uring
      * backend serialises SQE submissions internally; the kqueue / epoll
-     * backends rely on the kernel's atomic registration semantics.
+     * backends keep their per-fd waiter table under @c fdMu and issue the
+     * kernel registration while holding it, so the run loop can only consume
+     * a readiness event after the waiter is in the table.
      */
     class Reactor final {
     public:
@@ -170,11 +186,13 @@ namespace YarnBall {
          *
          * Backend specifics:
          *  - kqueue: EVFILT_TIMER, one-shot, with handle as both ident
-         *    and udata. Sub-millisecond precision via NOTE_USECONDS.
-         *  - epoll: a per-call @c timerfd_create, registered as
-         *    EPOLLONESHOT; the fd is closed automatically after the
-         *    timer fires.
-         *  - io_uring: IORING_OP_TIMEOUT with the handle as user_data.
+         *    and udata. Nanosecond units via NOTE_NSECONDS (the kernel may
+         *    still coarsen the actual resolution).
+         *  - epoll: deadlines in an ordered table served by one shared
+         *    @c timerfd armed for the earliest; a cancel is an O(log n)
+         *    table erase.
+         *  - io_uring: the same ordered table, served by one
+         *    IORING_OP_TIMEOUT (absolute deadline) armed for the earliest.
          *  - Windows: pushed onto a min-heap keyed by @c steady_clock
          *    deadline; the WSAPoll thread caps its wait time on the
          *    next deadline and dispatches expired entries.
@@ -182,6 +200,8 @@ namespace YarnBall {
          * @note Sub-millisecond durations may be coarsened by the kernel
          *       depending on the backend; treat the resume time as a
          *       lower bound, not a hard real-time guarantee.
+         * @note If the event loop has died (@ref isDead) @p h is scheduled
+         *       at once instead of being queued forever.
          */
         void registerTimer(std::chrono::nanoseconds duration,
                             std::coroutine_handle<> h) noexcept;
@@ -219,8 +239,8 @@ namespace YarnBall {
          * @brief Same as @ref cancelWait for a timer armed by
          *        @ref registerTimer: a pending timer is removed and @p h is
          *        resumed early (or forgotten when @p resume is false). The
-         *        same ownership contract applies: exact on kqueue, epoll and
-         *        Windows, "requested" on io_uring.
+         *        same ownership contract applies: exact on kqueue, epoll,
+         *        io_uring and Windows.
          */
         bool cancelTimer(std::coroutine_handle<> h, bool resume = true) noexcept;
 
@@ -242,6 +262,16 @@ namespace YarnBall {
          * number never inherits or strands them.
          */
         std::size_t cancelFd(SocketHandle fd) noexcept;
+
+        /**
+         * @brief Whether the event loop thread has exited on a fatal error
+         *        (not a normal @ref stop). Everything parked was resumed when
+         *        it died, and any later register* call resumes its waiter
+         *        immediately; Yarn's own awaiters then throw
+         *        @ref ReactorError rather than loop on a wait that can never
+         *        complete.
+         */
+        bool isDead() const noexcept { return this->dead.load(std::memory_order_acquire); }
 
         /**
          * @brief Cooperative stop. Wakes the event loop thread, which
@@ -291,6 +321,15 @@ namespace YarnBall {
          */
         void run();
 
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__linux__)
+        /**
+         * @brief Called by the loop thread when it exits on a fatal error: logs it, sets @ref dead and resumes every
+         *        parked waiter so it observes the failure instead of staying parked forever. Registrations that
+         *        arrive afterwards are resumed at once.
+         */
+        void abandonWaiters(const char *what, int err) noexcept;
+#endif
+
         /**
          * @brief Submit @p h for resumption on a Yarn worker.
          */
@@ -300,6 +339,13 @@ namespace YarnBall {
          * @brief Cooperative-stop flag.
          */
         std::atomic<bool> running{true};
+
+        /**
+         * @brief Set (once) when the loop thread died on a fatal error. Checked by the register* calls under the same
+         *        lock abandonWaiters sets it under, so a registration either lands before the sweep (and is woken by
+         *        it) or sees the flag and is resumed at once.
+         */
+        std::atomic<bool> dead{false};
 
         /**
          * @brief Owning thread that runs @ref run.
@@ -358,16 +404,52 @@ namespace YarnBall {
         std::atomic<int> droppedPending{0};
 
         /**
+         * @brief Armed fd polls: handle address -> fd, so @ref cancelFd can report how many waiters it cancelled (and
+         *        none when there are none). Entries leave when the poll completes or is cancelled by fd. Guarded by
+         *        @ref sqMu.
+         */
+        std::unordered_map<void *, int> pollFds;
+
+        /// Armed timers ordered by deadline (same design as the epoll backend). Guarded by @ref sqMu.
+        using TimerMap = std::multimap<std::chrono::steady_clock::time_point, void *>;
+        TimerMap timers;
+
+        /// Handle address -> its @ref timers node; present exactly while the timer is armed. Whoever erases it (fire,
+        /// cancel, shutdown) owns the one resume. Guarded by @ref sqMu.
+        std::unordered_map<void *, TimerMap::iterator> timerIndex;
+
+        /**
+         * @brief State of the single kernel IORING_OP_TIMEOUT serving @ref timers: whether one is armed, for which
+         *        deadline, and its generation (carried in the operation's user_data so a stale completion of a
+         *        replaced timeout is ignored). A cancel never touches the kernel timeout (the extra expiry is
+         *        harmless), so @c timerArmedFor can be earlier than the first entry but never later. @c timerSpec is
+         *        the absolute deadline the kernel reads; it stays valid here for SQPOLL. Guarded by @ref sqMu.
+         */
+        bool timerArmed = false;
+        std::chrono::steady_clock::time_point timerArmedFor{};
+        std::uint64_t timerGen = 0;
+        std::int64_t timerSpec[2] = {0, 0}; ///< tv_sec, tv_nsec: layout of __kernel_timespec
+
+        /// Arm (or re-arm for an earlier deadline) the kernel timeout for @p deadline. sqMu held. False when no SQE
+        /// could be obtained; the loop is poked and re-evaluates the table.
+        bool armKernelTimerLocked(std::chrono::steady_clock::time_point deadline) noexcept;
+
+        /// Get an SQE, flushing the submission queue first if it is full. sqMu held. Null only if the ring stays full.
+        io_uring_sqe *getSqeLocked() noexcept;
+
+        /// Track @p h as parked on @p fd. False (nothing recorded) when out of memory. sqMu held.
+        bool trackPollLocked(int fd, std::coroutine_handle<> h) noexcept;
+
+        /**
          * @brief Wake the loop so it submits SQEs left queued by a failed
          *        io_uring_submit.
          */
         void pokeLoop() noexcept;
 
         /**
-         * @brief Ask the kernel to cancel the poll (or timeout when
-         *        @p timer) whose user_data is @p key.
+         * @brief Ask the kernel to cancel the poll whose user_data is @p key.
          */
-        bool cancelByHandle(void *key, bool resume, bool timer) noexcept;
+        bool cancelByHandle(void *key, bool resume) noexcept;
 #elif defined(__linux__)
         /**
          * @brief epoll descriptor.
@@ -380,42 +462,47 @@ namespace YarnBall {
         int wakefd = -1;
 
         /**
-         * @brief Heap-allocated @c TimerEntry pointers (opaque here;
-         *        the concrete type lives in Reactor.cpp) created by
-         *        @ref registerTimer that have not yet fired or been
-         *        freed. The run loop removes an entry (and deletes it)
-         *        when its timer fires; @c ~Reactor reclaims any left
-         *        over when the loop exits with timers still pending,
-         *        so a Reactor destroyed mid-flight does not leak them.
-         *        Guarded by @ref timerSetMu.
+         * @brief The single timerfd all sleeps share (CLOCK_MONOTONIC, level-triggered in the epoll set). It is armed
+         *        for the earliest deadline in @ref timers, so any number of concurrent sleeps costs one fd.
          */
-        std::vector<void *> pendingTimers;
+        int timerfd = -1;
+
+        /// Armed timers ordered by deadline: O(log n) insert, O(1) earliest. Guarded by @ref timerSetMu.
+        using TimerMap = std::multimap<std::chrono::steady_clock::time_point, void *>;
+        TimerMap timers;
 
         /**
-         * @brief Guards @ref pendingTimers against concurrent
-         *        registerTimer callers and the run-loop thread.
+         * @brief Handle address -> its @ref timers node, so @ref cancelTimer erases in O(log n) without a scan. An
+         *        address is in here exactly while its timer is armed; whoever erases it (fire, cancel, shutdown) owns
+         *        the one resume. Guarded by @ref timerSetMu.
+         */
+        std::unordered_map<void *, TimerMap::iterator> timerIndex;
+
+        /**
+         * @brief Whether @ref timerfd is armed, and for which deadline. A cancel never re-arms (the extra expiry is
+         *        harmless: the run loop finds nothing due and re-arms for what is left), so this can be earlier than
+         *        the first entry of @ref timers but never later. Guarded by @ref timerSetMu.
+         */
+        bool timerArmed = false;
+        std::chrono::steady_clock::time_point timerArmedFor{};
+
+        /**
+         * @brief Guards @ref timers, @ref timerIndex and the timerfd arming state against concurrent registerTimer /
+         *        cancelTimer callers and the run-loop thread.
          */
         std::mutex timerSetMu;
 
         /**
-         * @brief Fallback for when a timerfd cannot be created (fd exhaustion with many concurrent sleeps): deadline-ordered
-         *        handles serviced by the run loop through the epoll_wait timeout. Guarded by @ref timerSetMu.
+         * @brief Arm @ref timerfd for @p deadline (never in the past: an already-due deadline fires at once).
+         *        timerSetMu held.
          */
-        std::multimap<std::chrono::steady_clock::time_point, void *> softTimers;
+        void armTimerfdLocked(std::chrono::steady_clock::time_point deadline) noexcept;
 
         /**
          * @brief Waiters per fd. Guarded by @ref fdMu.
          */
         std::unordered_map<int, detail::FdWaiters> fdWaiters;
         std::mutex fdMu;
-
-        /**
-         * @brief Timer entries removed by @ref cancelTimer whose memory is
-         *        released by the run loop once the current event batch (which
-         *        may still name them) has been processed. Guarded by
-         *        @ref timerSetMu.
-         */
-        std::vector<void *> deadTimers;
 
         /**
          * @brief (Re)arm @p fd for the directions in @p w, one-shot. Returns false when epoll refuses the fd. fdMu held.

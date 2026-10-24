@@ -29,6 +29,15 @@ namespace YarnBall {
     void run(sITask task);
 
     /**
+     * @brief Submit an owned task given as a pointer to its concrete type (see @c Yarn::run).
+     */
+    template<typename T>
+        requires(std::is_base_of_v<ITask, T> && !std::is_same_v<ITask, T>)
+    inline void run(std::unique_ptr<T> task) {
+        Yarn::instance()->run(uITask{std::move(task)});
+    }
+
+    /**
      * @brief Submit an arbitrary invocable. Equivalent to constructing a
      *        small pooled @c ITask wrapper around @p fn and routing it
      *        through @c run(uITask). Cheaper than building your own

@@ -2,10 +2,10 @@
 // Created by Fabrizio Paino on 2026-05-15.
 //
 // HttpClient: tiny HTTP/1.1 client built on Soccer::TcpStream +
-// BufferedReader. Supports GET / POST, Content-Length-framed bodies,
-// arbitrary request/response headers. NOT chunked transfer (would
-// require a stateful body decoder; doable but kept out of v1 to keep
-// the surface small). NO TLS yet -- pair with Soccer::TlsStream once
+// BufferedReader. Supports GET / POST, Content-Length-framed and
+// chunked-coded bodies (a lone "chunked" Transfer-Encoding, size-bounded;
+// trailers are read and discarded), arbitrary request/response headers.
+// NO TLS yet -- pair with Soccer::TlsStream once
 // TLS is wired on the target platform.
 //
 // Designed for example/test/scripting use, not as a production-grade
@@ -26,6 +26,7 @@
 #include <deque>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string_view>
 #include <string>
@@ -35,6 +36,7 @@
 
 #include "BufferedReader.h"
 #include "Coroutines.h"
+#include "IoDeadline.h"
 #include "PlatformNet.h"
 #include "SocketException.h"
 #include "TcpStream.h"
@@ -103,6 +105,218 @@ namespace Soccer {
          */
         inline bool hasCtlLineBreak(std::string_view s) noexcept {
             return s.find_first_of(std::string_view("\r\n\0", 3)) != std::string_view::npos;
+        }
+
+        /// RFC 9110 5.6.2 tchar: the characters allowed in a method or a header field name.
+        inline bool isTokenChar(unsigned char c) noexcept {
+            if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) return true;
+            switch (c) {
+                case '!': case '#': case '$': case '%': case '&': case '\'': case '*':
+                case '+': case '-': case '.': case '^': case '_': case '`': case '|': case '~':
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        /// True if @p s is a non-empty RFC 9110 token.
+        inline bool isHttpToken(std::string_view s) noexcept {
+            if (s.empty()) return false;
+            for (const char c : s) {
+                if (!isTokenChar(static_cast<unsigned char>(c))) return false;
+            }
+            return true;
+        }
+
+        /// True if @p s holds a control character a header field value may not carry
+        /// (anything below 0x20 other than HT, or DEL): CR, LF and NUL included.
+        inline bool hasFieldValueCtl(std::string_view s) noexcept {
+            for (const char ch : s) {
+                const unsigned char c = static_cast<unsigned char>(ch);
+                if ((c < 0x20 && c != '\t') || c == 0x7f) return true;
+            }
+            return false;
+        }
+
+        /// True if @p s cannot be a request target: it holds a space, a control
+        /// character or DEL (so it cannot split the request line either).
+        inline bool hasTargetCtl(std::string_view s) noexcept {
+            for (const char ch : s) {
+                const unsigned char c = static_cast<unsigned char>(ch);
+                if (c <= 0x20 || c == 0x7f) return true;
+            }
+            return false;
+        }
+
+        /**
+         * @brief True if any header field is named Transfer-Encoding, whatever its
+         *        value (an empty or folded one counts): every occurrence is looked
+         *        at, not just the first, so a decoy ahead of the real one hides nothing.
+         */
+        template<typename HeaderVec>
+        inline bool hasTransferEncoding(const HeaderVec &headers) {
+            for (const auto &h : headers) {
+                if (iequalsAscii(h.name, "Transfer-Encoding")) return true;
+            }
+            return false;
+        }
+
+        /**
+         * @brief True if the comma-separated token list @p value (a Connection or
+         *        Upgrade field value) holds @p token, compared case-insensitively.
+         */
+        inline bool headerListHasToken(std::string_view value, std::string_view token) {
+            std::size_t pos = 0;
+            while (pos <= value.size()) {
+                std::size_t comma = value.find(',', pos);
+                if (comma == std::string_view::npos) comma = value.size();
+                std::string_view item = value.substr(pos, comma - pos);
+                while (!item.empty() && (item.front() == ' ' || item.front() == '\t')) item.remove_prefix(1);
+                while (!item.empty() && (item.back() == ' ' || item.back() == '\t')) item.remove_suffix(1);
+                if (iequalsAscii(item, token)) return true;
+                pos = comma + 1;
+            }
+            return false;
+        }
+
+        /**
+         * @brief True if a header a handler sets on a response is one the server
+         *        frames itself (length and connection management), so the handler's
+         *        copy is dropped: a second Content-Length, or a Transfer-Encoding next
+         *        to it, would make the response ambiguous.
+         */
+        inline bool isServerManagedResponseHeader(std::string_view name) noexcept {
+            return iequalsAscii(name, "Content-Length") || iequalsAscii(name, "Connection") ||
+                   iequalsAscii(name, "Transfer-Encoding") || iequalsAscii(name, "Keep-Alive") ||
+                   iequalsAscii(name, "Upgrade") || iequalsAscii(name, "Proxy-Connection");
+        }
+
+        /// True if a response with @p status never carries content: 1xx, 204 and 304.
+        inline bool statusHasNoBody(int status) noexcept {
+            return (status >= 100 && status < 200) || status == 204 || status == 304;
+        }
+
+        /**
+         * @brief The Content-Length a server puts on a response, and whether it
+         *        sends the body. HEAD, 1xx, 204 and 304 never carry content:
+         *        a HEAD answer gets the length the GET would have had (the
+         *        handler's own Content-Length @p stated if it set one, else the
+         *        body's size), 304 only a length the handler stated, 1xx and 204 none.
+         *        An empty result means "no Content-Length header".
+         */
+        inline std::string framedContentLength(int status, bool head, std::string_view stated,
+                                               std::size_t bodySize, bool &sendBody) {
+            sendBody = !head && !statusHasNoBody(status);
+            if (sendBody) return std::to_string(bodySize);
+            if (status == 204 || (status >= 100 && status < 200)) return {};
+            const bool numeric = !stated.empty() && stated.size() <= 12 &&
+                                 stated.find_first_not_of("0123456789") == std::string_view::npos;
+            if (numeric) return std::string(stated);
+            if (status == 304) return {};
+            return std::to_string(bodySize);
+        }
+
+        /// The standard reason phrase for @p status ("" when there is none to offer).
+        inline const char *reasonPhrase(int status) noexcept {
+            switch (status) {
+                case 100: return "Continue";
+                case 101: return "Switching Protocols";
+                case 200: return "OK";
+                case 201: return "Created";
+                case 202: return "Accepted";
+                case 203: return "Non-Authoritative Information";
+                case 204: return "No Content";
+                case 205: return "Reset Content";
+                case 206: return "Partial Content";
+                case 300: return "Multiple Choices";
+                case 301: return "Moved Permanently";
+                case 302: return "Found";
+                case 303: return "See Other";
+                case 304: return "Not Modified";
+                case 307: return "Temporary Redirect";
+                case 308: return "Permanent Redirect";
+                case 400: return "Bad Request";
+                case 401: return "Unauthorized";
+                case 403: return "Forbidden";
+                case 404: return "Not Found";
+                case 405: return "Method Not Allowed";
+                case 406: return "Not Acceptable";
+                case 408: return "Request Timeout";
+                case 409: return "Conflict";
+                case 410: return "Gone";
+                case 411: return "Length Required";
+                case 412: return "Precondition Failed";
+                case 413: return "Content Too Large";
+                case 414: return "URI Too Long";
+                case 415: return "Unsupported Media Type";
+                case 417: return "Expectation Failed";
+                case 422: return "Unprocessable Content";
+                case 426: return "Upgrade Required";
+                case 429: return "Too Many Requests";
+                case 431: return "Request Header Fields Too Large";
+                case 500: return "Internal Server Error";
+                case 501: return "Not Implemented";
+                case 502: return "Bad Gateway";
+                case 503: return "Service Unavailable";
+                case 504: return "Gateway Timeout";
+                case 505: return "HTTP Version Not Supported";
+                default: return "";
+            }
+        }
+
+        /**
+         * @brief Split a request target at its first '?': @p path gets the part
+         *        before it, @p query the part after (without the '?').
+         */
+        inline void splitQuery(std::string_view target, std::string &path, std::string &query) {
+            const std::size_t q = target.find('?');
+            if (q == std::string_view::npos) {
+                path.assign(target);
+                query.clear();
+            } else {
+                path.assign(target.substr(0, q));
+                query.assign(target.substr(q + 1));
+            }
+        }
+
+        /**
+         * @brief A TcpStream view that counts the bytes read through it, so the
+         *        pooled request path can compare what the BufferedReader pulled off
+         *        the socket with what the response actually used.
+         */
+        struct CountingStream {
+            TcpStream *stream;
+            std::size_t total{0};
+
+            auto fd() const noexcept { return this->stream->fd(); }
+
+            YarnBall::Task<std::size_t> read(std::span<std::byte> buf) {
+                const std::size_t n = co_await this->stream->read(buf);
+                this->total += n;
+                co_return n;
+            }
+        };
+
+        /**
+         * @brief Host header value for @p host / @p port: an IPv6 literal is
+         *        bracketed, and the port is left off when it equals @p omitPort
+         *        (pass 0 to always include it).
+         */
+        inline std::string hostHeaderValue(std::string_view host, std::uint16_t port,
+                                           std::uint16_t omitPort) {
+            std::string out;
+            if (host.find(':') != std::string_view::npos && (host.empty() || host.front() != '[')) {
+                out.push_back('[');
+                out.append(host);
+                out.push_back(']');
+            } else {
+                out.append(host);
+            }
+            if (port != 0 && port != omitPort) {
+                out.push_back(':');
+                out.append(std::to_string(port));
+            }
+            return out;
         }
 
         /**
@@ -231,6 +445,9 @@ namespace Soccer {
          */
         static constexpr std::size_t kDefaultMaxIdlePerHost = 16;
 
+        /// Most distinct @c host:port keys that may hold idle connections at once.
+        static constexpr std::size_t kMaxHosts = 256;
+
         /**
          * @brief Process-wide default pool. Used by @c HttpClient's
          *        pooled request entry points.
@@ -350,6 +567,21 @@ namespace Soccer {
         }
 
         /**
+         * @brief Issue an HTTP HEAD. The response carries the headers a GET would
+         *        have (Content-Length included) and never a body, whatever the
+         *        Content-Length says.
+         */
+        static YarnBall::Task<HttpResponse> head(
+            std::string host,
+            std::uint16_t port,
+            std::string path,
+            std::vector<HttpHeader> extraHeaders = {}) {
+            co_return co_await HttpClient::request(
+                "HEAD", std::move(host), port, std::move(path),
+                std::move(extraHeaders), {});
+        }
+
+        /**
          * @brief Issue an HTTP POST with @p body bytes. Adds
          *        Content-Length automatically.
          */
@@ -415,9 +647,53 @@ namespace Soccer {
             return std::chrono::milliseconds{connectTimeoutMs().load(std::memory_order_relaxed)};
         }
 
+        /**
+         * @brief Default longest the response head (status line and headers) may
+         *        take to arrive once the request is being sent; a server that
+         *        accepts the connection and then says nothing fails the request
+         *        with a @c SocketException after this long.
+         */
+        static constexpr std::chrono::milliseconds kDefaultResponseHeaderTimeout{30000};
+
+        /**
+         * @brief Default longest the response body may take to arrive once its
+         *        head is in (the whole body, not the gap between two reads).
+         */
+        static constexpr std::chrono::milliseconds kDefaultResponseBodyTimeout{120000};
+
+        /**
+         * @brief Change the process-wide response deadlines. Zero disables the
+         *        respective limit.
+         */
+        static void setResponseTimeouts(std::chrono::milliseconds header,
+                                        std::chrono::milliseconds body) noexcept {
+            responseHeaderTimeoutMs().store(header.count(), std::memory_order_relaxed);
+            responseBodyTimeoutMs().store(body.count(), std::memory_order_relaxed);
+        }
+
+        /// @return The current response-head deadline.
+        static std::chrono::milliseconds responseHeaderTimeout() noexcept {
+            return std::chrono::milliseconds{responseHeaderTimeoutMs().load(std::memory_order_relaxed)};
+        }
+
+        /// @return The current response-body deadline.
+        static std::chrono::milliseconds responseBodyTimeout() noexcept {
+            return std::chrono::milliseconds{responseBodyTimeoutMs().load(std::memory_order_relaxed)};
+        }
+
     private:
         static std::atomic<long long> &connectTimeoutMs() noexcept {
             static std::atomic<long long> v{kDefaultConnectTimeout.count()};
+            return v;
+        }
+
+        static std::atomic<long long> &responseHeaderTimeoutMs() noexcept {
+            static std::atomic<long long> v{kDefaultResponseHeaderTimeout.count()};
+            return v;
+        }
+
+        static std::atomic<long long> &responseBodyTimeoutMs() noexcept {
+            static std::atomic<long long> v{kDefaultResponseBodyTimeout.count()};
             return v;
         }
 
@@ -449,15 +725,35 @@ namespace Soccer {
          * @param[out] outStreamReusable @c true iff the stream is left
          *        at a clean next-message boundary that a caller may
          *        safely pool (a body-forbidden response, or one framed
-         *        by a valid, present Content-Length); @c false for an
-         *        EOF-framed (identity) response, where the socket must
-         *        be read to closure and cannot be reused.
+         *        by a valid, present Content-Length or by chunked coding,
+         *        and neither side asked to close the connection: a
+         *        @c close token in Connection, or HTTP/1.0 without
+         *        @c keep-alive); @c false for an EOF-framed (identity)
+         *        response, where the socket must be read to closure and
+         *        cannot be reused.
+         * @param headRequest The request was HEAD: the response carries no body
+         *        whatever its Content-Length says.
+         * @param[out] consumedOut Bytes of the stream the response occupied
+         *        (head, body and chunk framing), for the leftover check.
+         *
+         *        Transfer-Encoding is handled for exactly one case: a single
+         *        @c chunked coding, no Content-Length beside it. Chunk sizes
+         *        are hex of at most 16 digits and bounded by the body cap
+         *        (@ref detail::kHttpMaxBodyBytes) in total, chunk extensions
+         *        are ignored, and the trailer section is read and discarded
+         *        within the header-block bounds. Anything else throws.
          */
+        template<typename Reader>
         static YarnBall::Task<HttpResponse> readResponse(
-            BufferedReader<TcpStream> &r, bool &outStreamReusable,
-            bool *sawResponseByte = nullptr) {
+            Reader &r, bool &outStreamReusable,
+            bool *sawResponseByte = nullptr, IoDeadline *deadline = nullptr,
+            bool headRequest = false, std::size_t *consumedOut = nullptr) {
             outStreamReusable = false;
             if (sawResponseByte) *sawResponseByte = false;
+            // Bytes taken off the reader for this response (lines and body), so the
+            // caller can tell whether the reader swallowed more than the response.
+            std::size_t consumed = 0;
+            bool http10 = false;
             HttpResponse resp;
             // Counted across the interim responses too, so a stream of 1xx
             // responses cannot make the client buffer more than one cap's worth.
@@ -481,11 +777,14 @@ namespace Soccer {
                 }
                 if (sawResponseByte) *sawResponseByte = true;
                 HttpClient::parseStatusLine(status_line, resp);
+                http10 = status_line.compare(0, 8, "HTTP/1.0") == 0;
 
                 header_bytes += status_line.size();
+                consumed += status_line.size();
                 while (true) {
                     std::string line = co_await r.readLine();
                     header_bytes += line.size();
+                    consumed += line.size();
                     if (header_bytes > detail::kHttpMaxHeaderBytes) {
                         throw std::runtime_error("HttpClient: header block too large");
                     }
@@ -494,28 +793,136 @@ namespace Soccer {
                             "HttpClient: connection closed inside header block");
                     }
                     if (line == "\r\n" || line == "\n") break;
+                    if (line.back() != '\n') {
+                        throw std::runtime_error("HttpClient: connection closed inside header block");
+                    }
                     HttpClient::parseHeaderLine(line, resp);
                 }
 
-                if (resp.status < 100 || resp.status >= 200) break;
+                if (resp.status < 100 || resp.status >= 200 || resp.status == 101) break;
                 // 1xx: no body ever accompanies it: discard and loop
                 // for the response it precedes.
             }
 
-            if (resp.status == 204 || resp.status == 304) {
-                // No body by definition; stream is already at the next
-                // message boundary (nothing beyond the headers was
-                // ever sent), so it's safe to pool.
-                outStreamReusable = true;
+            // 101 Switching Protocols is final: what follows on the connection
+            // belongs to the new protocol, not to HTTP, so nothing more is read here
+            // and the stream is never reusable.
+            if (resp.status == 101) {
+                outStreamReusable = false;
                 co_return resp;
             }
 
-            // Chunked framing is not implemented. Reading such a response
-            // as identity or Content-Length framed would hand the caller
-            // raw chunk framing and, on a pooled connection, leave unread
-            // bytes that desynchronise the next response.
-            if (!resp.header("Transfer-Encoding").empty()) {
-                throw std::runtime_error("HttpClient: Transfer-Encoding not supported");
+            // The head is in: from here on the body clock runs.
+            if (deadline) deadline->arm(r.raw()->fd(), responseBodyTimeout());
+
+            // Whether the connection may carry another exchange: the Connection
+            // field is a token list (possibly split over several fields), and an
+            // HTTP/1.0 peer closes unless it says keep-alive.
+            std::string connectionTokens;
+            for (const auto &h : resp.headers) {
+                if (detail::iequalsAscii(h.name, "Connection")) {
+                    if (!connectionTokens.empty()) connectionTokens += ',';
+                    connectionTokens += h.value;
+                }
+            }
+            const bool keepAlive = !detail::headerListHasToken(connectionTokens, "close") &&
+                                   (!http10 || detail::headerListHasToken(connectionTokens, "keep-alive"));
+
+            if (headRequest || resp.status == 204 || resp.status == 304) {
+                // No body by definition (whatever Content-Length says); stream is
+                // already at the next message boundary (nothing beyond the headers
+                // was ever sent), so it's safe to pool.
+                outStreamReusable = keepAlive;
+                if (consumedOut) *consumedOut = consumed;
+                co_return resp;
+            }
+
+            // Every header is looked at: an empty Transfer-Encoding ahead of a
+            // "chunked" one must not read as "no Transfer-Encoding".
+            if (detail::hasTransferEncoding(resp.headers)) {
+                // Only a lone "chunked" coding is understood, and never next to a
+                // Content-Length (RFC 9112 6.3: the two disagreeing about where the
+                // message ends is a smuggling primitive). A pre-1.1 peer cannot chunk.
+                std::size_t teCount = 0;
+                bool chunkedOnly = true;
+                for (const auto &h : resp.headers) {
+                    if (!detail::iequalsAscii(h.name, "Transfer-Encoding")) continue;
+                    ++teCount;
+                    if (!detail::iequalsAscii(h.value, "chunked")) chunkedOnly = false;
+                }
+                if (teCount != 1 || !chunkedOnly || http10 ||
+                    !resp.header("Content-Length").empty()) {
+                    throw std::runtime_error("HttpClient: unsupported Transfer-Encoding");
+                }
+                std::string chunked;
+                while (true) {
+                    const std::string sizeLine = co_await r.readLine();
+                    consumed += sizeLine.size();
+                    if (sizeLine.size() < 3 || sizeLine.size() > 1024 ||
+                        sizeLine[sizeLine.size() - 2] != '\r' || sizeLine.back() != '\n') {
+                        throw std::runtime_error("HttpClient: malformed chunk size line");
+                    }
+                    std::size_t digits = 0;
+                    std::uint64_t chunkLen = 0;
+                    for (; digits + 2 < sizeLine.size(); ++digits) {
+                        const char c = sizeLine[digits];
+                        unsigned v;
+                        if (c >= '0' && c <= '9') v = static_cast<unsigned>(c - '0');
+                        else if (c >= 'a' && c <= 'f') v = static_cast<unsigned>(c - 'a' + 10);
+                        else if (c >= 'A' && c <= 'F') v = static_cast<unsigned>(c - 'A' + 10);
+                        else break;
+                        if (digits >= 16) throw std::runtime_error("HttpClient: chunk size too large");
+                        chunkLen = (chunkLen << 4) | v;
+                    }
+                    // What follows the size is an extension (";...") and is ignored; a
+                    // bare CR or NUL inside it is not allowed.
+                    const std::string_view rest = std::string_view(sizeLine).substr(
+                        digits, sizeLine.size() - 2 - digits);
+                    if (digits == 0 || (!rest.empty() && rest.front() != ';') ||
+                        rest.find_first_of(std::string_view("\r\0", 2)) != std::string_view::npos) {
+                        throw std::runtime_error("HttpClient: malformed chunk size line");
+                    }
+                    if (chunkLen == 0) break;
+                    if (chunkLen > detail::kHttpMaxBodyBytes ||
+                        chunked.size() + chunkLen > detail::kHttpMaxBodyBytes) {
+                        throw std::runtime_error("HttpClient: body too large");
+                    }
+                    std::size_t left = static_cast<std::size_t>(chunkLen);
+                    while (left != 0) {
+                        const std::size_t want = std::min<std::size_t>(left, 64 * 1024);
+                        auto bytes = co_await r.readExact(want);
+                        if (bytes.size() != want) {
+                            throw std::runtime_error("HttpClient: truncated chunked body");
+                        }
+                        chunked.append(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+                        consumed += want;
+                        left -= want;
+                    }
+                    auto crlf = co_await r.readExact(2);
+                    if (crlf.size() != 2 || crlf[0] != std::byte{'\r'} || crlf[1] != std::byte{'\n'}) {
+                        throw std::runtime_error("HttpClient: malformed chunk terminator");
+                    }
+                    consumed += 2;
+                }
+                // Trailer section: header-shaped lines up to a blank one. Read to keep
+                // the stream aligned, within the same bounds as the head; discarded.
+                std::size_t trailerBytes = 0;
+                while (true) {
+                    std::string line = co_await r.readLine();
+                    consumed += line.size();
+                    trailerBytes += line.size();
+                    if (trailerBytes > detail::kHttpMaxHeaderBytes) {
+                        throw std::runtime_error("HttpClient: trailer block too large");
+                    }
+                    if (line.empty() || line.back() != '\n') {
+                        throw std::runtime_error("HttpClient: connection closed inside trailers");
+                    }
+                    if (line == "\r\n") break;
+                }
+                resp.body = std::move(chunked);
+                outStreamReusable = keepAlive;
+                if (consumedOut) *consumedOut = consumed;
+                co_return resp;
             }
             std::size_t clenValue = 0;
             if (detail::strictContentLength(resp.headers, clenValue)) {
@@ -525,7 +932,8 @@ namespace Soccer {
                 }
                 resp.body.assign(reinterpret_cast<const char *>(bytes.data()),
                                  bytes.size());
-                outStreamReusable = true;
+                consumed += bytes.size();
+                outStreamReusable = keepAlive;
             } else {
                 // Identity-framed: read to EOF; cannot pool afterwards.
                 std::string body_acc;
@@ -541,6 +949,7 @@ namespace Soccer {
                 resp.body = std::move(body_acc);
                 outStreamReusable = false;
             }
+            if (consumedOut) *consumedOut = consumed;
             co_return resp;
         }
 
@@ -561,34 +970,32 @@ namespace Soccer {
             std::vector<HttpHeader> extra,
             std::string body) {
             checkRequestParts(method, host, path, extra);
+            // An empty target would put "GET  HTTP/1.1" on the wire.
+            if (path.empty()) path = "/";
             auto &pool = HttpConnectionPool::defaultPool();
 
-            std::string req = method;
-            req += ' ';
-            req += path;
-            req += " HTTP/1.1\r\n";
-            req += "Host: " + host + "\r\n";
-            req += "Connection: keep-alive\r\n";
-            req += "User-Agent: manwe-soccer-http/0.3\r\n";
-            for (const auto &h : extra) {
-                req += h.name + ": " + h.value + "\r\n";
-            }
-            if (!body.empty()) {
-                req += "Content-Length: " + std::to_string(body.size()) + "\r\n";
-            }
-            req += "\r\n";
+            const std::string req = buildRequestHead(method, host, port, path, extra,
+                                                     body.size(), "keep-alive");
 
             const bool idempotent = isIdempotentMethod(method);
             for (int attempt = 0; ; ++attempt) {
                 // Only the first attempt may use a pooled connection; the retry
                 // below always dials a fresh one.
-                std::optional<TcpStream> reused;
-                if (attempt == 0) reused = pool.acquireLive(host, port);
-                const bool wasReused = reused.has_value();
-                TcpStream stream = reused ? std::move(*reused)
-                                           : co_await tcpConnect(host, port, connectTimeout());
+                std::optional<TcpStream> conn;
+                if (attempt == 0) conn = pool.acquireLive(host, port);
+                const bool wasReused = conn.has_value();
+                // Not `reused ? std::move(*reused) : co_await tcpConnect(...)`: GCC
+                // evaluates the co_await arm even when the pool had a connection,
+                // dialling (and wasting) a second one on every reuse.
+                if (!wasReused) {
+                    TcpStream dialled = co_await tcpConnect(host, port, connectTimeout());
+                    conn.emplace(std::move(dialled));
+                }
+                TcpStream &stream = *conn;
 
                 bool sawResponse = false;
+                // Declared after `stream`, so it is disarmed before the fd is closed or pooled.
+                IoDeadline dl(stream.fd(), responseHeaderTimeout());
                 try {
                     co_await stream.write(std::span<const std::byte>(
                         reinterpret_cast<const std::byte *>(req.data()), req.size()));
@@ -598,18 +1005,26 @@ namespace Soccer {
                             body.size()));
                     }
 
-                    BufferedReader<TcpStream> r(&stream);
+                    detail::CountingStream counted{&stream};
+                    BufferedReader<detail::CountingStream> r(&counted);
                     bool reusable = false;
-                    HttpResponse resp = co_await HttpClient::readResponse(r, reusable, &sawResponse);
+                    std::size_t consumed = 0;
+                    HttpResponse resp = co_await HttpClient::readResponse(
+                        r, reusable, &sawResponse, &dl, detail::iequalsAscii(method, "HEAD"), &consumed);
 
                     // Return the connection to the pool only if the parse left
-                    // it at a clean boundary and the server didn't explicitly
-                    // close it.
-                    if (reusable && !detail::iequalsAscii(resp.header("Connection"), "close")) {
+                    // it at a clean boundary, nobody asked to close it, and the
+                    // reader did not pull in bytes beyond this response (those
+                    // are unexplained and would be lost to the next exchange).
+                    dl.disarm();
+                    if (reusable && counted.total == consumed) {
                         pool.release(host, port, std::move(stream));
                     }
                     co_return resp;
                 } catch (...) {
+                    // A request that ran out of time is not retried: that would only
+                    // double the wait.
+                    if (dl.expired()) throw SocketException("HttpClient: response timed out");
                     // A pooled connection can die between the liveness check and
                     // the write (the server closes keep-alives on its own
                     // schedule). If nothing of a response was seen and the
@@ -632,39 +1047,35 @@ namespace Soccer {
             std::string body) {
             // Build the request preamble.
             checkRequestParts(method, host, path, extra);
-            std::string req = method;
-            req += ' ';
-            req += path;
-            req += " HTTP/1.1\r\n";
-            req += "Host: " + host + "\r\n";
-            req += "Connection: close\r\n";
-            req += "User-Agent: manwe-soccer-http/0.3\r\n";
-            for (const auto &h : extra) {
-                req += h.name + ": " + h.value + "\r\n";
-            }
-            if (!body.empty()) {
-                req += "Content-Length: " + std::to_string(body.size()) + "\r\n";
-            }
-            req += "\r\n";
+            if (path.empty()) path = "/";
+            const std::string req = buildRequestHead(method, host, port, path, extra,
+                                                     body.size(), "close");
 
             auto stream = co_await tcpConnect(host, port, connectTimeout());
-
-            // Send preamble + body in two writes; the kernel coalesces
-            // these for us. Splitting is fine for v1.
-            co_await stream.write(std::span<const std::byte>(
-                reinterpret_cast<const std::byte *>(req.data()), req.size()));
-            if (!body.empty()) {
+            // Declared after `stream`, so it is disarmed before the fd is closed.
+            IoDeadline dl(stream.fd(), responseHeaderTimeout());
+            try {
+                // Send preamble + body in two writes; the kernel coalesces
+                // these for us. Splitting is fine for v1.
                 co_await stream.write(std::span<const std::byte>(
-                    reinterpret_cast<const std::byte *>(body.data()),
-                    body.size()));
-            }
+                    reinterpret_cast<const std::byte *>(req.data()), req.size()));
+                if (!body.empty()) {
+                    co_await stream.write(std::span<const std::byte>(
+                        reinterpret_cast<const std::byte *>(body.data()),
+                        body.size()));
+                }
 
-            // Parse the response with a BufferedReader so we can do
-            // line-based header parsing without per-byte read calls.
-            BufferedReader<TcpStream> r(&stream);
-            bool reusable = false; // unused: this connection is never pooled.
-            HttpResponse resp = co_await HttpClient::readResponse(r, reusable);
-            co_return resp;
+                // Parse the response with a BufferedReader so we can do
+                // line-based header parsing without per-byte read calls.
+                BufferedReader<TcpStream> r(&stream);
+                bool reusable = false; // unused: this connection is never pooled.
+                HttpResponse resp = co_await HttpClient::readResponse(
+                    r, reusable, nullptr, &dl, detail::iequalsAscii(method, "HEAD"));
+                co_return resp;
+            } catch (...) {
+                if (dl.expired()) throw SocketException("HttpClient: response timed out");
+                throw;
+            }
         }
 
         /// Methods RFC 9110 9.2.2 defines as idempotent: safe to repeat after a failed attempt.
@@ -676,37 +1087,94 @@ namespace Soccer {
         }
 
         /**
-         * @brief Reject CR/LF/NUL in anything interpolated into the
-         *        request head (request-line / header injection).
+         * @brief Reject anything that cannot be put into the request head as it
+         *        is: a method or header name that is not a token, control
+         *        characters (CR, LF, NUL, ...) in the host, target or a header
+         *        value, a space in the target. These are the request-line /
+         *        header injection vectors. A caller-supplied Transfer-Encoding is
+         *        refused too: the body is always sent Content-Length-framed.
          */
         static void checkRequestParts(const std::string &method,
                                        const std::string &host,
                                        const std::string &path,
                                        const std::vector<HttpHeader> &extra) {
-            bool bad = detail::hasCtlLineBreak(method) || detail::hasCtlLineBreak(host) ||
-                       detail::hasCtlLineBreak(path) || path.find(' ') != std::string::npos;
+            bool bad = !detail::isHttpToken(method) || host.empty() ||
+                       detail::hasTargetCtl(host) || detail::hasTargetCtl(path);
             for (const auto &h : extra) {
-                if (detail::hasCtlLineBreak(h.name) || detail::hasCtlLineBreak(h.value)) bad = true;
+                if (!detail::isHttpToken(h.name) || detail::hasFieldValueCtl(h.value) ||
+                    detail::iequalsAscii(h.name, "Transfer-Encoding")) {
+                    bad = true;
+                }
             }
             if (bad) {
-                throw std::runtime_error("HttpClient: control characters in request");
+                throw std::runtime_error("HttpClient: invalid method, host, target or header in request");
             }
         }
 
         /**
-         * @brief Parse "HTTP/x.y CODE REASON\\r\\n" into @p resp.
+         * @brief Serialise the request line and headers. A caller-supplied Host or
+         *        User-Agent replaces the automatic one and a caller-supplied
+         *        Content-Length is dropped (the real length is always sent), so no
+         *        header appears twice. Methods that normally carry a body send
+         *        @c Content-Length: 0 when there is none.
          */
-        static void parseStatusLine(const std::string &line, HttpResponse &resp) {
-            // Tokenise: skip the HTTP-version, take the code, take the
-            // rest as reason.
-            const std::size_t sp1 = line.find(' ');
-            if (sp1 == std::string::npos) {
+        static std::string buildRequestHead(const std::string &method,
+                                            const std::string &host,
+                                            std::uint16_t port,
+                                            const std::string &path,
+                                            const std::vector<HttpHeader> &extra,
+                                            std::size_t bodySize,
+                                            const char *connection) {
+            bool haveHost = false, haveAgent = false;
+            for (const auto &h : extra) {
+                if (detail::iequalsAscii(h.name, "Host")) haveHost = true;
+                else if (detail::iequalsAscii(h.name, "User-Agent")) haveAgent = true;
+            }
+            std::string req = method;
+            req += ' ';
+            req += path;
+            req += " HTTP/1.1\r\n";
+            if (!haveHost) req += "Host: " + detail::hostHeaderValue(host, port, 80) + "\r\n";
+            req += "Connection: ";
+            req += connection;
+            req += "\r\n";
+            if (!haveAgent) req += "User-Agent: manwe-soccer-http/0.3\r\n";
+            for (const auto &h : extra) {
+                if (detail::iequalsAscii(h.name, "Content-Length")) continue;
+                req += h.name + ": " + h.value + "\r\n";
+            }
+            const bool expectsBody = detail::iequalsAscii(method, "POST") ||
+                                     detail::iequalsAscii(method, "PUT") ||
+                                     detail::iequalsAscii(method, "PATCH");
+            if (bodySize != 0 || expectsBody) {
+                req += "Content-Length: " + std::to_string(bodySize) + "\r\n";
+            }
+            req += "\r\n";
+            return req;
+        }
+
+        /// Drop the line terminator (CRLF, or a bare LF) from a line read off the wire.
+        static std::string stripLineEnd(std::string line) {
+            if (!line.empty() && line.back() == '\n') line.pop_back();
+            if (!line.empty() && line.back() == '\r') line.pop_back();
+            return line;
+        }
+
+        /**
+         * @brief Parse "HTTP/x.y CODE[ REASON]\\r\\n" into @p resp. The reason
+         *        phrase is optional (RFC 9112 4); the version must look like
+         *        HTTP/<digit>.<digit>.
+         */
+        static void parseStatusLine(const std::string &rawLine, HttpResponse &resp) {
+            const std::string line = stripLineEnd(rawLine);
+            if (line.size() < 12 || line.compare(0, 5, "HTTP/") != 0 ||
+                !std::isdigit(static_cast<unsigned char>(line[5])) || line[6] != '.' ||
+                !std::isdigit(static_cast<unsigned char>(line[7])) || line[8] != ' ') {
                 throw std::runtime_error("HttpClient: malformed status line");
             }
-            const std::size_t sp2 = line.find(' ', sp1 + 1);
+            const std::size_t sp2 = line.find(' ', 9);
             const std::string code =
-                line.substr(sp1 + 1, (sp2 == std::string::npos ? line.size() : sp2)
-                                      - sp1 - 1);
+                line.substr(9, (sp2 == std::string::npos ? line.size() : sp2) - 9);
             if (code.size() != 3 ||
                 code.find_first_not_of("0123456789") != std::string::npos) {
                 throw std::runtime_error("HttpClient: malformed status code");
@@ -719,14 +1187,24 @@ namespace Soccer {
 
         /**
          * @brief Parse "Name: Value\\r\\n" and append to @p resp.headers.
-         *        Tolerates absent CR; trims whitespace around the value.
+         *        Trims whitespace around the value. A line that is not a valid
+         *        field (obs-fold continuation, no colon, a name that is not a
+         *        token, a stray CR or NUL) is refused rather than skipped: a
+         *        skipped line could be the Transfer-Encoding a proxy would read.
          */
-        static void parseHeaderLine(const std::string &line, HttpResponse &resp) {
+        static void parseHeaderLine(const std::string &rawLine, HttpResponse &resp) {
+            const std::string line = stripLineEnd(rawLine);
             const std::size_t colon = line.find(':');
-            if (colon == std::string::npos) return; // skip malformed line
+            if (colon == std::string::npos ||
+                !detail::isHttpToken(std::string_view(line).substr(0, colon))) {
+                throw std::runtime_error("HttpClient: malformed header line");
+            }
             HttpHeader h;
             h.name = line.substr(0, colon);
             h.value = detail::trimAscii(line.substr(colon + 1));
+            if (detail::hasFieldValueCtl(h.value)) {
+                throw std::runtime_error("HttpClient: control character in header value");
+            }
             resp.headers.push_back(std::move(h));
         }
     };
@@ -767,6 +1245,7 @@ namespace Soccer {
         auto it = this->idle.find(k);
         if (it == this->idle.end()) return std::nullopt;
         auto &dq = it->second;
+        std::optional<TcpStream> out;
         while (!dq.empty()) {
             IdleConn c = std::move(dq.back());
             dq.pop_back();
@@ -777,9 +1256,13 @@ namespace Soccer {
                 dq.clear();
                 break;
             }
-            return std::move(c.stream);
+            out = std::move(c.stream);
+            break;
         }
-        return std::nullopt;
+        // A host with nothing idle keeps no entry, so the map cannot grow with every
+        // host ever contacted.
+        if (dq.empty()) this->idle.erase(it);
+        return out;
     }
 
     inline std::optional<TcpStream>
@@ -799,6 +1282,19 @@ namespace Soccer {
         const std::int64_t ageMs = this->maxIdleAgeMs.load(std::memory_order_relaxed);
         const auto now = std::chrono::steady_clock::now();
         std::lock_guard<std::mutex> lk(this->mu);
+        if (this->idle.size() >= kMaxHosts && this->idle.find(k) == this->idle.end()) {
+            // Too many hosts hold idle connections: forget the ones that have gone stale
+            // or empty, and if that frees no room this connection is simply not pooled.
+            for (auto it = this->idle.begin(); it != this->idle.end();) {
+                auto &old = it->second;
+                while (ageMs > 0 && !old.empty() &&
+                       std::chrono::duration_cast<std::chrono::milliseconds>(now - old.front().lastUsed).count() > ageMs) {
+                    old.pop_front();
+                }
+                it = old.empty() ? this->idle.erase(it) : std::next(it);
+            }
+            if (this->idle.size() >= kMaxHosts) return;
+        }
         auto &dq = this->idle[k];
         // Drop what has gone stale while it waited; the oldest are at the front.
         while (ageMs > 0 && !dq.empty() &&
@@ -808,7 +1304,7 @@ namespace Soccer {
         if (dq.size() >= cap) {
             // Over the cap: drop the stream by letting its destructor
             // run. Caller's move means we already own it.
-            (void) stream;
+            if (dq.empty()) this->idle.erase(k);
             return;
         }
         dq.push_back(IdleConn{std::move(stream), now});

@@ -9,6 +9,8 @@
 // socket.
 
 #include <array>
+#include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -25,8 +27,13 @@
 using clk = std::chrono::steady_clock;
 using namespace std::chrono_literals;
 
-// A lost echo reply must not hang the loop: each ping gets this long, after which the pending recv is cancelled.
+// A lost echo reply must not hang the loop: each ping gets this long, after which the pending recv is cancelled
+// (and has finished unwinding before the next ping starts: withCancellation waits for it, withTimeout would not).
 constexpr auto kPingTimeout = 1s;
+// Classic ping pacing: one echo request per interval, so a run does not hammer the target.
+constexpr auto kPingInterval = 1s;
+constexpr long kDefaultCount = 4;
+constexpr long kMaxCount = 1000;
 
 /**
  * @brief Send one Echo Request, wait for the matching Echo Reply, return
@@ -60,7 +67,7 @@ YarnBall::Task<long long> ping_one(Soccer::RawSocket &sock,
     }
 }
 
-YarnBall::Task<void> ping_loop(std::string target, int count) {
+YarnBall::Task<> ping_loop(std::string target, int count) {
     auto sock = Soccer::RawSocket::icmp(AF_INET);
     const auto dest = Soccer::SocketAddress::resolve(target, 0);
 
@@ -68,14 +75,16 @@ YarnBall::Task<void> ping_loop(std::string target, int count) {
     const auto identifier = static_cast<std::uint16_t>(::getpid() & 0xFFFFu);
     for (int i = 1; i <= count; ++i) {
         try {
-            const long long us = co_await YarnBall::withTimeout(
-                ping_one(sock, dest, identifier, static_cast<std::uint16_t>(i)), kPingTimeout);
+            const long long us = co_await YarnBall::withCancellation(
+                YarnBall::deadlineToken(kPingTimeout),
+                ping_one(sock, dest, identifier, static_cast<std::uint16_t>(i)));
             std::printf("seq=%d time=%.3f ms\n", i, static_cast<double>(us) / 1000.0);
-        } catch (const YarnBall::TimeoutException &) {
+        } catch (const YarnBall::CancelledException &) {
             std::printf("seq=%d timeout\n", i);
         } catch (const Soccer::SocketException &e) {
             std::cerr << "seq=" << i << " error: " << e.what() << "\n";
         }
+        if (i < count) co_await YarnBall::sleepFor(kPingInterval);
     }
     co_return;
 }
@@ -86,9 +95,19 @@ int main(int argc, char **argv) {
                   << "(run with sudo or CAP_NET_RAW)\n";
         return 1;
     }
-    const int count = (argc > 2) ? std::atoi(argv[2]) : 4;
+    long count = kDefaultCount;
+    if (argc > 2) {
+        char *end = nullptr;
+        errno = 0;
+        count = std::strtol(argv[2], &end, 10);
+        if (end == argv[2] || *end != '\0' || errno == ERANGE || count < 1) {
+            std::cerr << "invalid count: " << argv[2] << " (expected a positive integer)\n";
+            return 1;
+        }
+        count = std::min(count, kMaxCount);
+    }
     try {
-        YarnBall::syncWait(ping_loop(argv[1], count));
+        YarnBall::syncWait(ping_loop(argv[1], static_cast<int>(count)));
     } catch (const Soccer::SocketException &e) {
         std::cerr << "fatal: " << e.what() << "\n";
         if (e.errorCode() == 1 /* EPERM */) {

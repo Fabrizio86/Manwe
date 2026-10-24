@@ -218,9 +218,15 @@ namespace Soccer {
         co_return TlsStream(client_ctx, /*cfg=*/nullptr, adopted_fd);
     }
 
-    YarnBall::Task<TlsStream> TlsListener::accept() {
+    YarnBall::Task<TlsStream> TlsListener::accept(std::chrono::milliseconds handshakeTimeout) {
         PendingHandshake p = co_await this->acceptPending();
-        co_return co_await completeHandshake(std::move(p), std::chrono::seconds{10});
+        // Hand back the stream with its handshake still to run: the first handshake() / read /
+        // write drives it under handshakeTimeout, so a peer that connects and stalls costs the
+        // accept loop nothing.
+        ::tls *ctx = p.ctx;
+        p.ctx = nullptr;
+        const int fd = p.tcp.release();
+        co_return TlsStream(ctx, fd, handshakeTimeout);
     }
 
 }

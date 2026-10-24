@@ -59,11 +59,14 @@ YarnBall::Task<void> ws_echo_server(std::uint16_t port) {
     std::cout << "ws_echo_server listening on "
               << listener.localAddress().to_string() << "\n";
     // wsServe runs the accept loop and the opening handshake for us and applies the
-    // limits below: at most 1000 clients at once, a 10 s handshake, and (uncomment
+    // limits below: at most 1000 clients at once, a 10 s handshake, a 60 s idle timeout, and (uncomment
     // allowedOrigins) an Origin allow-list against cross-site WebSocket hijacking.
     Soccer::WsOptions options;
     options.maxConnections = 1000;
     options.handshakeTimeout = std::chrono::seconds{10};
+    // A client that stays connected but silent for a minute is dropped (the default is five), so idle sockets
+    // cannot hold the 1000 connection slots; clients that want to stay should ping.
+    options.idleTimeout = std::chrono::seconds{60};
     // options.allowedOrigins = {"https://app.example.com"};
     co_await Soccer::wsServe(std::move(listener), ws_echo_one, options);
 }

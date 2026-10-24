@@ -82,6 +82,11 @@ namespace Soccer {
          * @brief Construct from a raw kernel address (e.g. one returned by
          *        @c accept). @p len must be the address length the kernel
          *        provided.
+         *
+         * Never throws: a null @p src, a zero @p len, or a @p len larger than
+         * @c sockaddr_storage yields an EMPTY address (family @c AF_UNSPEC,
+         * @c length() == 0) rather than a truncated one. Check @c length() if the
+         * source is not the kernel.
          */
         SocketAddress(const sockaddr *src, socklen_t len) noexcept;
 
@@ -116,7 +121,9 @@ namespace Soccer {
 
         /**
          * @brief Human-readable representation, e.g. "127.0.0.1:8080" or
-         *        "[::1]:8080".
+         *        "[::1]:8080"; the path for an @c AF_UNIX address (a Linux
+         *        abstract name is shown with a leading '@'), and "<unknown>"
+         *        for any other family.
          */
         std::string to_string() const;
 

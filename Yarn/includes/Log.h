@@ -13,9 +13,15 @@
 // a socket, or wrap with their own writer.
 //
 // Hot path: a level check + early return when below the configured
-// minimum. Above the threshold, one formatted line + one sink call
-// under a mutex. Log emit is NOT a microsecond-budget operation; if
-// you log on the inner loop you are doing it wrong.
+// minimum. Above the threshold, one formatted line + one sink call.
+// Sink calls are serialised on a dedicated (recursive) mutex, so a sink
+// need not be thread-safe and may itself log. The line is fully formatted
+// before that mutex is taken, so the lock covers only the sink call
+// itself; the flip side is that a slow sink makes every other logging
+// thread wait for it (use a sink that hands lines to a queue if that
+// matters). Log emit is NOT a
+// microsecond-budget operation; if you log on the inner loop you are
+// doing it wrong.
 //
 
 #ifndef YARN_LOG_H
@@ -51,6 +57,10 @@ namespace YarnBall::log {
      * @brief One key/value pair. The value is pre-formatted into JSON
      *        at construction so emit() does not need to know the
      *        original type. Use the factory helpers below.
+     *
+     * @c formatted is spliced into the output line verbatim: it MUST be a
+     * valid JSON value. Building a Field by hand from untrusted text
+     * breaks (or forges) the log record; use @c str() for strings.
      */
     struct Field {
         std::string key;
@@ -59,7 +69,9 @@ namespace YarnBall::log {
 
     namespace detail {
         /**
-         * @brief JSON-escape @p s in place, surround in quotes, return.
+         * @brief JSON-escape @p s, surround in quotes, return. Control
+         *        characters and DEL are escaped; invalid UTF-8 sequences
+         *        are replaced by U+FFFD so the output is always valid UTF-8.
          */
         std::string jsonString(std::string_view s);
     }
@@ -111,6 +123,10 @@ namespace YarnBall::log {
     /**
      * @brief Replace the global sink. Default sink writes to @c stderr
      *        with a single fwrite per line. Idempotent; thread-safe.
+     *        Invocations of the sink are serialised (never concurrent) on a
+     *        recursive mutex that is held only for the call (not while the line
+     *        is formatted), and a sink may call back into @c emit on its own
+     *        thread. A slow sink therefore stalls the other logging threads.
      */
     void setSink(Sink s);
 

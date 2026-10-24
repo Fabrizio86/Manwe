@@ -28,6 +28,7 @@
 #ifndef EMBEDDED_SERIAL_PORT_H
 #define EMBEDDED_SERIAL_PORT_H
 
+#include <memory>
 #include <cstddef>
 #include <cstdint>
 #include <span>
@@ -36,6 +37,7 @@
 #include <utility>
 
 #include "Coroutines.h"
+#include "FdSlot.h"
 
 namespace Embedded {
 
@@ -44,6 +46,8 @@ namespace Embedded {
      * @brief Per-byte parity-checking mode.
      */
     enum class Parity { None, Even, Odd };
+    // With Even / Odd, parity is generated on TX and checked on RX; a received byte that fails the check is dropped
+    // (INPCK + IGNPAR), never delivered as data.
 
     /**
      * @enum StopBits
@@ -54,7 +58,8 @@ namespace Embedded {
     /**
      * @enum FlowControl
      * @brief Flow-control discipline. Hardware = RTS/CTS, Software =
-     *        XON/XOFF.
+     *        XON/XOFF. Hardware makes @c open throw where the platform
+     *        has no RTS/CTS support.
      */
     enum class FlowControl { None, Hardware, Software };
 
@@ -100,7 +105,22 @@ namespace Embedded {
          *        Defaults to 115200-8N1 no flow control. Throws
          *        @c SerialPortError if the device cannot be opened
          *        or the requested config is unsupported by the
-         *        kernel driver.
+         *        kernel driver (the settings are read back and compared,
+         *        since tcsetattr may succeed having applied only part of
+         *        them). The device is opened exclusively where the
+         *        platform allows (TIOCEXCL, best effort), and stale bytes
+         *        left in the driver's input and output queues are
+         *        discarded after configuration.
+         *
+         * Because of the exclusive open, a port closed an instant ago can
+         * still be busy until the last @c read / @c write in flight on it
+         * has left (see @ref close); @c open retries on EBUSY for a few
+         * milliseconds before giving up.
+         *
+         * A pseudo-terminal (a pty, e.g. in tests) has no UART behind it
+         * and always runs 8 bits, no parity, so on one the data bits and
+         * parity are not verified by the read-back; every other device is
+         * checked in full.
          */
         static SerialPort open(const std::string &path,
                                 const SerialConfig &cfg = {});
@@ -109,13 +129,13 @@ namespace Embedded {
         SerialPort &operator=(const SerialPort &) = delete;
 
         SerialPort(SerialPort &&other) noexcept
-            : descriptor(std::exchange(other.descriptor, -1)) {
+            : slot(std::move(other.slot)) {
         }
 
         SerialPort &operator=(SerialPort &&other) noexcept {
             if (this != &other) {
                 this->close();
-                this->descriptor = std::exchange(other.descriptor, -1);
+                this->slot = std::move(other.slot);
             }
             return *this;
         }
@@ -146,18 +166,29 @@ namespace Embedded {
         /**
          * @return Underlying fd, or -1 if closed.
          */
-        int fd() const noexcept { return this->descriptor; }
+        int fd() const noexcept { return this->slot ? this->slot->get() : -1; }
 
         /**
-         * @brief Close the port. Idempotent.
+         * @brief Close the port. Idempotent. A @c read / @c write parked on
+         *        it is woken and throws @c SerialPortError. The descriptor
+         *        is published as closed at once, but only released to the OS
+         *        when the last read / write in flight leaves, so a woken
+         *        call never touches a descriptor number that has been
+         *        reused. Safe to call from any thread.
          */
         void close() noexcept;
 
     private:
-        explicit SerialPort(int fd) noexcept : descriptor(fd) {
+        // Takes ownership of @p fd: closed again if the slot cannot be allocated.
+        explicit SerialPort(int fd) : slot(detail::FdSlot::adopt(fd)) {
         }
 
-        int descriptor = -1;
+        // The bodies of read / write. They take the shared slot by value, so the lazy task keeps it alive even if it
+        // first runs after the SerialPort has been moved from or destroyed.
+        static YarnBall::Task<std::size_t> readOn(std::shared_ptr<detail::FdSlot> slot, std::span<std::byte> buf);
+        static YarnBall::Task<std::size_t> writeOn(std::shared_ptr<detail::FdSlot> slot, std::span<const std::byte> data);
+
+        std::shared_ptr<detail::FdSlot> slot; // null once moved from
     };
 
 }

@@ -9,10 +9,11 @@
 //  - Text and binary messages
 //  - Automatic Ping/Pong
 //  - Graceful Close handshake
-//  - Single-frame messages only (continuation frames are rejected;
-//    add reassembly when a real use case demands it)
+//  - Fragmented messages (continuation frames) are reassembled, bounded by
+//    WsOptions::maxMessageBytes
 //  - No extensions (permessage-deflate etc.)
-//  - No subprotocols
+//  - Subprotocols: offered by the client (WsOptions::subprotocols), chosen by the
+//    server's handshake hook (WsOptions::onHandshake)
 //
 // API: one verb per operation. Receive returns the next message;
 // internal control frames (Ping/Close) are handled transparently so
@@ -37,6 +38,7 @@
 #include <vector>
 
 #include "Coroutines.h"
+#include "HttpClient.h" // HttpHeader
 #include "TcpListener.h"
 #include "TcpStream.h"
 
@@ -80,9 +82,60 @@ namespace Soccer {
     };
 
     /**
+     * @struct WsHandshakeInfo
+     * @brief What the opening handshake carried. On a server connection it is the
+     *        upgrade request: its target, every header (cookies, Authorization, ...)
+     *        and the subprotocols the client offered. On a client connection it is
+     *        the requested target plus the server's 101 response headers. Handed to
+     *        @ref WsOptions::onHandshake before the 101 goes out, and kept on the
+     *        connection (@ref WsConnection::handshake) for the handler.
+     */
+    struct WsHandshakeInfo {
+        /// Request target of the upgrade (path and query). On a server it is always
+        /// origin-form: an absolute-form target is reduced to its path before the hook sees it.
+        std::string path;
+        /// Every header of the request (server) or of the 101 response (client), in wire order.
+        std::vector<HttpHeader> headers;
+        /// Server: the Sec-WebSocket-Protocol tokens the client offered, in order.
+        std::vector<std::string> offeredSubprotocols;
+        /// The subprotocol both sides settled on; empty when none was negotiated.
+        std::string subprotocol;
+
+        /// Case-insensitive lookup of the first header named @p name; empty if absent.
+        std::string header(std::string_view name) const {
+            for (const auto &h : this->headers) {
+                if (detail::iequalsAscii(h.name, name)) return h.value;
+            }
+            return {};
+        }
+    };
+
+    /**
+     * @struct WsHandshakeDecision
+     * @brief Answer of @ref WsOptions::onHandshake: accept (optionally choosing a
+     *        subprotocol) or refuse with an HTTP status.
+     */
+    struct WsHandshakeDecision {
+        /// 0 accepts the upgrade; a value in 400..599 refuses it with that status
+        /// (e.g. 401 or 403) and no body. Anything else counts as 403.
+        int status{0};
+        /// Accepting: the subprotocol to answer with. Must be one of
+        /// @ref WsHandshakeInfo::offeredSubprotocols, or empty for none.
+        std::string subprotocol;
+
+        static WsHandshakeDecision accept(std::string subprotocol = {}) {
+            return WsHandshakeDecision{0, std::move(subprotocol)};
+        }
+
+        static WsHandshakeDecision reject(int status = 403) {
+            return WsHandshakeDecision{status, {}};
+        }
+    };
+
+    /**
      * @struct WsOptions
      * @brief Limits and policy for a WebSocket endpoint. Durations and sizes
-     *        treat zero as "unlimited".
+     *        treat zero as "unlimited" (an explicit opt-out; the defaults are finite).
      */
     struct WsOptions {
         /// Client: time allowed to resolve the host and establish the TCP connection.
@@ -93,9 +146,11 @@ namespace Soccer {
         /// message), time allowed for the rest of it. Cuts off a peer that sends
         /// half a frame and stalls.
         std::chrono::milliseconds frameTimeout{30000};
-        /// Time allowed between messages with nothing arriving. Off by default, as a
-        /// quiet connection is normal for WebSocket; set it (and have peers ping) to reap dead ones.
-        std::chrono::milliseconds idleTimeout{0};
+        /// Time allowed between messages with nothing arriving; a connection quiet for
+        /// longer is dropped, so peers that stay connected should ping. Zero turns the
+        /// limit off (a quiet connection is normal for WebSocket, but a dead one is then
+        /// never reaped).
+        std::chrono::milliseconds idleTimeout{300000};
         /// Time allowed for one frame write to drain (a peer that stops reading).
         std::chrono::milliseconds writeTimeout{30000};
         /// Handshake request/response size, headers included.
@@ -105,7 +160,12 @@ namespace Soccer {
 
         /// Server (@ref wsServe): connections served at once, handshake included; a
         /// connection accepted beyond it is closed at once. Zero means unlimited.
-        std::size_t maxConnections{0};
+        std::size_t maxConnections{1024};
+
+        /// Pings answered per second; further ones in the same second get no Pong (RFC
+        /// 6455 5.5.2 allows that), so a ping flood costs the peer more than it costs us.
+        /// Zero answers every Ping.
+        std::size_t maxPingsPerSecond{50};
 
         /// Server: Origin header values (exact, case-insensitive) a browser may connect from,
         /// e.g. "https://app.example.com". Empty means no allow-list.
@@ -116,6 +176,24 @@ namespace Soccer {
         /// Server: whether a handshake with no Origin header (non-browser clients) is accepted
         /// when an allow-list or @ref originCheck is configured.
         bool allowMissingOrigin{true};
+        /// Server: strict Origin mode. A handshake carrying an Origin header is refused
+        /// unless @ref allowedOrigins lists it or @ref originCheck accepts it -- with
+        /// neither configured, every browser Origin is refused (only non-browser clients
+        /// get in). Off by default for compatibility: with no allow-list a server accepts
+        /// any Origin, which lets a page on another site open a socket that carries the
+        /// visitor's cookies (cross-site WebSocket hijacking). Turn it on, or set an
+        /// allow-list, for any endpoint that authenticates by cookie.
+        bool strictOrigin{false};
+        /// Server: called with the parsed upgrade request after the Origin policy has
+        /// passed and before the 101 is sent. It can refuse (401, 403, ...) and choose
+        /// the subprotocol, from the path, cookies, Authorization header and so on.
+        /// An exception from it refuses the upgrade with 500. Unset: accept.
+        std::function<WsHandshakeDecision(const WsHandshakeInfo &)> onHandshake;
+
+        /// Client: subprotocols to offer in Sec-WebSocket-Protocol, in preference order.
+        /// A 101 that names a subprotocol not in this list (or any when it is empty) is
+        /// rejected, as is one that carries Sec-WebSocket-Extensions (none are offered).
+        std::vector<std::string> subprotocols;
     };
 
     /**
@@ -150,7 +228,8 @@ namespace Soccer {
          * per RFC 6455 section 4.2.2.
          *
          * A refused handshake (bad request, wrong version, Origin not
-         * allowed by @p options) is answered with a bodyless 400 / 426 / 403 on a
+         * allowed by @p options, refused by @ref WsOptions::onHandshake) is
+         * answered with a bodyless 400 / 426 / 403 / hook status on a
          * best-effort basis before the exception is thrown.
          *
          * @throws WsException on malformed request, missing headers,
@@ -257,6 +336,14 @@ namespace Soccer {
         bool isOpen() const noexcept;
 
         /**
+         * @brief What the opening handshake carried: the upgrade request (target,
+         *        headers, offered and chosen subprotocol) on a server connection, the
+         *        101 response headers on a client one. Valid while the connection
+         *        exists; empty on a moved-from handle.
+         */
+        const WsHandshakeInfo &handshake() const noexcept;
+
+        /**
          * @brief Heap state of a connection (defined in WebSocket.cpp). It lives
          *        on the heap, shared with every operation in flight, so moving
          *        the move-only handle never invalidates a running @c receive or
@@ -289,6 +376,9 @@ namespace Soccer {
      *  - @c handshakeTimeout cuts off a peer that never completes the upgrade.
      *  - @c allowedOrigins / @c originCheck / @c allowMissingOrigin refuse a
      *    browser Origin the server does not serve (403).
+     *  - @c strictOrigin and @c onHandshake add the stricter Origin mode and the
+     *    per-request hook (path / cookies / Authorization, 401 / 403, subprotocol);
+     *    the handler can read the same request via @ref WsConnection::handshake.
      *  - the remaining fields (frame / idle / write timeouts, size caps) become the
      *    connection's own limits.
      *

@@ -5,9 +5,17 @@
 #include "SocketAddress.h"
 #include "SocketException.h"
 
+#include <algorithm>
+#include <cctype>
 #include <cstring>
 
 #include "PlatformNet.h"
+
+#ifndef _WIN32
+#include <sys/un.h>
+#else
+#include <afunix.h>
+#endif
 
 namespace Soccer {
 
@@ -35,6 +43,31 @@ namespace Soccer {
         co_return SocketAddress::resolveAll(host, port);
     }
 
+    namespace {
+        /// Whether a failed AI_ADDRCONFIG lookup of @p host (error @p rc) is worth repeating without it.
+        bool addrConfigMayHaveHiddenIt(const std::string &host, int rc) {
+            if (rc != EAI_NONAME && rc != EAI_FAMILY
+#ifdef EAI_ADDRFAMILY
+                && rc != EAI_ADDRFAMILY
+#endif
+#ifdef EAI_NODATA
+                && rc != EAI_NODATA
+#endif
+            ) {
+                return false;
+            }
+            if (host.empty()) return true; // null node: wildcard / loopback
+            std::string h;
+            for (char c : host) h.push_back(static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+            if (!h.empty() && h.back() == '.') h.pop_back();
+            if (h == "localhost" || h == "ip6-localhost" || h == "ip6-loopback") return true;
+            if (h.size() > 10 && h.compare(h.size() - 10, 10, ".localhost") == 0) return true;
+            in6_addr a6{};
+            in_addr a4{};
+            return ::inet_pton(AF_INET, h.c_str(), &a4) == 1 || ::inet_pton(AF_INET6, h.c_str(), &a6) == 1;
+        }
+    }
+
     std::vector<SocketAddress> SocketAddress::resolveAll(const std::string &host,
                                                            std::uint16_t port) {
         // getaddrinfo on Windows requires WSAStartup; idempotent + cheap.
@@ -48,10 +81,13 @@ namespace Soccer {
         const std::string port_str = std::to_string(port);
         addrinfo *results = nullptr;
         int rc = ::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &results);
-        if (rc != 0 || results == nullptr) {
+        if ((rc != 0 || results == nullptr) && addrConfigMayHaveHiddenIt(host, rc)) {
             // AI_ADDRCONFIG hides every family the host has no non-loopback
             // address for, which makes even "localhost" unresolvable on a machine
-            // (or container) whose only interface is the loopback. Retry without it.
+            // (or container) whose only interface is the loopback. Retry without it --
+            // but only for the names it can hide (a loopback name or an address
+            // literal) and only for the errors it causes: any other failure, a name
+            // that simply does not exist, would just pay for a second full lookup.
             if (results) { ::freeaddrinfo(results); results = nullptr; }
             hints.ai_flags = 0;
             rc = ::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &results);
@@ -110,6 +146,19 @@ namespace Soccer {
             const auto *in6 = reinterpret_cast<const sockaddr_in6 *>(sa);
             ::inet_ntop(AF_INET6, &in6->sin6_addr, buf, sizeof(buf));
             return std::string("[") + buf + "]:" + std::to_string(this->port());
+        }
+        if (sa->sa_family == AF_UNIX) {
+            const auto *un = reinterpret_cast<const sockaddr_un *>(sa);
+            const std::size_t off = offsetof(sockaddr_un, sun_path);
+            const std::size_t have = static_cast<std::size_t>(this->len) > off
+                                         ? static_cast<std::size_t>(this->len) - off
+                                         : 0;
+            const std::size_t room = std::min<std::size_t>(have, sizeof(un->sun_path));
+            if (room == 0) return "";                              // unnamed (e.g. an unbound client)
+            if (un->sun_path[0] == '\0') {                         // Linux abstract namespace
+                return "@" + std::string(un->sun_path + 1, room - 1);
+            }
+            return std::string(un->sun_path, ::strnlen(un->sun_path, room));
         }
         return "<unknown>";
     }

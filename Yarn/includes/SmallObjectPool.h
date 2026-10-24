@@ -74,9 +74,16 @@ namespace YarnBall::detail {
                 // The local list is empty, so this thread may not have a flush-on-exit hook yet (blocks also arrive here
                 // from threads that only ever free). After the hook has run, bypass the thread cache entirely.
                 if (tlsDead) {
-                    std::lock_guard<std::mutex> lk(globalMu);
-                    node->next = globalHead;
-                    globalHead = node;
+                    {
+                        std::lock_guard<std::mutex> lk(globalMu);
+                        if (globalCount < kMaxGlobal) {
+                            node->next = globalHead;
+                            globalHead = node;
+                            ++globalCount;
+                            return;
+                        }
+                    }
+                    std::free(node);
                     return;
                 }
                 armThreadExit();
@@ -113,6 +120,23 @@ namespace YarnBall::detail {
         static constexpr std::size_t kHighWaterMark = 2 * kBatchSize;
 
         /**
+         * @brief Cap on blocks parked in the shared pool. Blocks arriving past it are returned to the allocator, so a
+         *        burst of allocations does not pin its peak footprint for the life of the process.
+         */
+        static constexpr std::size_t kMaxGlobal = 8192;
+
+        /**
+         * @brief Free a detached chain of blocks back to the allocator.
+         */
+        static void freeChain(Node *head) noexcept {
+            while (head) {
+                Node *next = head->next;
+                std::free(head);
+                head = next;
+            }
+        }
+
+        /**
          * @brief Move up to @c kBatchSize nodes from the shared pool into
          *        the local cache. Called when the local cache is empty.
          */
@@ -123,6 +147,7 @@ namespace YarnBall::detail {
             for (std::size_t i = 0; i < kBatchSize && globalHead != nullptr; ++i) {
                 Node *n = globalHead;
                 globalHead = n->next;
+                --globalCount;
                 n->next = tlsHead;
                 tlsHead = n;
                 ++tlsCount;
@@ -145,9 +170,19 @@ namespace YarnBall::detail {
             tlsHead = batchTail->next;
             tlsCount -= kBatchSize;
 
-            std::lock_guard<std::mutex> lk(globalMu);
-            batchTail->next = globalHead;
-            globalHead = batchHead;
+            {
+                std::lock_guard<std::mutex> lk(globalMu);
+                if (globalCount + kBatchSize <= kMaxGlobal) {
+                    batchTail->next = globalHead;
+                    globalHead = batchHead;
+                    globalCount += kBatchSize;
+                    return;
+                }
+            }
+            // Shared pool is full: give the surplus back to the allocator. Cut the chain first: the tail still links
+            // to the blocks that stay in the local cache.
+            batchTail->next = nullptr;
+            freeChain(batchHead);
         }
 
         /**
@@ -157,14 +192,22 @@ namespace YarnBall::detail {
          */
         static void flushLocal() noexcept {
             Node *h = tlsHead;
+            const std::size_t count = tlsCount;
             tlsHead = nullptr;
             tlsCount = 0;
             if (!h) return;
             Node *t = h;
             while (t->next) t = t->next;
-            std::lock_guard<std::mutex> lk(globalMu);
-            t->next = globalHead;
-            globalHead = h;
+            {
+                std::lock_guard<std::mutex> lk(globalMu);
+                if (globalCount + count <= kMaxGlobal) {
+                    t->next = globalHead;
+                    globalHead = h;
+                    globalCount += count;
+                    return;
+                }
+            }
+            freeChain(h);
         }
 
         struct ThreadExitFlush {
@@ -198,6 +241,7 @@ namespace YarnBall::detail {
          *        batch transfers, not per allocation.
          */
         static Node *globalHead;
+        static std::size_t globalCount;
         static std::mutex globalMu;
     };
 
@@ -214,6 +258,9 @@ namespace YarnBall::detail {
     template<std::size_t SlotSize>
     typename SmallObjectPool<SlotSize>::Node *
         SmallObjectPool<SlotSize>::globalHead = nullptr;
+
+    template<std::size_t SlotSize>
+    std::size_t SmallObjectPool<SlotSize>::globalCount = 0;
 
     template<std::size_t SlotSize>
     std::mutex SmallObjectPool<SlotSize>::globalMu;

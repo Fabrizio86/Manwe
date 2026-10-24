@@ -6,10 +6,14 @@
 #define YARN_YARN_HPP
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdint>
 #include <exception>
 #include <memory>
 #include <mutex>
 #include <random>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <vector>
@@ -41,6 +45,19 @@ namespace YarnBall {
      *  - Otherwise the task goes through the injection queue. One parked
      *    worker is woken if any; if none are parked and there is sustained
      *    backlog, a new temp fiber is spawned (up to MaxThreadCount).
+     *  - A small stall detector (a thread started on the first submission, asleep whenever the queues are empty) also
+     *    adds a temp fiber when work is queued, no worker is parked and no task has finished for a few tens of
+     *    milliseconds. That is what keeps a pool whose workers are all blocked (a task waiting, e.g. in
+     *    @c Waitable::wait, for a child sitting in its own queue) from deadlocking while temp slots remain.
+     *    Growth is one worker per detection period, bounded by MaxThreadCount, and temp workers retire when idle.
+     *
+     * API notes (changes of this revision):
+     *  - @c Workload and @c QueueSize are now @c enum class: spell the enumerators @c Workload::Busy,
+     *    @c QueueSize::Huge, ... and convert explicitly (@c static_cast) where a number is needed.
+     *  - @c Yarn::run(F&&) (the plain-callable overload) now reports an exception that escapes the callable through
+     *    @c setUnhandledExceptionHandler (or the logger) like a detached task, instead of swallowing it.
+     *  - A callable discarded at shutdown without running is not reported (it raises @c detail::PoolShutdownError,
+     *    which the reporting path ignores).
      *
      * Ownership:
      *  - Tasks live in the executor as raw @c ITask* pointers. The dequeueing
@@ -56,6 +73,11 @@ namespace YarnBall {
         Yarn &operator=(const Yarn &) = delete;
         Yarn &operator=(Yarn &&) = delete;
 
+        /**
+         * @brief Stops and joins the workers. Tasks that never ran are failed through @c ITask::exception and freed.
+         *        Safe when reached from a worker thread (the singleton is destroyed by exit()): that worker is not
+         *        joined and its state is kept alive.
+         */
         ~Yarn();
 
         /**
@@ -64,8 +86,35 @@ namespace YarnBall {
         static Yarn *instance();
 
         /**
-         * @brief Submit an owned task. Ownership is transferred to the pool.
-         *        Null tasks are silently ignored.
+         * @brief Wait until the pool has nothing left to run: every worker parked, the injection queue and every
+         *        worker's inbox and local deque empty, and that state held across a short settle window (so a hand-off
+         *        between queues is not mistaken for idleness). Returns @c true once idle, @c false on timeout.
+         *
+         * Meant for orderly shutdown: after the caller has seen its own work finish (a joined task, a closed server),
+         * call this before leaving @c main so the tails of detached runner frames -- which finish on a worker after
+         * the waiter they released has already resumed -- are done before static destruction tears the pool down.
+         * It cannot see coroutines parked on the Reactor (sockets, timers) or on locks: those are not runnable work.
+         * Not for use from a pool worker (it would wait for itself).
+         */
+        bool awaitQuiescence(std::chrono::milliseconds timeout = std::chrono::seconds(5));
+
+        /**
+         * @brief Test hook: make the calling thread's next submissions fail. The first @p skip calls to @c run proceed
+         *        normally, then the following @p count calls throw @c std::bad_alloc before touching the task (so they exercise the
+         *        "run threw, task destroyed" path of the ownership rule above). Pass @c 0, @c 0 to clear.
+         *        Costs one thread-local load per submission when unused.
+         */
+        static void failSubmissionsForTest(int skip, int count) noexcept;
+
+        /**
+         * @brief Submit an owned task. Null tasks are silently ignored.
+         *
+         * Ownership rule: after @c run returns normally the pool owns the task and it is either queued or has already
+         * run inline on the caller (the saturated-pool back-pressure fallback). If @c run throws, the task was never
+         * submitted and is destroyed by this call, exactly once and without being run -- for a coSpawn'd coroutine
+         * (@c CoroutineITask owning its frame) that destroys the frame, so a failed submission leaks nothing. The
+         * hand-off itself (@c dispatch) cannot fail: allocation or thread-creation errors past the point of no return
+         * degrade to an inline run rather than being reported.
          */
         void run(uITask task);
 
@@ -76,6 +125,17 @@ namespace YarnBall {
          *        for callers that retain a reference (e.g. Waitable).
          */
         void run(sITask task);
+
+        /**
+         * @brief Submit an owned task through a pointer to a concrete task type. A @c unique_ptr<Derived> converts to
+         *        both @c uITask and @c sITask, which would make the plain overloads ambiguous; this forwards to the
+         *        @c uITask one.
+         */
+        template<typename T>
+            requires(std::is_base_of_v<ITask, T> && !std::is_same_v<ITask, T>)
+        void run(std::unique_ptr<T> task) {
+            this->run(uITask{std::move(task)});
+        }
 
         /**
          * @brief Submit an arbitrary invocable. Allocates a small pooled
@@ -89,16 +149,22 @@ namespace YarnBall {
          *  - @c F must be invocable as @c f().
          *  - @c F is move-stored into the wrapper, so move-only callables
          *    (lambdas with @c unique_ptr captures, etc.) are fine.
-         *  - Exceptions thrown by @p fn are swallowed silently
-         *    (no @c ITask::exception equivalent). Wrap the body in
+         *  - Exceptions thrown by @p fn are reported like those of a detached
+         *    task (see @c setUnhandledExceptionHandler); wrap the body in
          *    @c try/catch if you need failure handling.
+         *  - Not viable for arguments convertible to @c uITask / @c sITask:
+         *    those go to the task overloads.
          */
         template<typename F>
+            requires(!std::is_convertible_v<F &&, uITask> && !std::is_convertible_v<F &&, sITask>)
         void run(F &&fn);
 
         /**
-         * @brief Replace the active scheduler. Thread-safe with respect to
-         *        concurrent @c Run() calls.
+         * @brief Replace the stored scheduler object. Thread-safe.
+         *
+         * Note: this has NO effect on dispatch. Task placement is fixed (the work-stealing scheme described above); the
+         * stored scheduler is not consulted when tasks are submitted or run. The accessor pair is kept for API
+         * compatibility only.
          */
         void switchScheduler(sIScheduler scheduler);
 
@@ -172,16 +238,17 @@ namespace YarnBall {
         /**
          * @brief Dispatch hot path for an already-owning raw task. Tries
          *        in-worker local push first; falls back to injection + grow.
-         *        Takes ownership of @c task.
+         *        Takes ownership of @c task unconditionally: it is queued or
+         *        run inline, never leaked, and nothing here throws.
          */
-        void dispatch(TaskPtr task);
+        void dispatch(TaskPtr task) noexcept;
 
         /**
          * @brief Push to the injection queue and wake / grow as appropriate.
          *        Takes ownership of @c task on success; on hard exhaustion
          *        the task is run inline on the calling thread.
          */
-        void enqueueInjection(TaskPtr task);
+        void enqueueInjection(TaskPtr task) noexcept;
 
         /**
          * @brief Spawn a temp fiber if there is a free slot and the backlog
@@ -191,11 +258,42 @@ namespace YarnBall {
         int maybeGrowLocked();
 
         /**
-         * @brief Walk fibers and notify one that is currently parked.
+         * @brief Walk fibers and notify one that is currently parked and not already claimed by another waker (so
+         *        concurrent wakes fan out over distinct fibers). Also makes sure the stall detector is armed.
          *        Reads the lock-free snapshot, never touches @c cmu.
          * @return @c true if a parked worker was found and woken.
          */
         bool wakeOneParked();
+
+        /**
+         * @brief Make sure the stall detector thread is running and watching. Cheap (one atomic load) when it already is.
+         */
+        void armWatchdog() noexcept;
+
+        /**
+         * @brief Stop and join the stall detector. Idempotent.
+         */
+        void stopWatchdog() noexcept;
+
+        /**
+         * @brief Stall detector thread body.
+         */
+        void watchdogLoop();
+
+        /**
+         * @brief @c true when the injection queue or any worker's inbox / deque holds a task.
+         */
+        bool hasOutstandingWork();
+
+        /**
+         * @brief Total tasks finished by the live workers (progress signal).
+         */
+        std::uint64_t completedTotal();
+
+        /**
+         * @brief The pool looks stalled (work queued, nothing completing): poke a sleeping worker or add one.
+         */
+        void resolveStall();
 
         /**
          * @brief Random-peer steal hook handed to each fiber. Visits up to
@@ -245,6 +343,13 @@ namespace YarnBall {
         }
 
     private:
+
+        /**
+         * @brief Stop and join every worker (live and retired), then fail and free all undelivered tasks. Shared by the
+         *        destructor and by constructor failure unwinding. When called from a worker thread (exit() inside a
+         *        task) that worker is left running and its Fiber is intentionally leaked.
+         */
+        void shutdownWorkers();
 
         /**
          * @brief Reap retired fibers (join their threads, drop the sFiber).
@@ -368,9 +473,27 @@ namespace YarnBall {
          */
         std::mutex schedMu;
 
+        /**
+         * @brief Set (under @c cmu) when shutdown begins; no worker may be added after it.
+         */
+        bool shuttingDown = false;
+
+        /**
+         * @brief Stall detector state. @c wdMu guards @c wdStop and the thread handle; @c wdArmed is true while the
+         *        detector is ticking (set by submitters, cleared by the detector when the queues are empty).
+         */
+        std::mutex wdMu;
+        std::condition_variable wdCv;
+        std::thread wdThread;
+        bool wdStop = false;
+        std::atomic<bool> wdArmed{false};
+
     };
 
     namespace detail {
+
+        /// Defined in Yarn.cpp; declared with the detached-task machinery in Coroutines.h.
+        void reportDetachedException(std::exception_ptr e) noexcept;
 
         /**
          * @class CallableITask
@@ -394,11 +517,11 @@ namespace YarnBall {
             explicit CallableITask(F &&fn) : f(std::move(fn)) {}
             explicit CallableITask(const F &fn) : f(fn) {}
 
-            void run() override {
-                try { this->f(); } catch (...) {}
-            }
+            void run() override { this->f(); }
 
-            void exception(std::exception_ptr) override {}
+            void exception(std::exception_ptr e) override {
+                reportDetachedException(std::move(e));
+            }
 
             static void *operator new(std::size_t) {
                 return ::YarnBall::detail::poolAlloc<CallableITask>();
@@ -415,6 +538,7 @@ namespace YarnBall {
     } // namespace detail
 
     template<typename F>
+        requires(!std::is_convertible_v<F &&, uITask> && !std::is_convertible_v<F &&, sITask>)
     inline void Yarn::run(F &&fn) {
         using Wrapper = detail::CallableITask<std::decay_t<F>>;
         // Construct the wrapper through our pool-backed operator new. The

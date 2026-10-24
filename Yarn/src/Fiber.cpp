@@ -6,8 +6,11 @@
 #include "ITask.hpp"
 #include "Yarn.hpp"
 
+#include <cassert>
 #include <chrono>
+#include <cstdlib>
 #include <exception>
+#include <stdexcept>
 #include <utility>
 
 #ifdef _WIN32
@@ -18,29 +21,48 @@
  *        via GetNumaHighestNodeNumber / GetNumaProcessorNodeEx and call
  *        SetThreadAffinityMask. Kept as a no-op for now.
  */
-static void SetNumaAffinity() {
+static void SetNumaAffinity(YarnBall::FiberId) {
 }
 
 #elif defined(__linux__)
-    #include <numa.h>
     #include <sched.h>
     #include <pthread.h>
-    #include <unistd.h>
 
 /**
- * @brief Linux affinity: pin the current thread to the CPU it currently
- *        happens to be running on. Keeps the worker local to its initial
- *        NUMA node without requiring an explicit policy.
+ * @brief Whether @c YARN_PIN_WORKERS=1 asked for hard pinning. Read once (the first Fiber is built while the pool is
+ *        constructed, before any worker exists), so later spawns never call getenv concurrently with a user's setenv.
  */
-static void SetNumaAffinity() {
-    int n = static_cast<int>(sysconf(_SC_NPROCESSORS_ONLN));
-    if (n <= 0) return;
-    int cpu = sched_getcpu();
-    if (cpu < 0) cpu = 0;
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(cpu % n, &cpuset);
-    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+static bool pinWorkersEnabled() {
+    static const bool enabled = [] {
+        const char *opt = std::getenv("YARN_PIN_WORKERS");
+        return opt && opt[0] == '1';
+    }();
+    return enabled;
+}
+
+/**
+ * @brief Linux affinity, opt-in (@c YARN_PIN_WORKERS=1): pin worker @p id to the (@p id mod N)-th CPU of the process's
+ *        allowed set (cpuset / cgroup / taskset), so the workers spread over the CPUs instead of piling onto whichever
+ *        one each happened to start on. Off by default because a hard single-CPU pin can never migrate off a busy core.
+ */
+static void SetNumaAffinity(YarnBall::FiberId id) {
+    if (!pinWorkersEnabled()) return;
+    cpu_set_t allowed;
+    CPU_ZERO(&allowed);
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0) return;
+    const int count = CPU_COUNT(&allowed);
+    if (count <= 0) return;
+    int want = static_cast<int>(id % static_cast<unsigned>(count));
+    int cpu = -1;
+    for (int i = 0; i < CPU_SETSIZE; ++i) {
+        if (!CPU_ISSET(i, &allowed)) continue;
+        if (want-- == 0) { cpu = i; break; }
+    }
+    if (cpu < 0) return;
+    cpu_set_t one;
+    CPU_ZERO(&one);
+    CPU_SET(cpu, &one);
+    pthread_setaffinity_np(pthread_self(), sizeof(one), &one);
 }
 
 #elif defined(__APPLE__)
@@ -54,7 +76,7 @@ static void SetNumaAffinity() {
  *        scheduler tries to keep them on the same L2 group. All Yarn workers
  *        share affinity tag 1 to encourage cache locality for stealing.
  */
-static void SetNumaAffinity() {
+static void SetNumaAffinity(YarnBall::FiberId) {
     thread_t mach_thread = pthread_mach_thread_np(pthread_self());
     thread_affinity_policy_data_t policy = {1};
     thread_policy_set(mach_thread,
@@ -67,7 +89,7 @@ static void SetNumaAffinity() {
 /**
  * @brief No-op fallback for unrecognised platforms.
  */
-static void SetNumaAffinity() {}
+static void SetNumaAffinity(YarnBall::FiberId) {}
 #endif
 
 
@@ -99,14 +121,16 @@ namespace YarnBall {
      */
     static constexpr std::size_t kInboxCapacity = 32;
 
-    /**
-     * @brief Max number of inbox entries drained per process-loop pass.
-     *        Bounded so a single dispatch loop iteration can't hog the
-     *        worker against its other obligations (deque, steal, park).
-     */
-    static constexpr int kInboxDrainPerLoop = 1;
-
     thread_local Fiber *tls_currentFiber = nullptr;
+
+    void detail::discardTask(TaskPtr task) noexcept {
+        if (!task) return;
+        try {
+            task->exception(std::make_exception_ptr(PoolShutdownError()));
+        } catch (...) {
+        }
+        delete task;
+    }
 
     Fiber::Fiber(FiberId id,
                  size_t dequeCapacity,
@@ -116,17 +140,25 @@ namespace YarnBall {
                  PushPending pushPending,
                  TryStealFromPeers tryStealFromPeers,
                  WakeOneIdle wakeOneIdle,
-                 bool temp)
+                 bool temp,
+                 AnyPeerWork anyPeerWork,
+                 Yarn *owner)
         : temp(temp),
           signalDone(std::move(signalDone)),
           getFromPending(std::move(getFromPending)),
           anyPendingTasks(std::move(anyPendingTasks)),
           pushPending(std::move(pushPending)),
           tryStealFromPeers(std::move(tryStealFromPeers)),
+          anyPeerWork(std::move(anyPeerWork)),
           wakeOneIdle(std::move(wakeOneIdle)),
+          owner(owner),
+          inbox(std::make_unique<MPMCQueue<TaskPtr>>(kInboxCapacity)),
           fiberId(id),
-          deque(std::make_unique<Deque>(dequeCapacity)),
-          inbox(std::make_unique<MPMCQueue<TaskPtr>>(kInboxCapacity)) {
+          deque(std::make_unique<Deque>(dequeCapacity)) {
+        // Resolve the pinning option on the constructing thread (see pinWorkersEnabled) before the worker starts.
+#ifdef __linux__
+        (void) pinWorkersEnabled();
+#endif
         this->thread = std::thread(&Fiber::process, this);
     }
 
@@ -134,37 +166,36 @@ namespace YarnBall {
         this->stop();
         if (this->thread.joinable()) {
             if (this->thread.get_id() == std::this_thread::get_id()) {
-                // Defensive only: Yarn arranges destruction off-worker via the
-                // graveyard / reaper, so this branch should not be reachable.
+                // Reachable: a worker that drops the last reference to its own Fiber (its thread-local snapshot cache,
+                // released at the end of process()) destroys it on its own thread. A join would self-deadlock, so
+                // detach; process() touches no member after releasing the cache, so the thread can finish unharmed.
                 this->thread.detach();
             } else {
                 this->thread.join();
             }
         }
 
-        // Reclaim anything still in the inbox. Producers may have
-        // squeezed a push in between this fiber's drainToPending and
-        // signalDone; forward those tasks to pending if we still have
-        // the callback (drained tasks then route to a peer), else
-        // delete to avoid a leak.
+        // The worker is gone (or past its last member access), so whatever is left in the inbox and the local deque
+        // was never run. Producers can squeeze a push into the inbox after the retirement drain, and a stopped worker
+        // leaves its deque as is. Forward the tasks if the scheduler is still alive; otherwise (Yarn::~Yarn dropped
+        // pushPending) fail them through ITask::exception so waiters wake up, and delete.
+        auto reclaim = [this](TaskPtr t) {
+            if (this->pushPending) this->pushPending(t);
+            else detail::discardTask(t);
+        };
         if (this->inbox) {
             TaskPtr stranded = nullptr;
-            while (this->inbox->dequeue(stranded)) {
-                if (this->pushPending) {
-                    this->pushPending(stranded);
-                } else {
-                    delete stranded;
-                }
-            }
+            while (this->inbox->dequeue(stranded)) reclaim(stranded);
         }
-
-        // Any tasks still sitting in the local deque at hard shutdown leak
-        // by design: Yarn::~Yarn drains the injection queue first, so the
-        // only way to land here with non-empty local state is mid-shutdown
-        // where running user code is unsafe.
+        if (this->deque) {
+            TaskPtr leftover = nullptr;
+            while (this->deque->pop(leftover)) reclaim(leftover);
+        }
     }
 
     bool Fiber::seed(TaskPtr task) {
+        // Single-producer deque: only the owning worker may push.
+        assert(tls_currentFiber == this);
         if (!task) return false;
         if (!this->running.load(std::memory_order_acquire)) return false;
         if (!this->deque->push(task)) return false;
@@ -177,7 +208,7 @@ namespace YarnBall {
         return true;
     }
 
-    bool Fiber::tryPushInbox(TaskPtr task) noexcept {
+    bool Fiber::tryPushInbox(TaskPtr task) {
         if (!task) return false;
         if (!this->running.load(std::memory_order_acquire)) return false;
         if (!this->inbox->enqueue(task)) {
@@ -196,7 +227,7 @@ namespace YarnBall {
         // Store-load handshake with park(): either we see parked == true, or park()'s re-check sees our enqueue.
         std::atomic_thread_fence(std::memory_order_seq_cst);
         if (this->parked.load(std::memory_order_acquire)) {
-            this->parkSignal.notify_one();
+            this->wakeParked(false);
         } else if (this->wakeOneIdle) {
             // Target is busy: let an idle peer know it can steal from the inbox.
             this->wakeOneIdle();
@@ -220,12 +251,29 @@ namespace YarnBall {
 
     void Fiber::stop() {
         this->running.store(false, std::memory_order_release);
-        // Bump the park signal and wake every waiter. atomic::wait on the
-        // futex checks the value at suspension time, so even if a fiber is
-        // about to park it will observe the bumped value and skip the
-        // wait. No mutex required.
+        // Bump the park signal and wake every waiter. A waiter checks the
+        // value at suspension time, so even if the fiber is about to park it
+        // observes the bump and skips the wait.
         this->parkSignal.fetch_add(1, std::memory_order_release);
-        this->parkSignal.notify_all();
+        this->wakeParked(true);
+    }
+
+    void Fiber::wakeParked(bool all) noexcept {
+        if (this->temp) {
+            // Temp fibers sleep on tempCv. Passing through tempMu orders the caller's parkSignal bump before the
+            // sleeper's predicate check or its wait, so the notify below cannot be lost.
+            { std::lock_guard<std::mutex> lk(this->tempMu); }
+            if (all) this->tempCv.notify_all();
+            else this->tempCv.notify_one();
+        } else if (all) {
+            this->parkSignal.notify_all();
+        } else {
+            this->parkSignal.notify_one();
+        }
+    }
+
+    bool Fiber::hasStealableWork() const noexcept {
+        return !this->deque->empty() || !this->inbox->empty();
     }
 
     void Fiber::join() {
@@ -244,11 +292,11 @@ namespace YarnBall {
         std::atomic_thread_fence(std::memory_order_seq_cst); // pairs with the one in park()
         if (!this->parked.load(std::memory_order_acquire)) return;
         this->parkSignal.fetch_add(1, std::memory_order_release);
-        this->parkSignal.notify_one();
+        this->wakeParked(false);
     }
 
     void Fiber::process() {
-        SetNumaAffinity();
+        SetNumaAffinity(this->fiberId);
         tls_currentFiber = this;
 
         int idleTicks = 0;
@@ -270,6 +318,7 @@ namespace YarnBall {
                     catch (...) { }
                 }
                 delete fromInbox;
+                this->noteCompleted();
                 continue;
             }
 
@@ -283,6 +332,7 @@ namespace YarnBall {
                     catch (...) { /* swallow secondary exceptions */ }
                 }
                 delete t;
+                this->noteCompleted();
                 continue;
             }
 
@@ -302,6 +352,7 @@ namespace YarnBall {
                     catch (...) { }
                 }
                 delete t;
+                this->noteCompleted();
                 continue;
             }
 
@@ -315,6 +366,7 @@ namespace YarnBall {
                         try { t->exception(std::current_exception()); } catch (...) { }
                     }
                     delete t;
+                    this->noteCompleted();
                     foundWork = true;
                     break;
                 }
@@ -325,16 +377,17 @@ namespace YarnBall {
             // 5. Temp fibers retire after a brief grace window of total idle.
             if (this->temp && ++idleTicks >= kTempIdleTicksBeforeRetire) {
                 this->running.store(false, std::memory_order_release);
+                // Store-load handshake with tryPushInbox: a producer either sees running == false and backs off, or
+                // its enqueue is visible to the drain below (or it forwards the leftovers itself).
+                std::atomic_thread_fence(std::memory_order_seq_cst);
                 this->drainToPending();
                 this->signalDone(this->fiberId);
-                // Catch any stragglers a producer may have pushed into
-                // the inbox between drainToPending() above and the
-                // snapshot rebuild inside signalDone(). The check is
-                // cheap when empty; when non-empty we forward to
-                // pending so a peer picks the task up promptly rather
-                // than leaving it stuck until reap runs ~Fiber.
+                // Catch any stragglers a producer pushed into the inbox
+                // after the first drain. Cheap when empty; otherwise they
+                // are forwarded so a peer picks them up promptly rather
+                // than leaving them until reap runs ~Fiber.
                 this->drainToPending();
-                Yarn::instance()->releaseThreadSnapshotCache();
+                if (this->owner) this->owner->releaseThreadSnapshotCache();
                 tls_currentFiber = nullptr;
                 return;
             }
@@ -347,7 +400,7 @@ namespace YarnBall {
         // If we leave the thread_local shared_ptr<Fiber> chain in place,
         // its destruction at thread_local teardown can trigger a ~Fiber
         // whose join() targets this very thread -- the classic self-join.
-        Yarn::instance()->releaseThreadSnapshotCache();
+        if (this->owner) this->owner->releaseThreadSnapshotCache();
         tls_currentFiber = nullptr;
     }
 
@@ -361,8 +414,13 @@ namespace YarnBall {
         // Mark ourselves parked AND bump the global parked-worker
         // counter so producers can fast-skip the snapshot walk in
         // wakeOneParked when nobody is asleep.
+        //
+        // Drop any wake claim left over from the previous sleep BEFORE publishing parked: a waker can only claim a
+        // fiber it sees parked, so it can never find a stale claim on a freshly parked fiber (clearing it after waking
+        // instead could erase a claim a waker took for the next sleep, or leave one that suppresses it).
+        this->wakeClaimed.store(false, std::memory_order_release);
         this->parked.store(true, std::memory_order_release);
-        Yarn::instance()->noteParked(+1);
+        if (this->owner) this->owner->noteParked(+1);
         // Publish "parked" before looking for work: a producer that enqueued before this point and then read
         // parked == false must be seen by the re-check below (store-load needs a full fence).
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -377,19 +435,21 @@ namespace YarnBall {
             if (!this->inbox->empty()) return true;
             if (!this->deque->empty()) return true;
             if (this->anyPendingTasks()) return true;
+            // Work pushed into a peer's deque/inbox is announced only by a wake aimed at some parked worker; re-check
+            // here so a push that raced with our parked.store is not slept through.
+            if (this->anyPeerWork && this->anyPeerWork(this->fiberId)) return true;
             return false;
         };
 
         if (!haveWork()) {
             if (this->temp) {
-                // A temp fiber must be able to notice sustained idleness and retire (see process()), but futex waits
-                // have no timeout: poll the signal until kParkWaitTimeout expires. Only temp fibers pay for this;
-                // permanent workers keep the untimed futex wait below.
-                const auto deadline = std::chrono::steady_clock::now() + kParkWaitTimeout;
-                while (this->parkSignal.load(std::memory_order_acquire) == expected && !haveWork()
-                       && std::chrono::steady_clock::now() < deadline) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(500));
-                }
+                // A temp fiber must be able to notice sustained idleness and retire (see process()), but a futex wait
+                // has no timeout: wait on the condition variable instead, which wakers interrupt via wakeParked().
+                // Only temp fibers pay for the mutex; permanent workers keep the untimed futex wait below.
+                std::unique_lock<std::mutex> lk(this->tempMu);
+                this->tempCv.wait_for(lk, kParkWaitTimeout, [&] {
+                    return this->parkSignal.load(std::memory_order_acquire) != expected;
+                });
             } else {
                 // Wait on the futex. Returns when parkSignal != expected (a
                 // poke happened) or on a spurious wake.
@@ -398,7 +458,14 @@ namespace YarnBall {
         }
 
         this->parked.store(false, std::memory_order_release);
-        Yarn::instance()->noteParked(-1);
+        if (this->owner) this->owner->noteParked(-1);
+        // Pairs with the fence in poke()/wakeOneParked(): a waker that still read parked == true (and so counts us as
+        // woken) published its work before that read, and this fence makes it visible to the source checks that follow.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+    }
+
+    void Fiber::noteCompleted() noexcept {
+        this->completed.store(this->completed.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     }
 
     TaskPtr Fiber::popLocal() {

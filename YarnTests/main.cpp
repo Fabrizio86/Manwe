@@ -606,7 +606,7 @@ namespace {
     // happen to tolerate on POSIX but MSVC reliably crashes on.
 
     YarnBall::Task<void> bumpAtomicOnce(std::atomic<int> *c) {
-        c->fetch_add(1, std::memory_order_relaxed);
+        c->fetch_add(1, std::memory_order_release);
         co_return;
     }
 
@@ -1771,6 +1771,23 @@ TEST(wire_signal_connect_emit_disconnect) {
     EXPECT_EQ(sum.load(), 10); // disconnected slot didn't fire
 }
 
+TEST(wire_signal_handlers_may_connect_and_disconnect_during_emit) {
+    Telegraph::Signal<int> sig;
+    std::vector<int> seen;
+    Telegraph::Signal<int>::SlotId self = 0;
+    self = sig.connect([&](int v) {
+        seen.push_back(v);
+        sig.disconnect(self);
+        sig.connect([&](int w) { seen.push_back(w * 10); });
+    });
+    sig.emit(1); // runs the original handler only (the emission works from a snapshot)
+    sig.emit(2); // runs the handler connected during the first emission
+    EXPECT_EQ(seen.size(), std::size_t{2});
+    EXPECT_EQ(seen[0], 1);
+    EXPECT_EQ(seen[1], 20);
+    EXPECT_EQ(sig.handlerCount(), std::size_t{1});
+}
+
 TEST(wire_signal_emit_runs_handlers_in_order) {
     Telegraph::Signal<int> sig;
     std::vector<int> recv;
@@ -1995,16 +2012,72 @@ TEST(wire_channel_select_picks_first_ready) {
     EXPECT_EQ(*result.value, 42);
 }
 
+namespace {
+    YarnBall::Task<Telegraph::SelectResult<int>> doSelectFlag(
+        std::shared_ptr<Telegraph::Channel<int>> a,
+        std::shared_ptr<Telegraph::Channel<int>> b,
+        std::shared_ptr<std::atomic<bool>> done) {
+        std::vector<std::shared_ptr<Telegraph::Channel<int>>> chans = {a, b};
+        auto r = co_await Telegraph::channelSelect(std::move(chans));
+        done->store(true);
+        co_return r;
+    }
+}
+
 TEST(wire_channel_select_closed_channel_yields_nullopt) {
+    // a is closed and empty, b is open and empty: the select must NOT complete on a's closure; it stays pending
+    // until b delivers. (The pending check can only err towards passing; the delivery check is deterministic.)
     auto a = std::make_shared<Telegraph::Channel<int>>();
     auto b = std::make_shared<Telegraph::Channel<int>>();
-
-    // Close a; receive() on a returns nullopt immediately.
+    auto done = std::make_shared<std::atomic<bool>>(false);
     a->close();
 
-    auto result = YarnBall::syncWait(doSelect(a, b));
-    EXPECT_EQ(result.index, static_cast<std::size_t>(0));
+    auto sel = YarnBall::spawnJoinable(doSelectFlag(a, b, done));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_FALSE(done->load());
+    b->send(7);
+    auto result = YarnBall::syncWait(sel.join());
+    EXPECT_EQ(result.index, static_cast<std::size_t>(1));
+    EXPECT_TRUE(result.value.has_value());
+    EXPECT_EQ(*result.value, 7);
+}
+
+TEST(wire_channel_select_completes_empty_only_when_every_channel_closes) {
+    auto a = std::make_shared<Telegraph::Channel<int>>();
+    auto b = std::make_shared<Telegraph::Channel<int>>();
+    auto done = std::make_shared<std::atomic<bool>>(false);
+    a->close();
+    auto sel = YarnBall::spawnJoinable(doSelectFlag(a, b, done));
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_FALSE(done->load());
+    b->close(); // now nothing can ever arrive
+    auto result = YarnBall::syncWait(sel.join());
     EXPECT_FALSE(result.value.has_value());
+
+    // Already all closed before the select starts: completes at once, empty.
+    auto c = std::make_shared<Telegraph::Channel<int>>();
+    auto d = std::make_shared<Telegraph::Channel<int>>();
+    c->close();
+    d->close();
+    EXPECT_FALSE(YarnBall::syncWait(doSelect(c, d)).value.has_value());
+}
+
+TEST(wire_channel_select_delivers_buffered_data_of_a_closed_channel_first) {
+    auto a = std::make_shared<Telegraph::Channel<int>>();
+    auto b = std::make_shared<Telegraph::Channel<int>>();
+    a->send(1);
+    a->send(2);
+    a->close(); // closed, but still holding two values; b open and empty
+    auto r1 = YarnBall::syncWait(doSelect(a, b));
+    EXPECT_EQ(r1.index, static_cast<std::size_t>(0));
+    EXPECT_TRUE(r1.value.has_value());
+    EXPECT_EQ(*r1.value, 1);
+    auto r2 = YarnBall::syncWait(doSelect(a, b));
+    EXPECT_EQ(r2.index, static_cast<std::size_t>(0));
+    EXPECT_TRUE(r2.value.has_value());
+    EXPECT_EQ(*r2.value, 2); // no value was lost or reordered by the first select's losers
+    b->close();
+    EXPECT_FALSE(YarnBall::syncWait(doSelect(a, b)).value.has_value());
 }
 
 
@@ -2201,7 +2274,9 @@ static YarnBall::Task<void> readOneByte(int reader, std::atomic<int> *completed)
     char buf[16];
     co_await YarnBall::io::waitReadable(reader);
     ::read(reader, buf, sizeof(buf));
-    completed->fetch_add(1, std::memory_order_relaxed);
+    // Release, not relaxed: the test's counter lives on its stack, and the waiter must see this coroutine's last touch of
+    // it as ordered before the stack slot is reused by the next test.
+    completed->fetch_add(1, std::memory_order_release);
     co_return;
 }
 
@@ -2632,10 +2707,64 @@ TEST(signal_set_captures_self_raised_signal) {
     EXPECT_EQ(caught.load(), SIGUSR1);
 }
 
-TEST(signal_set_second_instance_throws) {
+TEST(signal_set_multiple_instances_both_receive) {
     YarnBall::SignalSet first({SIGUSR2});
-    EXPECT_THROWS_AS(YarnBall::SignalSet({SIGUSR2}),
-                      YarnBall::SignalCaptureError);
+    YarnBall::SignalSet second({SIGUSR2});
+
+    std::atomic<int> a{-1}, b{-1};
+    auto waiter = [](YarnBall::SignalSet *s, std::atomic<int> *out) -> YarnBall::Task<void> {
+        out->store(co_await s->next(), std::memory_order_release);
+        co_return;
+    };
+    YarnBall::coSpawn(waiter(&first, &a));
+    YarnBall::coSpawn(waiter(&second, &b));
+    std::this_thread::sleep_for(50ms);
+    ::kill(::getpid(), SIGUSR2);
+
+    EXPECT_TRUE(wait_for([&] { return a.load() != -1 && b.load() != -1; }, 5s));
+    EXPECT_EQ(a.load(), SIGUSR2);
+    EXPECT_EQ(b.load(), SIGUSR2);
+}
+
+TEST(signal_set_restores_disposition_after_last_instance) {
+    struct sigaction before{};
+    ::sigaction(SIGWINCH, nullptr, &before);
+    {
+        YarnBall::SignalSet a({SIGWINCH});
+        {
+            YarnBall::SignalSet b({SIGWINCH});
+        }
+        // Still captured by `a`: dropping `b` must not restore the original yet.
+        struct sigaction mid{};
+        ::sigaction(SIGWINCH, nullptr, &mid);
+        EXPECT_TRUE(mid.sa_handler != before.sa_handler);
+    }
+    struct sigaction after{};
+    ::sigaction(SIGWINCH, nullptr, &after);
+    EXPECT_TRUE(after.sa_handler == before.sa_handler);
+}
+
+TEST(signal_set_rejects_uncatchable_signal) {
+    EXPECT_THROWS_AS(YarnBall::SignalSet({SIGKILL}), YarnBall::SignalCaptureError);
+}
+
+TEST(signal_set_destroyed_while_waiting_wakes_waiter) {
+    std::atomic<int> state{0}; // 1 = threw SignalCaptureError
+    auto waiter = [](YarnBall::SignalSet *s, std::atomic<int> *out) -> YarnBall::Task<void> {
+        try {
+            co_await s->next();
+        } catch (const YarnBall::SignalCaptureError &) {
+            out->store(1, std::memory_order_release);
+        }
+        co_return;
+    };
+    {
+        auto sigs = std::make_unique<YarnBall::SignalSet>(std::initializer_list<int>{SIGUSR1});
+        YarnBall::coSpawn(waiter(sigs.get(), &state));
+        std::this_thread::sleep_for(50ms);
+        sigs.reset();
+    }
+    EXPECT_TRUE(wait_for([&] { return state.load() == 1; }, 5s));
 }
 #endif
 
@@ -3574,9 +3703,9 @@ TEST(soccer_icmp_parse_rejects_too_short) {
 namespace {
     /**
      * @brief Coroutine that issues one ICMP Echo to @p target and waits for
-     *        a matching reply. Returns @c true if a reply with the same
-     *        identifier+sequence came back; @c false on timeout, parse
-     *        failure, or sequence mismatch.
+     *        a matching reply. Returns @c true once a reply with the same
+     *        identifier+sequence came back (never returns otherwise: bound it
+     *        with a timeout).
      */
     YarnBall::Task<bool> icmpPingOnce(std::string target) {
         // macOS allows ICMP via SOCK_DGRAM (no root); Linux requires SOCK_RAW
@@ -3594,18 +3723,22 @@ namespace {
         co_await sock.sendTo(
             std::span<const std::byte>(packet.data(), packet.size()), dest);
 
+        // A raw ICMP socket sees every ICMP packet the host receives, not just the answer: pinging
+        // loopback delivers our own Echo Request (type 8) back to us before the Echo Reply, so read
+        // until the matching reply arrives (the caller bounds the wait with a timeout).
         std::array<std::byte, 1024> rx{};
-        Soccer::SocketAddress from;
-        std::size_t n = co_await sock.recv(rx, &from);
-
-        // On Linux SOCK_RAW the IP header is present and must be skipped.
-        // On macOS SOCK_RAW for IPv4 ICMP the IP header is also delivered.
-        auto parsed = Soccer::IcmpEcho::parse(
-            std::span<const std::byte>(rx.data(), n), /*skip_ip=*/true);
-        if (!parsed) co_return false;
-        co_return parsed->type == Soccer::IcmpType::EchoReply &&
-                  parsed->identifier == kId &&
-                  parsed->sequence == kSeq;
+        while (true) {
+            Soccer::SocketAddress from;
+            std::size_t n = co_await sock.recv(rx, &from);
+            // On Linux SOCK_RAW the IP header is present and must be skipped.
+            // On macOS SOCK_RAW for IPv4 ICMP the IP header is also delivered.
+            auto parsed = Soccer::IcmpEcho::parse(
+                std::span<const std::byte>(rx.data(), n), /*skip_ip=*/true);
+            if (parsed && parsed->type == Soccer::IcmpType::EchoReply &&
+                parsed->identifier == kId && parsed->sequence == kSeq) {
+                co_return true;
+            }
+        }
     }
 }
 
@@ -3614,7 +3747,18 @@ TEST(soccer_icmp_ping_loopback_root_only) {
         std::cout << "       (skipped: ICMP raw socket needs root)\n";
         return;
     }
-    bool ok = YarnBall::syncWait(icmpPingOnce("127.0.0.1"));
+    bool ok = false;
+    try {
+        ok = YarnBall::syncWait(YarnBall::withTimeout(icmpPingOnce("127.0.0.1"), 3s));
+    } catch (const YarnBall::TimeoutException &) {
+        ok = false;
+    } catch (const Soccer::SocketException &e) {
+        if (e.errorCode() == EPERM || e.errorCode() == EACCES) { // root without CAP_NET_RAW (container)
+            std::cout << "       (skipped: raw ICMP socket not permitted)\n";
+            return;
+        }
+        throw;
+    }
     EXPECT_TRUE(ok);
 }
 #endif // !_WIN32 (ICMP ping needs geteuid; Windows raw sockets need admin)

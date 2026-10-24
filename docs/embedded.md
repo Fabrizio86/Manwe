@@ -220,8 +220,9 @@ YarnBall::coSpawn([](auto button, auto *ch) -> YarnBall::Task<void> {
 
 // Consumer coroutine pulls from the channel.
 while (true) {
-    int n = co_await events.receive();
-    co_await uart.write(formatTelemetry(n));
+    auto n = co_await events.receive();   // std::optional<int>: empty once the channel is closed
+    if (!n) break;
+    co_await uart.write(formatTelemetry(*n));
 }
 ```
 

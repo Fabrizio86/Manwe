@@ -6,16 +6,23 @@
 
 #include "TlsStream.h"
 
+#include <atomic>
+#include <chrono>
 #include <mutex>
+#include <optional>
 
 #include <cerrno>
+#include <poll.h>
 #include <fcntl.h>
 #include <string>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <tls.h>
 
+#include "AsyncSync.h"
 #include "IoAwaiters.h"
+#include "NetUtil.h"
+#include "PlatformNet.h"
 #include "Reactor.h"
 #include "IoDeadline.h"
 #include "SocketAddress.h"
@@ -36,18 +43,62 @@ namespace Soccer {
         int fd = -1;
         /// A libtls context is not safe for concurrent use, and a connection normally has a reader coroutine and writer coroutines
         /// running on different threads at once. Every tls_read / tls_write call (each is non-blocking: it returns TLS_WANT_POLL*
-        /// instead of waiting) is made under this lock; the waits for readiness happen outside it.
-        std::mutex callMu;
+        /// instead of waiting) is made under this lock; the waits for readiness happen outside it. Also guards the fields below.
+        mutable std::mutex callMu;
+        /// Serialises whole write() calls: two writers must not interleave their partial tls_write retries (the bytes of one
+        /// message would land inside another's, and libtls requires a WANT_POLL retry to repeat the same arguments).
+        YarnBall::AsyncMutex writeMu;
+        /// Coroutines parked on the descriptor (counted under callMu from the moment they decide to wait).
+        int waiters = 0;
+        /// Descriptor released by close() but not yet closed because a waiter may still register on it.
+        int retiredFd = -1;
+        /// Server-side stream accepted before its handshake: true until the first handshake() completes it.
+        std::atomic<bool> hsPending{false};
+        /// Longest the deferred handshake may take (zero or negative: unbounded). Fixed at construction.
+        std::chrono::milliseconds hsTimeout{0};
+        /// Serialises the deferred handshake; hsError (the sticky failure text) is only touched under it.
+        YarnBall::AsyncMutex hsMu;
+        std::string hsError;
+
+        void leave() noexcept {
+            int toClose = -1;
+            {
+                std::lock_guard<std::mutex> lk(this->callMu);
+                if (--this->waiters == 0) toClose = std::exchange(this->retiredFd, -1);
+            }
+            if (toClose >= 0) (void) YarnBall::closeSocket(toClose);
+        }
     };
 
-    TlsStream::TlsStream() : impl(std::make_unique<Impl>()) {
+    namespace {
+        /// Holds the descriptor open while its owner waits on it, so a concurrent close() cannot hand the number to
+        /// another connection between the owner's decision to wait and the Reactor registration. Created under callMu.
+        template<typename ImplT>
+        struct WaitTicket {
+            std::shared_ptr<ImplT> im;
+            explicit WaitTicket(std::shared_ptr<ImplT> i) noexcept : im(std::move(i)) {}
+            WaitTicket(const WaitTicket &) = delete;
+            WaitTicket &operator=(const WaitTicket &) = delete;
+            ~WaitTicket() { im->leave(); }
+        };
+    }
+
+    TlsStream::TlsStream() : impl(std::make_shared<Impl>()) {
     }
 
     TlsStream::TlsStream(::tls *ctx, ::tls_config *cfg, int fd) noexcept
-        : impl(std::make_unique<Impl>()) {
+        : impl(std::make_shared<Impl>()) {
         this->impl->ctx = ctx;
         this->impl->cfg = cfg;
         this->impl->fd = fd;
+    }
+
+    TlsStream::TlsStream(::tls *ctx, int fd, std::chrono::milliseconds handshakeTimeout) noexcept
+        : impl(std::make_shared<Impl>()) {
+        this->impl->ctx = ctx;
+        this->impl->fd = fd;
+        this->impl->hsTimeout = handshakeTimeout;
+        this->impl->hsPending.store(true, std::memory_order_release);
     }
 
     TlsStream::TlsStream(TlsStream &&) noexcept = default;
@@ -65,37 +116,62 @@ namespace Soccer {
 
     void TlsStream::close() noexcept {
         if (!this->impl) return;
-        // Serialise with in-flight tls_read / tls_write calls so the
-        // context is never freed underneath them.
-        std::lock_guard<std::mutex> lk(this->impl->callMu);
-        if (this->impl->ctx) {
-            ::tls_close(this->impl->ctx);
-            ::tls_free(this->impl->ctx);
-            this->impl->ctx = nullptr;
+        // Take the TLS objects and the descriptor out under the lock (which serialises with
+        // in-flight tls_read / tls_write, so the context is never freed underneath them), then
+        // do the slow part -- the close_notify -- outside it, so a concurrent reader or writer
+        // is never held up behind the alert, and nothing is woken from inside the lock.
+        ::tls *ctx = nullptr;
+        ::tls_config *cfg = nullptr;
+        int fd = -1;
+        {
+            std::lock_guard<std::mutex> lk(this->impl->callMu);
+            ctx = std::exchange(this->impl->ctx, nullptr);
+            cfg = std::exchange(this->impl->cfg, nullptr);
+            fd = std::exchange(this->impl->fd, -1);
         }
-        if (this->impl->cfg) {
-            ::tls_config_free(this->impl->cfg);
-            this->impl->cfg = nullptr;
+        if (ctx) {
+            // Best-effort close_notify on the still-open descriptor: one attempt, plus one more
+            // after a zero-wait poll if the socket was momentarily full. The socket is
+            // non-blocking, so this never waits for the peer; a full send buffer just drops the alert.
+            int rc = ::tls_close(ctx);
+            if ((rc == TLS_WANT_POLLIN || rc == TLS_WANT_POLLOUT) && fd >= 0) {
+                pollfd pfd{};
+                pfd.fd = fd;
+                pfd.events = (rc == TLS_WANT_POLLIN) ? POLLIN : POLLOUT;
+                if (::poll(&pfd, 1, 0) > 0) (void) ::tls_close(ctx);
+            }
+            ::tls_free(ctx);
         }
-        if (this->impl->fd >= 0) {
-            // Wake readers / writers parked on the fd before it is closed (and the number
-            // reused). They re-take callMu, find ctx gone and fail without touching the fd.
-            const int fd = this->impl->fd;
-            this->impl->fd = -1;
+        if (cfg) ::tls_config_free(cfg);
+        if (fd >= 0) {
+            // Wake readers / writers parked on the fd. They re-take callMu, find ctx gone and fail without touching
+            // the fd. A shutdown makes the descriptor readable and writable, which also wakes a waiter that has not
+            // registered yet; and the descriptor is kept open until the last waiter has left, so such a waiter never
+            // registers on a number that was closed (or reused by another connection).
+            detail::shutdownSocket(fd);
             (void) YarnBall::Reactor::instance()->cancelFd(fd);
-            ::close(fd);
+            int toClose = -1;
+            {
+                std::lock_guard<std::mutex> lk(this->impl->callMu);
+                if (this->impl->waiters == 0) toClose = fd;
+                else this->impl->retiredFd = fd;
+            }
+            if (toClose >= 0) (void) YarnBall::closeSocket(toClose);
         }
     }
 
     std::string TlsStream::alpnSelected() const {
-        if (!this->impl || !this->impl->ctx) return {};
+        if (!this->impl) return {};
         std::lock_guard<std::mutex> lk(this->impl->callMu);
+        if (!this->impl->ctx) return {};
         const char *p = ::tls_conn_alpn_selected(this->impl->ctx);
         return p ? std::string(p) : std::string();
     }
 
     int TlsStream::fd() const noexcept {
-        return this->impl ? this->impl->fd : -1;
+        if (!this->impl) return -1;
+        std::lock_guard<std::mutex> lk(this->impl->callMu);
+        return this->impl->fd;
     }
 
 
@@ -118,6 +194,10 @@ namespace Soccer {
     YarnBall::Task<TlsStream> TlsStream::connect(std::string host,
                                                  std::uint16_t port,
                                                  TlsClientOptions opts) {
+        if (opts.clientCertFile.empty() != opts.clientKeyFile.empty()) {
+            // Silently skipping half a client identity would connect without client auth.
+            throw SocketException("TlsClientOptions: clientCertFile and clientKeyFile must be set together");
+        }
         // Resolve (trying every address) and connect; the socket comes back
         // non-blocking and close-on-exec, and is closed again if anything below throws.
         TcpStream tcp = co_await tcpConnect(host, port, opts.connectTimeout);
@@ -194,21 +274,88 @@ namespace Soccer {
         co_return out;
     }
 
+    YarnBall::Task<void> TlsStream::handshake() {
+        if (!this->impl) {
+            throw SocketException("handshake on closed TlsStream");
+        }
+        if (!this->impl->hsPending.load(std::memory_order_acquire)) co_return;
+        co_await driveHandshake(this->impl);
+    }
+
+    YarnBall::Task<void> TlsStream::driveHandshake(std::shared_ptr<Impl> im) {
+        auto guard = co_await im->hsMu.lock();
+        if (!im->hsPending.load(std::memory_order_acquire)) co_return; // another caller finished it
+        if (!im->hsError.empty()) throw SocketException(im->hsError);
+
+        // The ticket keeps the descriptor open for the whole handshake, so the deadline below (declared after it, hence
+        // disarmed first) can never shut down a number that close() released and another connection reused.
+        int fd = -1;
+        std::optional<WaitTicket<Impl>> ticket;
+        {
+            std::lock_guard<std::mutex> lk(im->callMu);
+            if (!im->ctx) throw SocketException("handshake on closed TlsStream");
+            fd = im->fd;
+            ++im->waiters;
+            ticket.emplace(im);
+        }
+        IoDeadline deadline(fd, im->hsTimeout);
+        std::string err;
+        while (true) {
+            int hs;
+            {
+                std::lock_guard<std::mutex> lk(im->callMu);
+                if (!im->ctx) throw SocketException("handshake on closed TlsStream");
+                hs = ::tls_handshake(im->ctx);
+                if (hs != 0 && hs != TLS_WANT_POLLIN && hs != TLS_WANT_POLLOUT) {
+                    err = ::tls_error(im->ctx) ? ::tls_error(im->ctx) : "tls_handshake";
+                }
+            }
+            if (hs == 0) break;
+            if (hs == TLS_WANT_POLLIN) {
+                co_await YarnBall::io::waitReadable(fd);
+                continue;
+            }
+            if (hs == TLS_WANT_POLLOUT) {
+                co_await YarnBall::io::waitWritable(fd);
+                continue;
+            }
+            if (deadline.expired()) err = "TLS handshake timed out";
+            im->hsError = err;
+            deadline.disarm();
+            TlsStream dead; // close the connection now: it is useless, and the peer should not wait for the owner
+            dead.impl = im;
+            dead.close();
+            throw SocketException(err);
+        }
+        deadline.disarm();
+        im->hsPending.store(false, std::memory_order_release);
+        co_return;
+    }
+
     YarnBall::Task<std::size_t> TlsStream::read(std::span<std::byte> buf) {
-        if (!this->impl || !this->impl->ctx) {
+        if (!this->impl) {
             throw SocketException("read on closed TlsStream");
         }
+        // Held across the loop: the shared state outlives this stream object if it is destroyed mid-read.
+        const std::shared_ptr<Impl> im = this->impl;
+        if (im->hsPending.load(std::memory_order_acquire)) co_await driveHandshake(im);
+        // libtls reports end of stream as 0, which an empty buffer must not be mistaken for.
+        if (buf.empty()) co_return 0;
         while (true) {
             ssize_t n;
             std::string err;
             int fd;
+            std::optional<WaitTicket<Impl>> ticket;
             {
-                std::lock_guard<std::mutex> lk(this->impl->callMu);
-                if (!this->impl->ctx) throw SocketException("read on closed TlsStream");
-                fd = this->impl->fd; // close() changes it under this lock; waits below use this copy
-                n = ::tls_read(this->impl->ctx, buf.data(), buf.size());
+                std::lock_guard<std::mutex> lk(im->callMu);
+                if (!im->ctx) throw SocketException("read on closed TlsStream");
+                fd = im->fd;
+                n = ::tls_read(im->ctx, buf.data(), buf.size());
                 if (n < 0 && n != TLS_WANT_POLLIN && n != TLS_WANT_POLLOUT) {
-                    err = ::tls_error(this->impl->ctx) ? ::tls_error(this->impl->ctx) : "tls_read";
+                    err = ::tls_error(im->ctx) ? ::tls_error(im->ctx) : "tls_read";
+                } else if (n == TLS_WANT_POLLIN || n == TLS_WANT_POLLOUT) {
+                    ++im->waiters; // released by the ticket; keeps `fd` open while we wait on it
+                    ticket.emplace(im);
                 }
             }
             if (n >= 0) co_return static_cast<std::size_t>(n);
@@ -225,27 +372,38 @@ namespace Soccer {
     }
 
     YarnBall::Task<std::size_t> TlsStream::write(std::span<const std::byte> buf) {
-        if (!this->impl || !this->impl->ctx) {
+        if (!this->impl) {
             throw SocketException("write on closed TlsStream");
         }
+        const std::shared_ptr<Impl> im = this->impl;
+        if (im->hsPending.load(std::memory_order_acquire)) co_await driveHandshake(im);
+        // One writer at a time for the whole buffer (see Impl::writeMu).
+        auto writeGuard = co_await im->writeMu.lock();
         std::size_t total = 0;
         while (total < buf.size()) {
             ssize_t n;
             std::string err;
             int fd;
+            std::optional<WaitTicket<Impl>> ticket;
             {
-                std::lock_guard<std::mutex> lk(this->impl->callMu);
-                if (!this->impl->ctx) throw SocketException("write on closed TlsStream");
-                fd = this->impl->fd; // close() changes it under this lock; waits below use this copy
-                n = ::tls_write(this->impl->ctx, buf.data() + total, buf.size() - total);
+                std::lock_guard<std::mutex> lk(im->callMu);
+                if (!im->ctx) throw SocketException("write on closed TlsStream");
+                fd = im->fd;
+                n = ::tls_write(im->ctx, buf.data() + total, buf.size() - total);
                 if (n < 0 && n != TLS_WANT_POLLIN && n != TLS_WANT_POLLOUT) {
-                    err = ::tls_error(this->impl->ctx) ? ::tls_error(this->impl->ctx) : "tls_write";
+                    err = ::tls_error(im->ctx) ? ::tls_error(im->ctx) : "tls_write";
+                } else if (n == TLS_WANT_POLLIN || n == TLS_WANT_POLLOUT) {
+                    ++im->waiters;
+                    ticket.emplace(im);
                 }
             }
-            if (n >= 0) {
-                if (n == 0) break;
+            if (n > 0) {
                 total += static_cast<std::size_t>(n);
                 continue;
+            }
+            if (n == 0) {
+                // No progress on a non-empty buffer: a short count would break the "writes it all" contract.
+                throw SocketException("tls_write made no progress");
             }
             if (n == TLS_WANT_POLLIN) {
                 co_await YarnBall::io::waitReadable(fd);

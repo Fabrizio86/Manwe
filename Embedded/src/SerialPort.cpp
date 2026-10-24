@@ -9,12 +9,19 @@
 #include "SerialPort.h"
 
 #include <cerrno>
+#include <chrono>
 #include <cstring>
+#include <thread>
 
 #if defined(_WIN32)
 // Windows path: not implemented in this round.
 #else
 #include <fcntl.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#if defined(__linux__)
+#include <sys/sysmacros.h>
+#endif
 #include <termios.h>
 #include <unistd.h>
 #endif
@@ -76,10 +83,25 @@ namespace Embedded {
         }
 
         /**
+         * @brief True if @p fd is a pseudo-terminal. A pty cannot carry a character size or parity (Linux forces it to
+         *        8 bits, no parity), so those settings cannot be read back from one.
+         */
+        bool isPseudoTerminal(int fd) {
+#if defined(__linux__)
+            struct stat st{};
+            // Unix98 pty slaves: character devices with majors 136..143 (UNIX98_PTY_SLAVE_MAJOR).
+            return ::fstat(fd, &st) == 0 && S_ISCHR(st.st_mode) && major(st.st_rdev) >= 136 && major(st.st_rdev) <= 143;
+#else
+            (void) fd;
+            return false;
+#endif
+        }
+
+        /**
          * @brief Apply a @c SerialConfig to an open fd via termios.
-         *        Throws on tcgetattr / tcsetattr failure or on an
-         *        unsupported parameter (only baud rate currently can
-         *        be rejected).
+         *        Throws on tcgetattr / tcsetattr failure, on an
+         *        unsupported parameter, or when the driver did not take
+         *        the requested settings (read back and compared).
          */
         void applyConfig(int fd, const SerialConfig &cfg) {
             termios tio{};
@@ -116,6 +138,7 @@ namespace Embedded {
             switch (cfg.parity) {
                 case Parity::None:
                     tio.c_cflag &= ~PARENB;
+                    tio.c_iflag &= ~(INPCK | IGNPAR | PARMRK);
                     break;
                 case Parity::Even:
                     tio.c_cflag |= PARENB;
@@ -126,6 +149,12 @@ namespace Embedded {
                     tio.c_cflag |= PARODD;
                     break;
             }
+            // cfmakeraw clears INPCK, which would leave parity generated on TX but never checked on RX. Policy:
+            // check it, and drop a byte that fails (IGNPAR) rather than deliver it as data or as a 0x00 / marker.
+            if (cfg.parity != Parity::None) {
+                tio.c_iflag |= (INPCK | IGNPAR);
+                tio.c_iflag &= ~PARMRK;
+            }
 
             // Stop bits.
             if (cfg.stopBits == StopBits::Two) tio.c_cflag |= CSTOPB;
@@ -135,6 +164,10 @@ namespace Embedded {
 #ifdef CRTSCTS
             if (cfg.flowControl == FlowControl::Hardware) tio.c_cflag |= CRTSCTS;
             else                                            tio.c_cflag &= ~CRTSCTS;
+#else
+            if (cfg.flowControl == FlowControl::Hardware) {
+                throw SerialPortError("hardware flow control (CRTSCTS) is not supported on this platform");
+            }
 #endif
             if (cfg.flowControl == FlowControl::Software) tio.c_iflag |= (IXON | IXOFF);
             else                                            tio.c_iflag &= ~(IXON | IXOFF);
@@ -152,60 +185,112 @@ namespace Embedded {
                 throw SerialPortError(std::string("tcsetattr: ") +
                                        std::strerror(errno));
             }
+
+            // tcsetattr reports success if any one requested change took effect, so check what the driver kept.
+            termios got{};
+            if (::tcgetattr(fd, &got) < 0) {
+                throw SerialPortError(std::string("tcgetattr: ") +
+                                       std::strerror(errno));
+            }
+            // A pseudo-terminal has no UART behind it: it keeps 8 bits and no parity whatever was asked, so those are
+            // not compared there. Every real device is compared in full.
+            tcflag_t mask = CSTOPB;
+            if (!isPseudoTerminal(fd)) mask |= CSIZE | PARENB | PARODD;
+#ifdef CRTSCTS
+            mask |= CRTSCTS;
+#endif
+            tcflag_t imask = IXON | IXOFF;
+            if (!isPseudoTerminal(fd)) imask |= INPCK | IGNPAR | PARMRK;
+            if ((got.c_cflag & mask) != (tio.c_cflag & mask) || (got.c_iflag & imask) != (tio.c_iflag & imask) ||
+                ::cfgetispeed(&got) != baud || ::cfgetospeed(&got) != baud) {
+                throw SerialPortError("the serial driver did not accept the requested line settings");
+            }
         }
     }
 
     SerialPort SerialPort::open(const std::string &path,
                                   const SerialConfig &cfg) {
-        const int fd = ::open(path.c_str(),
-                                O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+        int fd = -1;
+        // EBUSY: a port closed an instant ago can still be held exclusively (TIOCEXCL) by a read / write in flight
+        // on it, whose descriptor is released when that call leaves (see FdSlot). Give it a few ms to do so.
+        for (int attempt = 0;; ++attempt) {
+            fd = ::open(path.c_str(), O_RDWR | O_NOCTTY | O_NONBLOCK | O_CLOEXEC);
+            if (fd >= 0 || errno != EBUSY || attempt >= 20) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
         if (fd < 0) {
             throw SerialPortError("open(" + path + "): " +
                                    std::strerror(errno));
         }
+#ifdef TIOCEXCL
+        // Best effort: keep other (non-root) processes from opening the same device and interleaving bytes.
+        (void) ::ioctl(fd, TIOCEXCL);
+#endif
         try {
             applyConfig(fd, cfg);
         } catch (...) {
             ::close(fd);
             throw;
         }
+        // Drop whatever the previous user left queued in the driver, now that the line settings are in force.
+        (void) ::tcflush(fd, TCIOFLUSH);
         return SerialPort(fd);
     }
 
     YarnBall::Task<std::size_t> SerialPort::read(std::span<std::byte> buf) {
-        if (this->descriptor < 0) {
+        // Copies the shared state now, not when the lazy task first runs, so the task may outlive this SerialPort.
+        return readOn(this->slot, buf);
+    }
+
+    YarnBall::Task<std::size_t> SerialPort::write(std::span<const std::byte> data) {
+        return writeOn(this->slot, data);
+    }
+
+    YarnBall::Task<std::size_t> SerialPort::readOn(std::shared_ptr<detail::FdSlot> slot, std::span<std::byte> buf) {
+        // The guard pins the fd for the whole call: close() retires it but the OS descriptor is released only after the
+        // guard is gone, so the number cannot be reused under a syscall below.
+        detail::FdSlot::Guard guard(std::move(slot));
+        const int fd = guard.fd();
+        if (fd < 0) {
             throw SerialPortError("read on closed SerialPort");
         }
         while (true) {
             ::ssize_t n;
             do {
-                n = ::read(this->descriptor, buf.data(), buf.size());
+                n = ::read(fd, buf.data(), buf.size());
             } while (n < 0 && errno == EINTR);
             if (n >= 0) co_return static_cast<std::size_t>(n);
             const int err = errno;
             if (err == EAGAIN || err == EWOULDBLOCK) {
-                co_await YarnBall::io::waitReadable(this->descriptor);
-                if (this->descriptor < 0) throw SerialPortError("SerialPort closed during read");
+                co_await guard.readable();
+                if (!guard.open()) {
+                    throw SerialPortError("SerialPort closed during read");
+                }
                 continue;
             }
             throw SerialPortError(std::string("read: ") + std::strerror(err));
         }
     }
 
-    YarnBall::Task<std::size_t> SerialPort::write(std::span<const std::byte> data) {
-        if (this->descriptor < 0) {
+    YarnBall::Task<std::size_t> SerialPort::writeOn(std::shared_ptr<detail::FdSlot> slot,
+                                                    std::span<const std::byte> data) {
+        detail::FdSlot::Guard guard(std::move(slot));
+        const int fd = guard.fd();
+        if (fd < 0) {
             throw SerialPortError("write on closed SerialPort");
         }
         while (true) {
             ::ssize_t n;
             do {
-                n = ::write(this->descriptor, data.data(), data.size());
+                n = ::write(fd, data.data(), data.size());
             } while (n < 0 && errno == EINTR);
             if (n >= 0) co_return static_cast<std::size_t>(n);
             const int err = errno;
             if (err == EAGAIN || err == EWOULDBLOCK) {
-                co_await YarnBall::io::waitWritable(this->descriptor);
-                if (this->descriptor < 0) throw SerialPortError("SerialPort closed during write");
+                co_await guard.writable();
+                if (!guard.open()) {
+                    throw SerialPortError("SerialPort closed during write");
+                }
                 continue;
             }
             throw SerialPortError(std::string("write: ") + std::strerror(err));
@@ -213,12 +298,9 @@ namespace Embedded {
     }
 
     void SerialPort::close() noexcept {
-        if (this->descriptor >= 0) {
-            // Wake any read()/write() parked on this fd; they see the closed port on resume instead of hanging.
-            YarnBall::Reactor::instance()->cancelFd(this->descriptor);
-            (void) ::close(this->descriptor);
-            this->descriptor = -1;
-        }
+        // Publishes "closed", wakes a read()/write() parked on the fd (it sees the closed port on resume instead of
+        // hanging) and releases the descriptor once no call is in flight.
+        if (this->slot) this->slot->close();
     }
 
 #endif

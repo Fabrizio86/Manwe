@@ -20,7 +20,7 @@ namespace YarnBall {
      *  - @c Burdened     : 35% < occupancy < 70%.
      *  - @c Overburdened : 70% <= occupancy <= 100%.
      */
-    enum Workload {
+    enum class Workload : int {
         Idle = 0,
         Busy = 35,
         Burdened = 70,

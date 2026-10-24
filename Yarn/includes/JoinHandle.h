@@ -123,10 +123,14 @@ namespace YarnBall {
         Task<void> joinRunner(std::shared_ptr<JoinState<T>> state,
                               Task<T> task) {
             try {
+                // Own the task in a block-local so the child's frame (and with it the parameters and temporaries it
+                // holds) is destroyed before the joiner is released: the joiner may return and let the process exit as
+                // soon as it is woken, and must not race the tail of this runner destroying the user's objects.
+                Task<T> work = std::move(task);
                 if constexpr (std::is_void_v<T>) {
-                    co_await std::move(task);
+                    co_await std::move(work);
                 } else {
-                    state->value.emplace(co_await std::move(task));
+                    state->value.emplace(co_await std::move(work));
                 }
             } catch (...) {
                 state->exception = std::current_exception();
@@ -194,14 +198,17 @@ namespace YarnBall {
                 std::shared_ptr<std::atomic<bool>> watch;
                 if (core) watch = this->bind.armWatched(core, &JoinAwaiter::onCancel, this);
                 std::uintptr_t expected = 0;
-                if (state->state.compare_exchange_strong(
+                // Local copy: once the CAS below parks us the runner may resume and destroy this awaiter at once, so
+                // nothing reached through `this` (the member shared_ptr included) may be touched after it.
+                const std::shared_ptr<JoinState<T>> st = this->state;
+                if (st->state.compare_exchange_strong(
                         expected, enc,
                         std::memory_order_acq_rel,
                         std::memory_order_acquire)) {
                     // Parked: from here only locals may be touched, unless the unpark below wins.
                     if (watch && watch->load(std::memory_order_acquire)) {
                         expected = enc;
-                        if (state->state.compare_exchange_strong(
+                        if (st->state.compare_exchange_strong(
                                 expected, 0, std::memory_order_acq_rel)) {
                             this->cancelled = true;
                             this->proxy.reclaim();

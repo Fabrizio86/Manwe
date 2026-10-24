@@ -11,7 +11,6 @@
 #include <cstring>
 #include <random>
 #include <stdexcept>
-#include <sstream>
 #include <string>
 
 #include "AsyncSync.h"
@@ -158,6 +157,33 @@ namespace Soccer {
             std::uint8_t digest[20];
             s.finish(digest);
             return base64Encode(digest, 20);
+        }
+
+        /// True if @p key is the base64 text of exactly 16 bytes (RFC 6455 4.1: the
+        /// Sec-WebSocket-Key nonce): 22 alphabet characters followed by "==".
+        bool validWsKey(std::string_view key) {
+            if (key.size() != 24 || key.compare(22, 2, "==") != 0) return false;
+            for (std::size_t i = 0; i < 22; ++i) {
+                const char c = key[i];
+                const bool ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                                (c >= '0' && c <= '9') || c == '+' || c == '/';
+                if (!ok) return false;
+            }
+            return true;
+        }
+
+        /// A peer-supplied string made safe to put in an exception message (and so in a
+        /// log line): control and non-ASCII bytes become '?', and it is cut at 64 bytes.
+        std::string sanitize(std::string_view in) {
+            constexpr std::size_t kMax = 64;
+            std::string out;
+            out.reserve(std::min(in.size(), kMax) + 3);
+            for (std::size_t i = 0; i < in.size() && i < kMax; ++i) {
+                const unsigned char c = static_cast<unsigned char>(in[i]);
+                out.push_back((c >= 0x20 && c < 0x7f) ? static_cast<char>(c) : '?');
+            }
+            if (in.size() > kMax) out += "...";
+            return out;
         }
 
         // ----------------------------------------------------------------
@@ -344,8 +370,9 @@ namespace Soccer {
      *        or destroyed while a receive / send is still running.
      */
     struct WsConnection::Impl {
-        Impl(TcpStream s, bool server, std::vector<std::byte> pre, WsOptions o)
-            : stream(std::move(s)), preBuf(std::move(pre)), serverSide(server), opts(std::move(o)) {
+        Impl(TcpStream s, bool server, std::vector<std::byte> pre, WsOptions o, WsHandshakeInfo hs)
+            : stream(std::move(s)), preBuf(std::move(pre)), serverSide(server), opts(std::move(o)),
+              info(std::move(hs)) {
         }
 
         TcpStream stream;
@@ -356,7 +383,15 @@ namespace Soccer {
         std::size_t preOffset{0};
         bool serverSide;
         std::atomic<bool> open{true};
+        /// Set when a frame write failed or timed out: part of that frame may be on the
+        /// wire, so nothing more may follow it (guarded by writeMu).
+        bool writeBroken{false};
         WsOptions opts;
+        /// The opening handshake (request target, headers, subprotocol).
+        WsHandshakeInfo info;
+        /// Pong rate window (touched only by the one receive() in flight).
+        std::chrono::steady_clock::time_point pingWindowStart{std::chrono::steady_clock::now()};
+        std::size_t pingsInWindow{0};
         /// Serialises frame writes: the Pong receive() emits, sendText, close and
         /// fragmented sends all go through it, so frames never interleave.
         YarnBall::AsyncMutex writeMu;
@@ -540,12 +575,21 @@ namespace Soccer {
                                           std::span<const std::byte> payload,
                                           bool isFinal) {
             auto guard = co_await im->writeMu.lock();
+            // A sender queued behind one whose write failed would put its frame after a
+            // partial one: the peer would read garbage. It fails instead.
+            if (im->writeBroken) throw WsException("WebSocket connection broken by a failed write");
             const DisarmOnExit disarm{im->writeDeadline};
             im->writeDeadline.arm(im->stream.fd(), im->opts.writeTimeout);
             try {
                 co_await writeFrame(im->stream, opcode, payload, !im->serverSide, isFinal);
             } catch (const SocketException &) {
+                im->writeBroken = true;
+                im->open.store(false);
                 if (im->writeDeadline.expired()) throw WsException("WebSocket write timed out");
+                throw;
+            } catch (...) {
+                im->writeBroken = true;
+                im->open.store(false);
                 throw;
             }
             co_return;
@@ -554,7 +598,13 @@ namespace Soccer {
         std::vector<std::byte> closeBody(std::uint16_t code, std::string_view reason) {
             // A control frame payload is at most 125 bytes: 2 for the code
             // plus up to 123 of reason.
-            if (reason.size() > 123) reason = reason.substr(0, 123);
+            if (reason.size() > 123) {
+                // Cut on a code point boundary: back up over continuation bytes so the
+                // reason stays valid UTF-8 (a peer must close with 1007 on invalid text).
+                std::size_t cut = 123;
+                while (cut > 0 && (static_cast<unsigned char>(reason[cut]) & 0xC0) == 0x80) --cut;
+                reason = reason.substr(0, cut);
+            }
             std::vector<std::byte> body;
             body.reserve(2 + reason.size());
             body.push_back(std::byte((code >> 8) & 0xFF));
@@ -582,7 +632,11 @@ namespace Soccer {
         }
 
         bool originAllowed(const WsOptions &o, bool haveOrigin, const std::string &origin) {
-            if (o.allowedOrigins.empty() && !o.originCheck) return true;
+            if (o.allowedOrigins.empty() && !o.originCheck) {
+                // No policy: every Origin passes -- unless the strict mode asks for a
+                // policy and none is set, in which case no browser Origin does.
+                return !(o.strictOrigin && haveOrigin);
+            }
             if (!haveOrigin) return o.allowMissingOrigin;
             if (!o.allowedOrigins.empty()) {
                 bool listed = false;
@@ -599,10 +653,20 @@ namespace Soccer {
         YarnBall::Task<void> rejectHandshake(TcpStream &stream, int status) {
             const char *reason = "Bad Request";
             std::string extra;
-            if (status == 403) reason = "Forbidden";
-            if (status == 426) {
-                reason = "Upgrade Required";
-                extra = "Sec-WebSocket-Version: 13\r\n";
+            switch (status) {
+                case 401: reason = "Unauthorized"; break;
+                case 403: reason = "Forbidden"; break;
+                case 404: reason = "Not Found"; break;
+                case 429: reason = "Too Many Requests"; break;
+                case 500: reason = "Internal Server Error"; break;
+                case 503: reason = "Service Unavailable"; break;
+                case 426:
+                    reason = "Upgrade Required";
+                    extra = "Sec-WebSocket-Version: 13\r\n";
+                    break;
+                default:
+                    if (status != 400) reason = status >= 500 ? "Server Error" : "Client Error";
+                    break;
             }
             const std::string resp = "HTTP/1.1 " + std::to_string(status) + " " + reason + "\r\n" +
                                      extra + "Content-Length: 0\r\nConnection: close\r\n\r\n";
@@ -611,22 +675,135 @@ namespace Soccer {
             co_return;
         }
 
-        /// Peel "Name: value" lines (after the first line) into a callback.
-        template<typename Fn>
-        void forEachHeader(std::istringstream &iss, Fn &&fn) {
-            std::string line;
-            while (std::getline(iss, line)) {
-                if (!line.empty() && line.back() == '\r') line.pop_back();
-                if (line.empty()) continue;
+        /// A handshake message split into its first line and its header fields.
+        struct ParsedHead {
+            std::string firstLine;
+            std::vector<HttpHeader> headers;
+        };
+
+        /**
+         * @brief Split a handshake head (the text up to and including the blank line)
+         *        into first line and headers, strictly: lines end in CRLF only, a CR,
+         *        LF or NUL anywhere else is refused, every field is "token: value"
+         *        (so no obs-fold continuation and no colon-less junk is skipped over)
+         *        and values carry no control characters.
+         * @return false if the head is malformed.
+         */
+        bool parseHead(const std::string &raw, ParsedHead &out) {
+            if (raw.size() < 4) return false;
+            const std::string_view head(raw.data(), raw.size() - 4); // minus the closing CRLF CRLF
+            for (std::size_t i = 0; i < head.size(); ++i) {
+                const char c = head[i];
+                if (c == '\0') return false;
+                if (c == '\n' && (i == 0 || head[i - 1] != '\r')) return false;
+                if (c == '\r' && (i + 1 >= head.size() || head[i + 1] != '\n')) return false;
+            }
+            std::size_t pos = 0;
+            bool first = true;
+            while (pos <= head.size()) {
+                std::size_t eol = head.find("\r\n", pos);
+                if (eol == std::string_view::npos) eol = head.size();
+                const std::string_view line = head.substr(pos, eol - pos);
+                pos = eol + 2;
+                if (first) {
+                    out.firstLine.assign(line);
+                    first = false;
+                    continue;
+                }
                 const auto colon = line.find(':');
-                if (colon == std::string::npos) continue;
-                std::string name = line.substr(0, colon);
+                if (colon == std::string_view::npos || !detail::isHttpToken(line.substr(0, colon))) {
+                    return false;
+                }
                 std::size_t lead = colon + 1;
                 while (lead < line.size() && (line[lead] == ' ' || line[lead] == '\t')) ++lead;
                 std::size_t end = line.size();
                 while (end > lead && (line[end - 1] == ' ' || line[end - 1] == '\t')) --end;
-                fn(name, line.substr(lead, end - lead));
+                HttpHeader h;
+                h.name.assign(line.substr(0, colon));
+                h.value.assign(line.substr(lead, end - lead));
+                if (detail::hasFieldValueCtl(h.value)) return false;
+                out.headers.push_back(std::move(h));
             }
+            return !out.firstLine.empty();
+        }
+
+        /// Number of fields named @p name.
+        std::size_t countHeaders(const std::vector<HttpHeader> &hs, std::string_view name) {
+            std::size_t n = 0;
+            for (const auto &h : hs) {
+                if (iequals(h.name, name)) ++n;
+            }
+            return n;
+        }
+
+        /// Value of the first field named @p name (empty if absent).
+        std::string firstHeader(const std::vector<HttpHeader> &hs, std::string_view name) {
+            for (const auto &h : hs) {
+                if (iequals(h.name, name)) return h.value;
+            }
+            return {};
+        }
+
+        /// The comma-separated tokens of every field named @p name. @p ok is cleared if
+        /// one of them is not a valid token.
+        std::vector<std::string> headerTokens(const std::vector<HttpHeader> &hs,
+                                              std::string_view name, bool &ok) {
+            std::vector<std::string> out;
+            for (const auto &h : hs) {
+                if (!iequals(h.name, name)) continue;
+                std::string_view list = h.value;
+                std::size_t i = 0;
+                while (i <= list.size()) {
+                    std::size_t j = list.find(',', i);
+                    if (j == std::string_view::npos) j = list.size();
+                    std::string_view t = list.substr(i, j - i);
+                    while (!t.empty() && (t.front() == ' ' || t.front() == '\t')) t.remove_prefix(1);
+                    while (!t.empty() && (t.back() == ' ' || t.back() == '\t')) t.remove_suffix(1);
+                    if (!t.empty()) {
+                        if (!detail::isHttpToken(t)) ok = false;
+                        out.emplace_back(t);
+                    }
+                    i = j + 1;
+                }
+            }
+            return out;
+        }
+
+        /// The values of every field named @p name joined with ", " (a list-valued field
+        /// may be split over several lines, RFC 9110 5.3).
+        std::string joinedHeader(const std::vector<HttpHeader> &hs, std::string_view name) {
+            std::string out;
+            for (const auto &h : hs) {
+                if (!iequals(h.name, name)) continue;
+                if (!out.empty()) out += ", ";
+                out += h.value;
+            }
+            return out;
+        }
+
+        /**
+         * @brief Reduce the request target of an upgrade to origin-form, the only
+         *        shape a handshake hook can reason about. An absolute-form target
+         *        ("http://host/path") loses its scheme and authority; anything that
+         *        is not a path (a bare word, "*", an authority) or carries a fragment
+         *        is refused. Returns false for the refusals.
+         */
+        bool normaliseTarget(std::string_view target, std::string &out) {
+            if (target.find('#') != std::string_view::npos) return false;
+            if (!target.empty() && target.front() == '/') {
+                out.assign(target);
+                return true;
+            }
+            std::size_t skip = 0;
+            if (target.size() > 7 && iequals(target.substr(0, 7), "http://")) skip = 7;
+            else if (target.size() > 8 && iequals(target.substr(0, 8), "https://")) skip = 8;
+            if (skip == 0) return false;
+            std::string_view rest = target.substr(skip);
+            const std::size_t end = rest.find_first_of("/?");
+            if (end == 0) return false; // no authority
+            rest = end == std::string_view::npos ? std::string_view{} : rest.substr(end);
+            out = rest.empty() || rest.front() == '?' ? "/" + std::string(rest) : std::string(rest);
+            return true;
         }
 
         bool hasToken(std::string_view list, std::string_view token) {
@@ -662,23 +839,8 @@ namespace Soccer {
 
         // Parse the request line + headers (case-insensitive). Body
         // is irrelevant -- a WebSocket upgrade has no body.
-        const auto headerEnd = raw.find("\r\n\r\n");
-        std::string headers = raw.substr(0, headerEnd);
-
-        std::istringstream iss(headers);
-        std::string requestLine;
-        std::getline(iss, requestLine);
-        if (!requestLine.empty() && requestLine.back() == '\r') requestLine.pop_back();
-
-        std::string upgrade, connection, key, version, origin;
-        bool haveOrigin = false;
-        forEachHeader(iss, [&](const std::string &name, std::string value) {
-            if (iequals(name, "upgrade"))         upgrade = std::move(value);
-            else if (iequals(name, "connection")) connection = std::move(value);
-            else if (iequals(name, "sec-websocket-key")) key = std::move(value);
-            else if (iequals(name, "sec-websocket-version")) version = std::move(value);
-            else if (iequals(name, "origin")) { origin = std::move(value); haveOrigin = true; }
-        });
+        ParsedHead head;
+        const bool wellFormed = parseHead(raw, head);
 
         int rejectStatus = 0;
         std::string why;
@@ -686,22 +848,91 @@ namespace Soccer {
             rejectStatus = status;
             why = std::move(reason);
         };
-        if (requestLine.compare(0, 4, "GET ") != 0) {
+
+        WsHandshakeInfo info;
+        std::string upgrade, connection, key, version, origin;
+        bool haveOrigin = false;
+        bool subprotocolsOk = true;
+        if (!wellFormed) {
+            refuse(400, "malformed WebSocket handshake request");
+        } else {
+            // Upgrade and Connection are token lists: all their fields count.
+            upgrade = joinedHeader(head.headers, "upgrade");
+            connection = joinedHeader(head.headers, "connection");
+            key = firstHeader(head.headers, "sec-websocket-key");
+            version = firstHeader(head.headers, "sec-websocket-version");
+            origin = firstHeader(head.headers, "origin");
+            haveOrigin = countHeaders(head.headers, "origin") != 0;
+            info.offeredSubprotocols = headerTokens(head.headers, "sec-websocket-protocol", subprotocolsOk);
+        }
+
+        const std::string &requestLine = head.firstLine;
+        std::string target;
+        if (rejectStatus != 0) {
+            // already refused
+        } else if (requestLine.compare(0, 4, "GET ") != 0) {
             refuse(400, "WebSocket upgrade must be a GET request");
-        } else if (requestLine.size() < 13 || requestLine.compare(requestLine.size() - 9, 9, " HTTP/1.1") != 0) {
+        } else if (requestLine.size() < 14 || requestLine.compare(requestLine.size() - 9, 9, " HTTP/1.1") != 0) {
             refuse(400, "WebSocket upgrade must be HTTP/1.1");
-        } else if (!iequals(upgrade, "websocket")) {
+        } else if (detail::hasTargetCtl(std::string_view(requestLine).substr(4, requestLine.size() - 13))) {
+            refuse(400, "invalid request target in WebSocket upgrade");
+        } else if (!normaliseTarget(std::string_view(requestLine).substr(4, requestLine.size() - 13), target)) {
+            refuse(400, "WebSocket upgrade target must be an origin-form path without a fragment");
+        } else if (countHeaders(head.headers, "host") != 1 ||
+                   joinedHeader(head.headers, "host").empty() ||
+                   detail::hasTargetCtl(joinedHeader(head.headers, "host"))) {
+            // HTTP/1.1 requires exactly one Host (RFC 9112 3.2).
+            refuse(400, "WebSocket upgrade needs exactly one Host header");
+        } else if (countHeaders(head.headers, "sec-websocket-key") > 1 ||
+                   countHeaders(head.headers, "sec-websocket-version") > 1 ||
+                   countHeaders(head.headers, "origin") > 1) {
+            // A duplicated header is read one way here and another by a proxy in front.
+            refuse(400, "duplicate header in WebSocket upgrade");
+        } else if (!hasToken(upgrade, "websocket")) {
             refuse(400, "missing or wrong Upgrade header");
         } else if (!hasToken(connection, "upgrade")) {
             // Connection may be "Upgrade" or list it among other tokens.
             refuse(400, "missing Upgrade in Connection header");
         } else if (version != "13") {
-            refuse(426, "unsupported Sec-WebSocket-Version: " + version);
-        } else if (key.size() != 24 || key.compare(22, 2, "==") != 0) {
+            refuse(426, "unsupported Sec-WebSocket-Version: " + sanitize(version));
+        } else if (!validWsKey(key)) {
             // Key is a base64-encoded 16-byte nonce: 24 characters ending "==".
             refuse(400, "invalid Sec-WebSocket-Key");
+        } else if (!subprotocolsOk) {
+            refuse(400, "invalid Sec-WebSocket-Protocol");
         } else if (!originAllowed(options, haveOrigin, origin)) {
-            refuse(403, "WebSocket Origin not allowed: " + origin);
+            refuse(403, "WebSocket Origin not allowed: " + sanitize(origin));
+        }
+
+        std::string chosenSubprotocol;
+        if (rejectStatus == 0) {
+            info.path = std::move(target);
+            info.headers = std::move(head.headers);
+            if (options.onHandshake) {
+                WsHandshakeDecision decision;
+                bool hookThrew = false;
+                try {
+                    decision = options.onHandshake(info);
+                } catch (...) {
+                    hookThrew = true;
+                }
+                if (hookThrew) {
+                    refuse(500, "WebSocket handshake hook failed");
+                } else if (decision.status != 0) {
+                    refuse((decision.status >= 400 && decision.status <= 599) ? decision.status : 403,
+                           "WebSocket upgrade refused by the handshake hook");
+                } else if (!decision.subprotocol.empty()) {
+                    bool offered = false;
+                    for (const auto &o : info.offeredSubprotocols) {
+                        if (o == decision.subprotocol) offered = true;
+                    }
+                    if (!offered || !detail::isHttpToken(decision.subprotocol)) {
+                        refuse(500, "handshake hook chose a subprotocol the client did not offer");
+                    } else {
+                        chosenSubprotocol = std::move(decision.subprotocol);
+                    }
+                }
+            }
         }
         if (rejectStatus != 0) {
             try {
@@ -711,13 +942,16 @@ namespace Soccer {
             }
             throw WsException(why);
         }
+        info.subprotocol = chosenSubprotocol;
 
         const std::string accept = computeAccept(key);
         std::string resp =
             "HTTP/1.1 101 Switching Protocols\r\n"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
-            "Sec-WebSocket-Accept: " + accept + "\r\n\r\n";
+            "Sec-WebSocket-Accept: " + accept + "\r\n";
+        if (!chosenSubprotocol.empty()) resp += "Sec-WebSocket-Protocol: " + chosenSubprotocol + "\r\n";
+        resp += "\r\n";
         try {
             co_await stream.write(std::span<const std::byte>(
                 reinterpret_cast<const std::byte *>(resp.data()), resp.size()));
@@ -728,13 +962,28 @@ namespace Soccer {
         hs.disarm(); // before the fd moves into the connection
 
         co_return WsConnection(std::make_shared<Impl>(std::move(stream), /*server=*/true,
-                                                      std::move(trailing), std::move(options)));
+                                                      std::move(trailing), std::move(options),
+                                                      std::move(info)));
     }
 
     YarnBall::Task<WsConnection> WsConnection::connect(std::string host,
                                                          std::uint16_t port,
                                                          std::string path,
                                                          WsOptions options) {
+        // Validated before anything is sent or connected: the host and the target go
+        // into the request line and Host header verbatim, so a CR, LF or space in
+        // either would let a caller-supplied string inject headers or a second request.
+        if (path.empty()) path = "/";
+        if (host.empty() || detail::hasTargetCtl(host) || detail::hasTargetCtl(path)) {
+            throw WsException("invalid host or path for WebSocket connect");
+        }
+        std::string offered;
+        for (const auto &p : options.subprotocols) {
+            if (!detail::isHttpToken(p)) throw WsException("invalid WebSocket subprotocol");
+            if (!offered.empty()) offered += ", ";
+            offered += p;
+        }
+
         TcpStream s = co_await tcpConnect(host, port, options.connectTimeout);
         IoDeadline hs(s.fd(), options.handshakeTimeout);
 
@@ -743,11 +992,13 @@ namespace Soccer {
 
         std::string req =
             "GET " + path + " HTTP/1.1\r\n"
-            "Host: " + host + ":" + std::to_string(port) + "\r\n"
+            "Host: " + detail::hostHeaderValue(host, port, 0) + "\r\n"
             "Upgrade: websocket\r\n"
             "Connection: Upgrade\r\n"
             "Sec-WebSocket-Key: " + key + "\r\n"
-            "Sec-WebSocket-Version: 13\r\n\r\n";
+            "Sec-WebSocket-Version: 13\r\n";
+        if (!offered.empty()) req += "Sec-WebSocket-Protocol: " + offered + "\r\n";
+        req += "\r\n";
 
         std::vector<std::byte> trailing;
         std::string raw;
@@ -764,28 +1015,21 @@ namespace Soccer {
         }
         hs.disarm();
 
-        const auto headerEnd = raw.find("\r\n\r\n");
-        std::string headers = raw.substr(0, headerEnd);
-
-        std::istringstream iss(headers);
-        std::string line;
-        if (!std::getline(iss, line)) throw WsException("no status line in response");
-        if (!line.empty() && line.back() == '\r') line.pop_back();
+        ParsedHead head;
+        if (!parseHead(raw, head)) throw WsException("malformed WebSocket handshake response");
         {
             // "HTTP/1.1 101 ..." -- the status code token must be exactly 101.
+            const std::string &line = head.firstLine;
             const auto sp = line.find(' ');
             if (sp == std::string::npos || line.compare(0, 5, "HTTP/") != 0 ||
                 line.compare(sp + 1, 3, "101") != 0 ||
                 (line.size() > sp + 4 && line[sp + 4] != ' ')) {
-                throw WsException("server did not upgrade: " + line);
+                throw WsException("server did not upgrade: " + sanitize(line));
             }
         }
-        std::string acceptHeader, upgrade, connection;
-        forEachHeader(iss, [&](const std::string &name, std::string value) {
-            if (iequals(name, "sec-websocket-accept")) acceptHeader = std::move(value);
-            else if (iequals(name, "upgrade")) upgrade = std::move(value);
-            else if (iequals(name, "connection")) connection = std::move(value);
-        });
+        const std::string acceptHeader = firstHeader(head.headers, "sec-websocket-accept");
+        const std::string upgrade = firstHeader(head.headers, "upgrade");
+        const std::string connection = firstHeader(head.headers, "connection");
 
         if (!iequals(upgrade, "websocket") || !hasToken(connection, "upgrade")) {
             throw WsException("server response lacks Upgrade: websocket / Connection: Upgrade");
@@ -794,8 +1038,29 @@ namespace Soccer {
         if (acceptHeader != expected) {
             throw WsException("Sec-WebSocket-Accept mismatch");
         }
+        // RFC 6455 4.1: an extension or subprotocol the client did not ask for fails the connection.
+        if (countHeaders(head.headers, "sec-websocket-extensions") != 0) {
+            throw WsException("server selected a WebSocket extension that was not requested");
+        }
+        WsHandshakeInfo info;
+        info.path = std::move(path);
+        {
+            bool ok = true;
+            const auto chosen = headerTokens(head.headers, "sec-websocket-protocol", ok);
+            if (!ok || chosen.size() > 1) throw WsException("invalid Sec-WebSocket-Protocol in response");
+            if (!chosen.empty()) {
+                bool requested = false;
+                for (const auto &p : options.subprotocols) {
+                    if (p == chosen.front()) requested = true;
+                }
+                if (!requested) throw WsException("server selected a WebSocket subprotocol that was not requested");
+                info.subprotocol = chosen.front();
+            }
+        }
+        info.headers = std::move(head.headers);
         co_return WsConnection(std::make_shared<Impl>(std::move(s), /*server=*/false,
-                                                      std::move(trailing), std::move(options)));
+                                                      std::move(trailing), std::move(options),
+                                                      std::move(info)));
     }
 
     WsConnection &WsConnection::operator=(WsConnection &&other) noexcept {
@@ -818,6 +1083,11 @@ namespace Soccer {
         }
     }
 
+    const WsHandshakeInfo &WsConnection::handshake() const noexcept {
+        static const WsHandshakeInfo empty;
+        return this->impl ? this->impl->info : empty;
+    }
+
     bool WsConnection::isOpen() const noexcept {
         return this->impl && this->impl->open.load(std::memory_order_acquire);
     }
@@ -838,6 +1108,10 @@ namespace Soccer {
             WsMessageType assemblyType{WsMessageType::Text};
             std::vector<std::byte> assemblyBuf;
             const std::size_t maxMessage = im->opts.maxMessageBytes;
+            // Non-final continuation frames with no payload add nothing to the message
+            // yet each one re-arms the frame timeout; a run of them is an attack.
+            constexpr std::size_t kMaxEmptyFragments = 32;
+            std::size_t emptyFragments = 0;
 
             while (true) {
                 WsFrame f;
@@ -889,6 +1163,13 @@ namespace Soccer {
                         if (!assembling) {
                             co_await failConnection(im, 1002, "orphan continuation frame");
                         }
+                        if (f.payload.empty() && !f.fin) {
+                            if (++emptyFragments > kMaxEmptyFragments) {
+                                co_await failConnection(im, 1008, "too many empty message fragments");
+                            }
+                        } else {
+                            emptyFragments = 0;
+                        }
                         if (maxMessage != 0 && assemblyBuf.size() + f.payload.size() > maxMessage) {
                             co_await failConnection(im, 1009, "multi-frame message exceeds the size cap");
                         }
@@ -911,6 +1192,16 @@ namespace Soccer {
                         // to interleave with continuation; assembly state
                         // stays untouched. The write lock keeps the Pong
                         // from landing inside another task's frame.
+                        if (im->opts.maxPingsPerSecond != 0) {
+                            const auto now = std::chrono::steady_clock::now();
+                            if (now - im->pingWindowStart >= std::chrono::seconds{1}) {
+                                im->pingWindowStart = now;
+                                im->pingsInWindow = 0;
+                            }
+                            // Past the budget a Ping goes unanswered (RFC 6455 5.5.2 lets an
+                            // endpoint answer only some of them).
+                            if (++im->pingsInWindow > im->opts.maxPingsPerSecond) break;
+                        }
                         co_await sendLocked(im, kOpPong, f.payload, true);
                         break;
                     }

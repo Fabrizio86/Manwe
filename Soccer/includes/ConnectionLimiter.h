@@ -65,11 +65,13 @@ namespace Soccer {
 
         /// @return A slot, or an empty one when @c maxConnections are already live.
         Slot tryAcquire() {
-            const std::size_t before = this->count->fetch_add(1, std::memory_order_acq_rel);
-            if (this->max != 0 && before >= this->max) {
-                this->count->fetch_sub(1, std::memory_order_acq_rel);
-                return Slot{};
-            }
+            // Compare-exchange, so a refused attempt never raises the count (a transient
+            // over-count would falsely refuse a caller while a slot is in fact free).
+            std::size_t cur = this->count->load(std::memory_order_relaxed);
+            do {
+                if (this->max != 0 && cur >= this->max) return Slot{};
+            } while (!this->count->compare_exchange_weak(cur, cur + 1, std::memory_order_acq_rel,
+                                                         std::memory_order_relaxed));
             return Slot{this->count};
         }
 

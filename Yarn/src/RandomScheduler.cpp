@@ -9,6 +9,7 @@ namespace YarnBall {
     int RandomScheduler::ThreadIndex(int maxValue) {
         if (maxValue <= 0) return -1;
         std::uniform_int_distribution<int> fiberIndex(0, maxValue - 1);
+        std::lock_guard<std::mutex> lk(this->mu);
         return fiberIndex(this->randomEngine);
     }
 

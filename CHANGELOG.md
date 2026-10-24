@@ -6,7 +6,124 @@ to [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **`Telegraph::Signal::emit` / `emitAsync` no longer copy the handler list.** The list is
+  copy-on-write behind a `shared_ptr`, so an emission only copies one pointer under the lock
+  (and skips the waiter bookkeeping when no `next()` is parked). `benchmarks/bench_signal.cpp`
+  (Apple silicon, Release): 8 handlers 69 → 26 ns/emit, 8 handlers on 4 threads 187 → 45 ns/emit,
+  1 handler 41 → 21 ns/emit. Semantics are unchanged: handlers may connect/disconnect during an
+  emission, which works from a snapshot.
+- **`SignalSet` supports any number of live instances.** The one-per-process limit is gone:
+  on macOS/BSD each set owns a kqueue with `EVFILT_SIGNAL` filters (no signal handler, so
+  nothing has to be async-signal-safe; same-number signals arriving before `next()` runs coalesce);
+  elsewhere the `sigaction` handler fans out to every live set's self-pipe. Original dispositions
+  are restored when the last set holding a signal is destroyed. A second set used to throw
+  `SignalCaptureError`; it now succeeds.
+
+### Fixed (code audit)
+- **Reactor / cancellation:** epoll `registerFd` no longer resumes a waiter twice when `EPOLL_CTL_MOD`
+  fails; epoll timer registration is atomic against `cancelTimer` (no double delete / foreign fd close);
+  `disarmCancelHook` can no longer return while a fire is in progress; a wake racing a destroyed
+  `AsyncMutex`/`Semaphore`/`RwLock` waiter no longer revokes a grant that was never made;
+  `whenAny`/`whenAll` clean up when their frame is destroyed while parked; `AsyncOnce` recovers when
+  its runner frame is destroyed; the Reactor loop wakes parked waiters instead of exiting silently.
+- **Scheduler shutdown:** tasks left in a worker deque, inbox or the injection queue are failed through
+  `exception()` and deleted, so `Waitable::wait()` returns; temp-fiber retirement has the missing fence;
+  a failed pool constructor unwinds its workers; idle workers re-check peers before sleeping.
+- **Channels / Signal / Select:** `Channel`/`BoundedChannel` state is shared with parked awaiters (no
+  use-after-free when the channel dies first); `~Signal` cancels parked `next()` waiters; wake-ups fall
+  back inline if the pool refuses a task; `pushFront` on a closed channel keeps the value; rendezvous
+  `BoundedChannel` no longer releases a sender without a receiver; `emit` runs every handler and rethrows
+  the first exception; serial and GPIO `close()` no longer races reads (atomic fd, non-blocking GPIO fd).
+- **Sockets / TLS:** socket fds are atomic slots with an in-flight count, so `close()` from another
+  thread can't hit a recycled descriptor; `tcpConnectUnix` no longer leaks the fd on cancel;
+  `bindUnix` refuses to unlink a live server's socket; `tcpServe` sheds load at EMFILE, survives
+  transient accept errors and throwing handlers, and its stop probe is bounded; `readExact` is capped;
+  ICMP parsing checks IP version, protocol and type; `TlsStream` keeps its fd until the last waiter
+  leaves and serialises writers; client cert/key must come as a pair; `MSG_NOSIGNAL`/`SO_NOSIGPIPE`
+  per socket.
+- **HTTP/1.1:** request-smuggling fixes (all `Transfer-Encoding` headers scanned, CRLF-only line endings,
+  token header names, exactly one `Host`), proper 400/414/431/500 responses, response header/body
+  deadlines on the client, a `101` is final, status line without a reason phrase parses.
+- **HTTP/2:** client use-after-free on close after submit (nghttp2 copies header strings; streams freed
+  only after the session and the awaiter are done); cookie crumbs are joined; trailers-only responses keep
+  their trailers; flow-controlled output is pulled in bounded chunks; `nghttp2_option` limits set and
+  nghttp2 >= 1.61 required; handler exceptions return a fixed 500 body; `route()` after `serve()` no
+  longer races.
+- **WebSocket:** handshake path/host are validated (request injection); duplicate handshake headers are
+  rejected; key must be 16 bytes of base64; client rejects unrequested extensions/subprotocols; Close
+  reasons are cut on a UTF-8 boundary; ping flood and empty-fragment limits.
+- **Metrics / Log / Trace / Timers:** Prometheus metric names are validated; histogram sums ignore
+  non-finite values and scrapes are consistent; log sink state survives static teardown; `jsonString`
+  repairs invalid UTF-8; `trace::newChild` of an empty parent, uppercase `traceparent` hex, signed
+  overflow in timer helpers.
+- **`SignalSet`:** on non-kqueue builds a set only receives the signals it subscribed to; teardown no
+  longer reads or writes a recycled descriptor; `next()` binds its descriptor when called.
+- **Examples:** `ping`, `http_get`, `http2_get` argument validation; `graceful_http` watcher owns its
+  `SignalSet`; `echo_server` has a connection cap and idle timeout; `chat_signals` and
+  `producer_consumer` no longer synchronise with sleeps.
+
+### Fixed (second audit pass)
+- **Cancellation / timers:** a stale second `cancelTimer` on a freed sleeper address (handle reuse) woke an
+  unrelated sleeper, so `withTimeout(instant, 30s)` occasionally threw `TimeoutException` (also in the original
+  tree); `SleepAwaiter` and the fd-wait awaiter now gate the redo on "registered" vs "stopped" without
+  allocating. `runTakenHooks` no longer touches hooks whose owner died during an inline resume; a stop callback
+  that unwinds the frame owning its own stop source stops through a copy.
+- **Scheduler:** a failed `Yarn()` constructor (thread creation error) throws instead of hanging; wake claiming
+  stops quick spawns piling onto one parked worker; the pool grows when every worker is blocked on a child
+  task; shutdown no longer reports one "unhandled exception" per discarded callable; `Trace::Scope` unwinds on
+  its owner thread; pinning (opt-in) spreads over the allowed CPUs.
+- **Reactor:** io_uring sleepers use the ordered-table design (cancelling 50,000 sleepers: 12.8 s -> 143 ms);
+  io_uring `cancelFd`/`cancelByHandle` no longer lose a cancel when the submission queue is full; a dead
+  reactor resumes new waiters with `ReactorError` instead of queueing them forever.
+- **`SignalSet`:** a signal raised in a forked child no longer reaches the parent's set; capturing `SIGCHLD`
+  on kqueue platforms no longer auto-reaps children (empty handler instead of `SIG_IGN`).
+- **Wire:** `channelSelect` no longer loses or reorders values (the caller resumes after every pull has put
+  its value back) and no longer prefers low indexes; `receiveFor`/`sendFor` give lossless timeouts (plain
+  `withTimeout` around `receive`/`send` is documented as lossy); `Signal::disconnect` no longer deadlocks when a
+  handler's captures re-enter the signal; `connect`/`disconnect` are O(1) when no emission is in flight (20,000
+  connects: 1125 ms -> 0.6 ms); a throwing `T` move can't strand a receiver; `Signal::next()` after
+  `~Signal` no longer hangs. Serial/GPIO fd slots defer `::close` to the last in-flight operation.
+- **Sockets / TLS:** `bindUnix` no longer changes the process umask (bind, then `chmod`, then `listen`) and
+  refuses to unlink a live or saturated server; `TCP_NODELAY` on every TCP socket (two-write responses no
+  longer stall ~42 ms); a waiter can no longer register on a closed or reused fd (was ~1 hang per 1000 stress
+  iterations); `tcpServe` doesn't drop a legitimate connection when fd exhaustion ends; `TlsStream::close()`
+  no longer holds its lock for ~100 ms; each connect candidate gets its own timeout slice; `TlsListener::accept`
+  defers the handshake to first use; connect with a timeout only arms a timer when the handshake is still
+  pending (HTTP GET with a new connection: 122 us -> 91 us).
+- **HTTP / HTTP/2 / WebSocket:** no body on HEAD/1xx/204/304; HTTP/2 idle timeout runs from the last real
+  progress and control-frame floods get `ENHANCE_YOUR_CALM`; response headers/trailers are validated and
+  framing headers filtered; routes match on the path with `HttpRequest::query`; the HTTP/1 client decodes
+  chunked responses and parses `Connection` as a token list; WebSocket handshake targets are normalised and
+  `Host` is validated; split `Connection`/`Upgrade` fields are accepted; the per-request HTTP/2 deadline
+  timer is cancelled when the request ends.
+- **`BoundedChannel`:** the audit's changes had grown the `send`/`receive` coroutine frames by ~48 bytes (a
+  slower malloc size class: ~15 ns per pair); frames are now smaller than the original's.
+
+### Changed (behaviour)
+- `HttpServer`/`Http2Server`: `HEAD` needs its own route (no fallback to `GET`); methods are case-sensitive;
+  `Http2ServerOptions::maxControlFramesPerSecond` (default 50) and `WsOptions::onHandshake`/`strictOrigin`/
+  `subprotocols`/`maxPingsPerSecond` are new.
+- `tcpConnectUnix(path, busyRetry = 5s)`, `TcpListener::tryAccept()`/`interruptAccept()`, `Yarn::awaitQuiescence()`.
+- Linux worker CPU pinning is now opt-in (`YARN_PIN_WORKERS=1`) and respects the allowed CPU set.
+- `Workload` and `QueueSize` are `enum class`.
+- Exceptions thrown by callables passed to `Yarn::run` are reported as unhandled-detached-task errors
+  instead of vanishing.
+- `whenAny` on an empty list throws `std::invalid_argument` instead of waiting forever;
+  `channelSelect` on an empty list completes with `nullopt`.
+- Servers default to `maxConnections = 1024` (0 still means unlimited); WebSocket `idleTimeout` defaults
+  to 300 s, HTTP/2 idle timeout to 60 s. `HttpClient` defaults to 30 s / 120 s response header / body
+  deadlines. `HttpClient` sends `Host` with the port when it isn't 80 and rejects malformed header lines.
+- `BufferedReader::readExact` is capped at 64 MiB by default; the line cap is a constructor option.
+- `TlsListener::accept` takes a handshake timeout (default 10 s).
+- `SocketAddress` binds set `IPV6_V6ONLY` explicitly (`dualStack` option, default on).
+- `WsOptions` gains `onHandshake`, `strictOrigin`, `subprotocols` and `maxPingsPerSecond`;
+  `Signal` gains `connectScoped()`; `Channel` gains an optional soft cap.
+- `SignalSet` no longer limits one instance per process (see above); a signal outside 1..64 is rejected
+  on non-kqueue builds.
+
 ### Added
+- `benchmarks/bench_signal.cpp` — `Telegraph::Signal` emit cost with 0/1/8 handlers and 1/4 threads.
 - **Cancellable awaits** (`Yarn/includes/Cancellation.h`) — `withCancellation(token, task)`
   runs a task in a cancellation scope; `sleepFor`, `io::waitReadable/Writable`,
   `AsyncMutex/Semaphore/Notify/Event/Barrier/RwLock/Once`, `JoinHandle::join` and the

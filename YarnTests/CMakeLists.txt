@@ -14,7 +14,9 @@ if (NOT MSVC)
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -fPIC")
 endif ()
 
-add_executable(YarnTests main.cpp soccer_limits_tests.cpp cancellation_tests.cpp test_framework.hpp)
+add_executable(YarnTests main.cpp soccer_limits_tests.cpp cancellation_tests.cpp
+        audit_core_tests.cpp audit_async_tests.cpp audit_wire_tests.cpp audit_soccer_net_tests.cpp audit_soccer_http_tests.cpp
+        test_framework.hpp)
 
 # Link against the CMake targets (not raw .a paths) so that PUBLIC compile
 # definitions like SOCCER_HAS_TLS propagate transitively.

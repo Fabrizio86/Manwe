@@ -22,10 +22,14 @@
 
 #ifdef _WIN32
 
+#include <algorithm>
+#include <atomic>
 #include <coroutine>
 #include <cstddef>
+#include <memory>
 #include <span>
 
+#include "Cancellation.h"
 #include "Coroutines.h"
 #include "PlatformNet.h"
 #include "Reactor.h"
@@ -38,119 +42,182 @@
 namespace Soccer {
 
     namespace detail {
+        /// Largest length handed to one WSARecv / WSASend (WSABUF::len is a ULONG; a longer buffer
+        /// would be truncated modulo 2^32). The call transfers fewer bytes than asked, as a short
+        /// read or write always may.
+        inline constexpr std::size_t kOverlappedMaxChunk = 0x7fffffffu;
+
+        /**
+         * @brief Shared body of the overlapped awaiters: one operation issued on an
+         *        IOCP-associated socket, resumed by the Reactor's completion thread.
+         *
+         * Lifetime. The OVERLAPPED record is heap-allocated and the awaiter
+         * resumes through a @c WaitProxy, mirroring the POSIX fd awaiters:
+         *  - a stop request (cancellation scope or @c Task::requestCancel) calls
+         *    @c CancelIoEx; the operation then completes as aborted and the awaiter
+         *    throws @c CancelledException;
+         *  - an awaiter destroyed while the operation is still in flight cancels
+         *    it, waits for the kernel to finish with the caller's buffer, and
+         *    LEAKS the (small) record: the completion thread may still dequeue
+         *    its packet and touch it, so freeing it would be a use-after-free.
+         *    The proxy makes that late resume a no-op.
+         */
+        class OverlappedOp {
+        public:
+            OverlappedOp(const OverlappedOp &) = delete;
+            OverlappedOp &operator=(const OverlappedOp &) = delete;
+
+            ~OverlappedOp() {
+                this->bind.disarm();
+                if (this->inFlight) {
+                    // Frame destroyed with the operation outstanding.
+                    (void) this->proxy.kill();
+                    (void) ::CancelIoEx(this->socketHandle(), this->oc);
+                    DWORD ignored = 0;
+                    DWORD flags = 0;
+                    (void) ::WSAGetOverlappedResult(this->sock(), this->oc, &ignored, TRUE, &flags);
+                    this->oc = nullptr; // leaked on purpose, see above
+                }
+                this->proxy.drop();
+                delete this->oc;
+            }
+
+            bool await_ready() noexcept { return false; }
+
+        protected:
+            OverlappedOp(int fd, void *data, std::size_t len)
+                : fd(fd), oc(new YarnBall::OverlappedCompletion{}) {
+                this->wsabuf.buf = static_cast<CHAR *>(data);
+                this->wsabuf.len = static_cast<ULONG>(std::min(len, kOverlappedMaxChunk));
+            }
+
+            YarnBall::OverlappedCompletion *ocPtr() const noexcept { return this->oc; }
+            SOCKET sock() const noexcept { return static_cast<SOCKET>(static_cast<unsigned>(this->fd)); }
+            HANDLE socketHandle() const noexcept { return reinterpret_cast<HANDLE>(this->sock()); }
+
+            /// @p issue starts the WSA call and returns its result code (0 or SOCKET_ERROR).
+            template<typename Promise, typename Issue>
+            bool suspendAndIssue(std::coroutine_handle<Promise> h, Issue issue) {
+                YarnBall::detail::TaskPromiseCore *core = YarnBall::detail::CancelBinding::ambient(h);
+                std::shared_ptr<std::atomic<bool>> watch;
+                if (core) {
+                    // Armed before the call, so a stop that lands later finds an operation to cancel.
+                    watch = this->bind.armWatched(core, &OverlappedOp::onCancel, this);
+                    if (this->cancelled.load(std::memory_order_acquire)) {
+                        this->bind.disarm();
+                        return false; // stopped before anything was issued; await_resume throws
+                    }
+                }
+                this->oc->handle = this->proxy.publish(h);
+                this->started = true;
+                this->inFlight = true; // set before the call: once it is issued `this` may be gone
+                const HANDLE sockHandle = this->socketHandle();
+                OVERLAPPED *const ov = this->oc;
+                if (issue() != 0) {
+                    const int err = ::WSAGetLastError();
+                    if (err != WSA_IO_PENDING) {
+                        // Hard failure before suspending: report it without suspending (resuming
+                        // the handle from inside await_suspend would re-enter the coroutine).
+                        this->inFlight = false;
+                        this->bind.disarm();
+                        this->proxy.reclaim();
+                        this->oc->err = err; // nonzero: await_resume reports it
+                        return false;
+                    }
+                }
+                // Only locals from here on: the completion may already have resumed (and
+                // destroyed) this awaiter. A stop that landed before the call was issued found
+                // nothing to cancel: redo it.
+                if (watch && watch->load(std::memory_order_acquire)) (void) ::CancelIoEx(sockHandle, ov);
+                return true;
+            }
+
+            std::size_t finish(const char *what) {
+                this->inFlight = false;
+                this->bind.disarm();
+                if (!this->started) throw YarnBall::CancelledException{}; // stopped before the call was issued
+                const int err = this->oc->err;
+                const std::size_t bytes = static_cast<std::size_t>(this->oc->bytes);
+                if (this->cancelled.load(std::memory_order_acquire) &&
+                    (err == ERROR_OPERATION_ABORTED || err == WSA_OPERATION_ABORTED)) {
+                    throw YarnBall::CancelledException{};
+                }
+                if (err != 0) {
+                    throw SocketException(what, err);
+                }
+                return bytes;
+            }
+
+            int fd;
+            WSABUF wsabuf{};
+
+        private:
+            static void onCancel(void *p) noexcept {
+                auto *self = static_cast<OverlappedOp *>(p);
+                self->cancelled.store(true, std::memory_order_release);
+                (void) ::CancelIoEx(self->socketHandle(), self->oc);
+            }
+
+            YarnBall::OverlappedCompletion *oc;
+            bool started = false;  ///< the WSA call was issued
+            bool inFlight = false; ///< issued and not yet resumed
+            std::atomic<bool> cancelled{false};
+            YarnBall::detail::WaitProxy proxy;
+            YarnBall::detail::CancelBinding bind;
+        };
+
         /**
          * @brief Awaiter for a single WSARecv-driven read on a socket
          *        already associated with the Reactor's IOCP.
          *
-         * Lifetime: the @ref OverlappedCompletion lives inside this awaiter
-         * (a member, not a heap allocation) and is referenced by the kernel
-         * until the IOCP completion thread dequeues it. The awaiter is a
-         * member of the coroutine's frame, so the kernel-visible storage
-         * survives until the coroutine resumes.
-         *
-         * Failure modes:
-         *  - WSARecv that returns 0 immediately (success synchronously):
-         *    the kernel still queues a completion to the IOCP, so we
-         *    suspend exactly once and the IOCP path delivers @c bytes.
-         *  - WSARecv that returns SOCKET_ERROR with WSA_IO_PENDING:
-         *    the standard async case; we suspend and wait for the
-         *    completion.
-         *  - WSARecv with any other error: the awaiter records the error
-         *    in @c oc.err and resumes inline (await_ready returns true).
+         * WSARecv returning 0 immediately still queues a completion to the
+         * IOCP, so the awaiter suspends exactly once and the IOCP path delivers
+         * the byte count; WSA_IO_PENDING is the ordinary asynchronous case; any
+         * other error is thrown without suspending.
          */
-        struct OverlappedRecvAwaiter {
-            int fd;
-            WSABUF wsabuf{};
-            YarnBall::OverlappedCompletion oc{};
-            int sync_err = 0;
-            bool sync_done = false;
-
-            OverlappedRecvAwaiter(int sock, void *data, std::size_t len) noexcept
-                : fd(sock) {
-                this->wsabuf.buf = static_cast<CHAR *>(data);
-                this->wsabuf.len = static_cast<ULONG>(len);
+        struct OverlappedRecvAwaiter : OverlappedOp {
+            OverlappedRecvAwaiter(int sock, void *data, std::size_t len) 
+                : OverlappedOp(sock, data, len) {
             }
 
-            bool await_ready() noexcept { return false; }
-
-            bool await_suspend(std::coroutine_handle<> h) noexcept {
-                this->oc.handle = h;
-                DWORD bytes = 0;
-                DWORD flags = 0;
-                int rc = ::WSARecv(static_cast<SOCKET>(static_cast<unsigned>(this->fd)),
-                                   &this->wsabuf, /*dwBufferCount=*/1,
-                                   &bytes, &flags,
-                                   static_cast<OVERLAPPED *>(&this->oc),
-                                   /*lpCompletionRoutine=*/nullptr);
-                if (rc == 0) {
-                    // Success synchronous; the kernel still posts a
-                    // completion (notifications are not skipped unless
-                    // SetFileCompletionNotificationModes opted in), so we
-                    // simply wait for the IOCP path to deliver @c bytes.
-                    return true;
-                }
-                const int err = ::WSAGetLastError();
-                if (err == WSA_IO_PENDING) return true; // expected async path
-                // Hard failure pre-suspend: capture the error and do not
-                // suspend, so await_resume reports it. (Resuming the handle
-                // from inside await_suspend would re-enter a coroutine that
-                // has not finished suspending.)
-                this->oc.err = err;
-                this->sync_err = err;
-                this->sync_done = true;
-                return false;
+            template<typename Promise>
+            bool await_suspend(std::coroutine_handle<Promise> h) {
+                return this->suspendAndIssue(h, [this]() {
+                    DWORD bytes = 0;
+                    DWORD flags = 0;
+                    return ::WSARecv(this->sock(), &this->wsabuf, /*dwBufferCount=*/1, &bytes, &flags,
+                                     static_cast<OVERLAPPED *>(this->ocPtr()),
+                                     /*lpCompletionRoutine=*/nullptr);
+                });
             }
 
-            std::size_t await_resume() {
-                if (this->oc.err != 0) {
-                    throw SocketException("WSARecv", this->oc.err);
-                }
-                return static_cast<std::size_t>(this->oc.bytes);
-            }
+            std::size_t await_resume() { return this->finish("WSARecv"); }
         };
 
         /**
          * @brief Awaiter for a single WSASend on an IOCP-associated socket.
-         *        Same shape as @ref OverlappedRecvAwaiter; @c bytes is the
+         *        Same shape as @ref OverlappedRecvAwaiter; the result is the
          *        kernel-reported count which may be partial. Soccer's
          *        higher-level helper loops until the buffer is drained.
          */
-        struct OverlappedSendAwaiter {
-            int fd;
-            WSABUF wsabuf{};
-            YarnBall::OverlappedCompletion oc{};
-
-            OverlappedSendAwaiter(int sock, const void *data, std::size_t len) noexcept
-                : fd(sock) {
+        struct OverlappedSendAwaiter : OverlappedOp {
+            OverlappedSendAwaiter(int sock, const void *data, std::size_t len) 
+                : OverlappedOp(sock, const_cast<void *>(data), len) {
                 // WSABUF::buf is non-const PCHAR even for sends; the
                 // const_cast is the conventional WinSock idiom.
-                this->wsabuf.buf = const_cast<CHAR *>(static_cast<const CHAR *>(data));
-                this->wsabuf.len = static_cast<ULONG>(len);
             }
 
-            bool await_ready() noexcept { return false; }
-
-            bool await_suspend(std::coroutine_handle<> h) noexcept {
-                this->oc.handle = h;
-                DWORD bytes = 0;
-                int rc = ::WSASend(static_cast<SOCKET>(static_cast<unsigned>(this->fd)),
-                                   &this->wsabuf, /*dwBufferCount=*/1,
-                                   &bytes, /*flags=*/0,
-                                   static_cast<OVERLAPPED *>(&this->oc),
-                                   /*lpCompletionRoutine=*/nullptr);
-                if (rc == 0) return true;
-                const int err = ::WSAGetLastError();
-                if (err == WSA_IO_PENDING) return true;
-                this->oc.err = err;
-                return false;
+            template<typename Promise>
+            bool await_suspend(std::coroutine_handle<Promise> h) {
+                return this->suspendAndIssue(h, [this]() {
+                    DWORD bytes = 0;
+                    return ::WSASend(this->sock(), &this->wsabuf, /*dwBufferCount=*/1, &bytes, /*flags=*/0,
+                                     static_cast<OVERLAPPED *>(this->ocPtr()),
+                                     /*lpCompletionRoutine=*/nullptr);
+                });
             }
 
-            std::size_t await_resume() {
-                if (this->oc.err != 0) {
-                    throw SocketException("WSASend", this->oc.err);
-                }
-                return static_cast<std::size_t>(this->oc.bytes);
-            }
+            std::size_t await_resume() { return this->finish("WSASend"); }
         };
     }
 

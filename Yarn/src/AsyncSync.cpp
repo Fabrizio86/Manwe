@@ -164,11 +164,18 @@ namespace YarnBall {
      *        through Yarn.
      */
     struct AsyncNotifyAwaiter : detail::ParkBase<AsyncNotifyAwaiter> {
+        AsyncNotify *notify;
+
         explicit AsyncNotifyAwaiter(AsyncNotify *n) noexcept
-            : ParkBase(n->mu, n->waiters) {
+            : ParkBase(n->mu, n->waiters), notify(n) {
         }
 
         ~AsyncNotifyAwaiter() { this->abandon(); }
+
+        // Woken but destroyed before it ran: the notification would be swallowed while other waiters stay parked, so
+        // pass it on. After a notifyAll this wakes one extra waiter, which the wait/notify pattern (re-check the
+        // condition after every wake) tolerates.
+        void revokeGrant() noexcept { this->notify->notifyOne(); }
 
         bool await_ready() noexcept { return false; }
 
@@ -467,6 +474,24 @@ namespace YarnBall {
             }
 
             if (aw.role == AsyncOnceAwaiter::Role::kFirstCaller) {
+                // The runner's frame can be destroyed while it is suspended inside fn() (its owner dropped it, or a
+                // scope tore it down). Without this the state would stay Running and every waiter parked forever:
+                // hand the run back instead, exactly as for a cancelled runner.
+                struct RunnerGuard {
+                    AsyncOnce *once;
+                    bool armed = true;
+
+                    ~RunnerGuard() {
+                        if (!this->armed) return;
+                        std::vector<std::coroutine_handle<>> wake;
+                        {
+                            std::lock_guard<std::mutex> lk(this->once->mu);
+                            this->once->state = State::Idle;
+                            this->once->waiters.takeAll(wake);
+                        }
+                        for (auto h : wake) dispatchToYarn(h);
+                    }
+                } guard{this};
                 bool runnerCancelled = false;
                 try {
                     co_await fn();
@@ -475,6 +500,7 @@ namespace YarnBall {
                 } catch (...) {
                     this->exception = std::current_exception();
                 }
+                guard.armed = false;
                 std::vector<std::coroutine_handle<>> wake;
                 {
                     std::lock_guard<std::mutex> lk(this->mu);

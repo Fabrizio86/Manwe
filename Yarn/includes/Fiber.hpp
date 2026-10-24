@@ -6,14 +6,39 @@
 #define YARN_FIBER_HPP
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <memory>
+#include <mutex>
+#include <stdexcept>
 #include <thread>
+#include <vector>
 
 #include "ITask.hpp"
 #include "Workload.hpp"
 
 namespace YarnBall {
+
+    class Yarn;
+
+    namespace detail {
+        /**
+         * @brief Dispose of a task that will never run because the pool is shutting down: report
+         *        @c std::runtime_error("... pool shut down ...") through @c ITask::exception (so completion hooks such as
+         *        @c Waitable::wait unblock) and delete it. Exceptions from the hook are swallowed.
+         */
+        void discardTask(TaskPtr task) noexcept;
+
+        /**
+         * @brief The error handed to @c ITask::exception for a task that is discarded because the pool is shutting down.
+         *        A distinct type so that fire-and-forget callables (whose @c exception() reports to the unhandled-exception
+         *        handler) can tell an expected shutdown discard from a real failure and stay quiet about it.
+         */
+        class PoolShutdownError final : public std::runtime_error {
+        public:
+            PoolShutdownError() : std::runtime_error("YarnBall: pool shut down before the task could run") {}
+        };
+    }
 
     /**
      * @class Fiber
@@ -57,6 +82,11 @@ namespace YarnBall {
          * @param tryStealFromPeers Attempts to steal from a peer fiber.
          * @param wakeOneIdle       Wakes one parked worker, if any.
          * @param temp              If true, the fiber retires when idle.
+         * @param anyPeerWork       Optional: reports work sitting in a peer's queues; consulted before sleeping.
+         * @param owner             The pool this worker belongs to. The worker reports its parked state to it and drops its
+         *                          snapshot cache through it, so it never has to go through @c Yarn::instance() (which would
+         *                          block on the singleton's construction guard while the pool is still being built or is
+         *                          unwinding from a failed construction). May be null for a stand-alone fiber.
          */
         Fiber(FiberId id,
               size_t dequeCapacity,
@@ -66,7 +96,9 @@ namespace YarnBall {
               PushPending pushPending,
               TryStealFromPeers tryStealFromPeers,
               WakeOneIdle wakeOneIdle,
-              bool temp);
+              bool temp,
+              AnyPeerWork anyPeerWork = {},
+              Yarn *owner = nullptr);
 
         /**
          * @brief Joins the OS thread. Safe to call from any thread except the
@@ -79,19 +111,6 @@ namespace YarnBall {
         Fiber(Fiber &&) = delete;
         Fiber &operator=(const Fiber &) = delete;
         Fiber &operator=(Fiber &&) = delete;
-
-        /**
-         * @brief Push a task onto the local deque from outside the worker.
-         *
-         * Used by Yarn when it wants to seed a freshly spawned temp fiber with
-         * the task that triggered the spawn. Returns @c false if the deque is
-         * full or the fiber is no longer accepting work; in that case the
-         * caller retains ownership.
-         *
-         * @param task Raw owning pointer; on success ownership moves to the deque.
-         * @return @c true on success.
-         */
-        bool seed(TaskPtr task);
 
         /**
          * @brief Enqueue a task into this fiber's per-worker inbox.
@@ -107,7 +126,7 @@ namespace YarnBall {
          *         the caller should try another fiber or fall back to
          *         the central injection queue.
          */
-        bool tryPushInbox(TaskPtr task) noexcept;
+        bool tryPushInbox(TaskPtr task);
 
         /**
          * @brief Steal one task from this fiber's deque on behalf of a peer.
@@ -156,6 +175,23 @@ namespace YarnBall {
         }
 
         /**
+         * @brief Reserve the next wake-up of this fiber for the caller. Returns @c true to exactly one caller per park:
+         *        the claim is released when the fiber next goes to sleep. Lets concurrent wakers fan out over different
+         *        parked fibers instead of all poking the first one (which has not yet marked itself running).
+         */
+        bool claimWake() noexcept {
+            return !this->wakeClaimed.exchange(true, std::memory_order_acq_rel);
+        }
+
+        /**
+         * @brief Number of tasks this worker has finished. Written only by the worker, read by the pool's stall
+         *        detector as a progress signal.
+         */
+        std::uint64_t completedCount() const noexcept {
+            return this->completed.load(std::memory_order_relaxed);
+        }
+
+        /**
          * @brief Slot identifier supplied at construction.
          */
         [[nodiscard]] FiberId id() const noexcept { return this->fiberId; }
@@ -172,6 +208,31 @@ namespace YarnBall {
         size_t dequeCapacity() const noexcept;
 
     private:
+        friend class Yarn;
+
+        /**
+         * @brief Push a task onto the local deque. OWNER THREAD ONLY: the deque is single-producer, so this may only be
+         *        called from this fiber's own worker thread (Yarn does so from @c dispatch and the injection refill,
+         *        both running on the worker). Foreign threads go through @ref tryPushInbox.
+         *
+         * Returns @c false if the deque is full or the fiber is no longer accepting work; in that case the caller
+         * retains ownership.
+         *
+         * @param task Raw owning pointer; on success ownership moves to the deque.
+         * @return @c true on success.
+         */
+        bool seed(TaskPtr task);
+
+        /**
+         * @brief @c true if this fiber's deque or inbox holds a task a peer could take.
+         */
+        bool hasStealableWork() const noexcept;
+
+        /**
+         * @brief Bump the park signal and wake the sleeping worker, if any (all waiters when @p all).
+         */
+        void wakeParked(bool all) noexcept;
+
         /**
          * @brief Worker thread entry point. Drives the pop/refill/steal/park
          *        cycle until @ref running becomes false.
@@ -179,10 +240,15 @@ namespace YarnBall {
         void process();
 
         /**
-         * @brief Park on @ref condition until a wake source signals or a task
-         *        becomes locally visible.
+         * @brief Sleep until a wake source bumps @ref parkSignal or work becomes visible. Permanent workers wait on the
+         *        futex; temp workers wait on @ref tempCv with a timeout so they can notice sustained idleness.
          */
         void park();
+
+        /**
+         * @brief Count one finished task (owner thread only).
+         */
+        void noteCompleted() noexcept;
 
         /**
          * @brief Drain any remaining local tasks into the injection queue.
@@ -218,6 +284,17 @@ namespace YarnBall {
         std::atomic<bool> parked{false};
 
         /**
+         * @brief Set by the waker that has taken responsibility for waking this fiber (see @ref claimWake); cleared by
+         *        @ref park before it publishes @ref parked, so a fiber that is visibly parked always has a free claim.
+         */
+        std::atomic<bool> wakeClaimed{false};
+
+        /**
+         * @brief Tasks completed by this worker (progress signal for the stall detector).
+         */
+        std::atomic<std::uint64_t> completed{0};
+
+        /**
          * @brief Temp fibers self-retire when they observe sustained idleness;
          *        permanent fibers do not. Set once at construction.
          */
@@ -251,10 +328,20 @@ namespace YarnBall {
         TryStealFromPeers tryStealFromPeers;
 
         /**
+         * @brief Peer-queue probe used by @ref park's last-chance re-check. May be empty.
+         */
+        AnyPeerWork anyPeerWork;
+
+        /**
          * @brief Wake-one signal used to attract a stealer when we push to the
          *        local deque while peers may be parked.
          */
         WakeOneIdle wakeOneIdle;
+
+        /**
+         * @brief The owning pool (parked-worker accounting, snapshot cache release). Null for a stand-alone fiber.
+         */
+        Yarn *const owner;
 
         /**
          * @brief Park signal. Bumped by any producer that wants to wake this
@@ -269,6 +356,13 @@ namespace YarnBall {
          *        loads.
          */
         std::atomic<std::uint32_t> parkSignal{0};
+
+        /**
+         * @brief Timed-wait pair used only by temp fibers (a futex wait has no timeout). Wakers bump @ref parkSignal,
+         *        then pass through @c tempMu before notifying so the sleeper cannot miss the change.
+         */
+        std::mutex tempMu;
+        std::condition_variable tempCv;
 
         /**
          * @brief Per-worker MPMC inbox. Yarn::dispatch picks a target

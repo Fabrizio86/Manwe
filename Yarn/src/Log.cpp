@@ -7,16 +7,33 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdint>
 #include <ctime>
 #include <mutex>
+#include <string>
 
 namespace YarnBall::log {
 
     namespace {
-        std::mutex g_sinkMu;
-        Sink g_sink = [](std::string_view line) {
-            (void) std::fwrite(line.data(), 1, line.size(), stderr);
+        /**
+         * @brief Sink state. Heap-allocated and never freed: the logger is
+         *        used from detached tasks and destructors that can run
+         *        during static teardown (e.g. ~Yarn), after ordinary
+         *        statics would already be gone.
+         */
+        struct SinkState {
+            std::mutex mu;               // guards sink
+            std::recursive_mutex callMu; // serialises sink calls; recursive so a sink may log
+            Sink sink = [](std::string_view line) {
+                (void) std::fwrite(line.data(), 1, line.size(), stderr);
+            };
         };
+
+        SinkState &sinkState() {
+            static SinkState *st = new SinkState;
+            return *st;
+        }
+
         std::atomic<int> g_minLevel{static_cast<int>(Level::Info)};
 
         const char *levelName(Level l) noexcept {
@@ -47,7 +64,7 @@ namespace YarnBall::log {
             gmtime_r(&tt, &tm);
 #endif
             const auto ms = duration_cast<milliseconds>(now.time_since_epoch()).count() % 1000;
-            char buf[40];
+            char buf[96];
             std::snprintf(buf, sizeof(buf),
                           "%04d-%02d-%02dT%02d:%02d:%02d.%03lldZ",
                           tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
@@ -62,7 +79,36 @@ namespace YarnBall::log {
             std::string out;
             out.reserve(s.size() + 2);
             out.push_back('"');
-            for (char c : s) {
+            const std::size_t n = s.size();
+            for (std::size_t i = 0; i < n;) {
+                const unsigned char c = static_cast<unsigned char>(s[i]);
+                if (c >= 0x80) {
+                    // Validate one UTF-8 sequence (shortest form, no surrogates, <= U+10FFFF); copy it through if it
+                    // is well formed, else substitute U+FFFD for the offending byte.
+                    std::size_t len = 0;
+                    std::uint32_t cp = 0;
+                    if (c >= 0xC2 && c <= 0xDF) { len = 2; cp = c & 0x1F; }
+                    else if (c >= 0xE0 && c <= 0xEF) { len = 3; cp = c & 0x0F; }
+                    else if (c >= 0xF0 && c <= 0xF4) { len = 4; cp = c & 0x07; }
+                    bool ok = len != 0 && i + len <= n;
+                    for (std::size_t k = 1; ok && k < len; ++k) {
+                        const unsigned char cc = static_cast<unsigned char>(s[i + k]);
+                        if ((cc & 0xC0) != 0x80) ok = false;
+                        else cp = (cp << 6) | (cc & 0x3F);
+                    }
+                    if (ok) {
+                        if (len == 3 && (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF))) ok = false;
+                        if (len == 4 && (cp < 0x10000 || cp > 0x10FFFF)) ok = false;
+                    }
+                    if (ok) {
+                        out.append(s.substr(i, len));
+                        i += len;
+                    } else {
+                        out.append("\xEF\xBF\xBD");
+                        ++i;
+                    }
+                    continue;
+                }
                 switch (c) {
                     case '"':  out.append("\\\""); break;
                     case '\\': out.append("\\\\"); break;
@@ -70,15 +116,15 @@ namespace YarnBall::log {
                     case '\r': out.append("\\r");  break;
                     case '\t': out.append("\\t");  break;
                     default:
-                        if (static_cast<unsigned char>(c) < 0x20) {
-                            char esc[8];
-                            std::snprintf(esc, sizeof(esc), "\\u%04x",
-                                          static_cast<unsigned>(c) & 0xFF);
+                        if (c < 0x20 || c == 0x7F) {
+                            char esc[16];
+                            std::snprintf(esc, sizeof(esc), "\\u%04x", static_cast<unsigned>(c));
                             out.append(esc);
                         } else {
-                            out.push_back(c);
+                            out.push_back(static_cast<char>(c));
                         }
                 }
+                ++i;
             }
             out.push_back('"');
             return out;
@@ -86,8 +132,9 @@ namespace YarnBall::log {
     }
 
     void setSink(Sink s) {
-        std::lock_guard<std::mutex> lk(g_sinkMu);
-        g_sink = std::move(s);
+        auto &st = sinkState();
+        std::lock_guard<std::mutex> lk(st.mu);
+        st.sink = std::move(s);
     }
 
     void setMinLevel(Level lvl) {
@@ -121,21 +168,18 @@ namespace YarnBall::log {
         }
         line.append("}\n");
 
-        // Copy the sink under the lock, then invoke it after releasing:
-        // a sink that itself calls back into emit() (a network sink
-        // logging its own write failure, a sink that forwards into
-        // another logging framework that round-trips here) would
-        // otherwise re-lock g_sinkMu on the same thread while this
-        // lock_guard is still held -- a guaranteed self-deadlock on
-        // the non-recursive std::mutex. Telegraph::Signal::emit()
-        // (TelegraphSignal.h) already establishes this exact pattern
-        // for the same reason; this brings emit() in line with it.
+        // Copy the sink under the state lock, then call it holding only callMu: a sink that itself calls back into
+        // emit() re-enters the recursive callMu on the same thread (no deadlock), while sink calls from different
+        // threads stay serialised. setSink() only needs the state lock, so it can run from inside a sink too.
+        auto &st = sinkState();
         Sink sinkCopy;
         {
-            std::lock_guard<std::mutex> lk(g_sinkMu);
-            sinkCopy = g_sink;
+            std::lock_guard<std::mutex> lk(st.mu);
+            sinkCopy = st.sink;
         }
-        if (sinkCopy) sinkCopy(line);
+        if (!sinkCopy) return;
+        std::lock_guard<std::recursive_mutex> call(st.callMu);
+        sinkCopy(line);
     }
 
 }

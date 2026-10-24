@@ -25,7 +25,8 @@ namespace Soccer {
     /**
      * @class TlsListener
      * @brief TLS-wrapped TCP listener. Reads server cert + key at bind
-     *        time; @c accept performs the TLS handshake on each connection.
+     *        time; @c accept hands back each connection with its TLS handshake deferred
+     *        to the first use of the stream.
      */
     class TlsListener final {
     public:
@@ -53,10 +54,21 @@ namespace Soccer {
                                 const TlsServerOptions &options = {});
 
         /**
-         * @brief Accept the next TCP connection and perform the server-side
-         *        TLS handshake.
+         * @brief Accept the next TCP connection and return it as a TlsStream as
+         *        soon as the TCP accept completes. The server-side TLS handshake
+         *        is deferred: the first @c handshake() / @c read / @c write on the
+         *        stream drives it, bounded by @p handshakeTimeout, and a failure
+         *        or timeout surfaces as a SocketException from that call. A peer
+         *        that connects and stalls therefore never holds up the accept loop
+         *        (the handshake cost lands on whichever task first uses the stream).
+         *        Call @c TlsStream::handshake() first when the negotiated ALPN
+         *        protocol or the handshake outcome is needed before any I/O.
+         *
+         * @param handshakeTimeout Longest the handshake may take once driven
+         *        (default 10 s); zero or negative means no limit.
          */
-        YarnBall::Task<TlsStream> accept();
+        YarnBall::Task<TlsStream> accept(
+            std::chrono::milliseconds handshakeTimeout = std::chrono::seconds{10});
 
         /**
          * @class PendingHandshake

@@ -67,26 +67,34 @@ namespace YarnBall::io {
                     return false;
                 }
                 this->handle = this->proxy.publish(h);
-                const auto watch = this->bind.armWatched(core, &FdWaitAwaiter::onCancel, this);
+                this->bind.arm(core, &FdWaitAwaiter::onCancel, this);
                 if (this->cancelled.load(std::memory_order_relaxed)) {
                     // Stopped while arming: nothing is registered yet, so the proxy was never visible to anyone.
                     this->bind.disarm();
                     this->proxy.reclaim();
                     return false;
                 }
+                // Keeps the proxy (its gate, and its address) allocated after the registration, when the wait may already
+                // have completed and destroyed this awaiter. Taken only now: the early return above reclaims the proxy.
+                const auto pin = this->proxy.pin();
                 const auto proxyHandle = this->handle;
                 const SocketHandle waitFd = this->fd;
                 this->armed = true;
                 this->registerWait(proxyHandle);
                 // A stop that landed before the registration found nothing to cancel: redo it now. Only locals from
-                // here on: the wait may already have completed (and destroyed) this awaiter.
-                if (watch->load(std::memory_order_acquire)) (void) Reactor::instance()->cancelWait(waitFd, proxyHandle);
+                // here on. The redo happens only if the stop really came first, and the pin guarantees the address is
+                // still this wait's: a later waiter on the same fd cannot have reused it and be woken early.
+                if (pin.gate().exchange(kRegistered, std::memory_order_acq_rel) == kStopped) {
+                    (void) Reactor::instance()->cancelWait(waitFd, proxyHandle);
+                }
                 return true;
             }
 
             void await_resume() {
                 this->resumed = true;
                 if (this->cancelled.load(std::memory_order_relaxed)) throw CancelledException{};
+                // A dead event loop resumes waiters rather than strand them; without this a retry loop would spin.
+                if (this->armed && Reactor::instance()->isDead()) throw ReactorError{};
             }
 
         private:
@@ -101,8 +109,13 @@ namespace YarnBall::io {
             static void onCancel(void *p) noexcept {
                 auto *self = static_cast<FdWaitAwaiter *>(p);
                 self->cancelled.store(true, std::memory_order_relaxed);
-                (void) Reactor::instance()->cancelWait(self->fd, self->handle);
+                // Not registered yet: leave the cancel to await_suspend, which sees kStopped once it has registered.
+                if (self->proxy.gate().exchange(kStopped, std::memory_order_acq_rel) == kRegistered) {
+                    (void) Reactor::instance()->cancelWait(self->fd, self->handle);
+                }
             }
+
+            static constexpr int kRegistered = 1, kStopped = 2; // proxy gate values (idle is 0)
 
             std::coroutine_handle<> handle{}; // the proxy, once published
             std::atomic<bool> cancelled{false};
@@ -173,7 +186,9 @@ namespace YarnBall::io {
         std::size_t total = 0;
         const auto *p = static_cast<const unsigned char *>(buf);
         // A peer that hung up must surface as EPIPE, not kill the process with SIGPIPE: send(MSG_NOSIGNAL) where it
-        // exists, SO_NOSIGPIPE elsewhere. Non-sockets (pipes, files) fall back to plain write.
+        // exists, SO_NOSIGPIPE elsewhere. Non-sockets (pipes, files) fall back to plain write, which is covered by the
+        // process-wide SIGPIPE ignore Yarn installs when its pool is created (a coroutine running here implies the pool
+        // exists); a program that re-installed a SIGPIPE handler after that gets its own handler for pipe writes.
         bool useSend = true;
 #if !defined(MSG_NOSIGNAL) && defined(SO_NOSIGPIPE)
         {

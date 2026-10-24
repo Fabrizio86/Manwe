@@ -26,6 +26,13 @@
 //   auto v = co_await s.next();
 //   if (v) ...;
 //
+// Cancellation: while the producer runs on behalf of a next() pull it sits in
+// the consumer's co_await chain, so the cancellable awaits it parks in
+// (sleepFor, io::waitReadable, AsyncMutex, ...) observe the consumer's scope
+// and Task::requestCancel, and wake with CancelledException, which the pull
+// rethrows. Between pulls the producer is suspended at a co_yield and is not
+// cancellable; a producer that is not being pulled does no work.
+//
 
 #ifndef YARN_STREAM_H
 #define YARN_STREAM_H
@@ -35,8 +42,11 @@
 #include <exception>
 #include <memory>
 #include <optional>
+#include <tuple>
 #include <type_traits>
 #include <utility>
+
+#include "Coroutines.h"
 
 namespace YarnBall {
 
@@ -44,6 +54,32 @@ namespace YarnBall {
     class Stream;
 
     namespace detail {
+
+        /// True when copying a @c T would really compile: is_copy_constructible_v alone lies for standard containers
+        /// (and pairs, tuples, optionals) of move-only elements, so look through their element types.
+        template<typename T, typename = void>
+        struct DeepCopyable : std::is_copy_constructible<T> {};
+
+        template<typename T>
+        struct DeepCopyable<T, std::void_t<typename T::value_type, decltype(std::declval<const T &>().begin())>>
+            : std::conjunction<std::is_copy_constructible<T>, DeepCopyable<typename T::value_type>> {};
+
+        template<typename A, typename B>
+        struct DeepCopyable<std::pair<A, B>, void>
+            : std::conjunction<std::is_copy_constructible<std::pair<A, B>>, DeepCopyable<std::remove_const_t<A>>,
+                               DeepCopyable<B>> {};
+
+        template<typename... Ts>
+        struct DeepCopyable<std::tuple<Ts...>, void>
+            : std::conjunction<std::is_copy_constructible<std::tuple<Ts...>>, DeepCopyable<Ts>...> {};
+
+        template<typename U>
+        struct DeepCopyable<std::optional<U>, void>
+            : std::conjunction<std::is_copy_constructible<std::optional<U>>, DeepCopyable<U>> {};
+
+        template<typename T>
+        inline constexpr bool deepCopyable = DeepCopyable<T>::value;
+
 
         /**
          * @brief Promise type for @ref Stream. Holds a pointer to the
@@ -56,7 +92,7 @@ namespace YarnBall {
          * then resumes the producer to clear the slot.
          */
         template<typename T>
-        struct StreamPromise {
+        struct StreamPromise : TaskPromiseCore {
             /**
              * @brief Pointer to the most-recent yielded value. Lives in
              *        the producer's @c co_yield expression's storage.
@@ -140,8 +176,26 @@ namespace YarnBall {
                 }
             };
 
-            YieldAwaiter yield_value(T &value) noexcept {
-                this->current = std::addressof(value);
+            /**
+             * @brief @c co_yield of a non-const lvalue. The consumer moves
+             *        the value out of what the promise points at, which for
+             *        an lvalue would be the producer's own variable (left
+             *        moved-from when the producer reads it again), so a
+             *        value that really can be copied is copied into the
+             *        promise first. Anything else (move-only, or a container
+             *        whose copy constructor is declared but cannot be
+             *        instantiated, like a vector of unique_ptr) is handed
+             *        over by pointer, the producer's variable then being
+             *        moved from. @c co_yield std::as_const(x) always copies.
+             */
+            YieldAwaiter yield_value(T &value) noexcept(!detail::deepCopyable<T>
+                                                        || std::is_nothrow_copy_constructible_v<T>) {
+                if constexpr (detail::deepCopyable<T>) {
+                    this->copy.emplace(value);
+                    this->current = std::addressof(*this->copy);
+                } else {
+                    this->current = std::addressof(value);
+                }
                 return {};
             }
 
@@ -228,13 +282,22 @@ namespace YarnBall {
                 return !this->producer || this->producer.done();
             }
 
-            std::coroutine_handle<> await_suspend(std::coroutine_handle<> consumer) noexcept {
-                this->producer.promise().consumer = consumer;
+            template<typename Caller>
+            std::coroutine_handle<> await_suspend(std::coroutine_handle<Caller> consumer) noexcept {
+                auto &p = this->producer.promise();
+                p.consumer = consumer;
+                if constexpr (std::is_base_of_v<detail::TaskPromiseCore, Caller>) {
+                    // The producer runs as a child of the consumer for the length of this pull (see the file header).
+                    p.parent.store(static_cast<detail::TaskPromiseCore *>(&consumer.promise()),
+                                   std::memory_order_release);
+                }
                 return this->producer;
             }
 
             std::optional<T> await_resume() {
+                if (!this->producer) return std::nullopt;
                 auto &p = this->producer.promise();
+                p.parent.store(nullptr, std::memory_order_release);
                 if (p.exception) std::rethrow_exception(p.exception);
                 if (p.done && p.current == nullptr) {
                     return std::nullopt;

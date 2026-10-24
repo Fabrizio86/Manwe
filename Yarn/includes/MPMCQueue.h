@@ -31,7 +31,7 @@ namespace YarnBall {
      *  - @c Medium : 1024 slots — moderate fan-in queues.
      *  - @c Huge   : 4096 slots — the executor's global injection queue.
      */
-    enum QueueSize {
+    enum class QueueSize : size_t {
         Light = 512,
         Medium = 1024,
         Huge = 4096
@@ -98,7 +98,7 @@ namespace YarnBall {
          * @throws std::invalid_argument If @p capacity is not a power of two
          *                               or is zero.
          */
-        explicit MPMCQueue(size_t capacity = QueueSize::Huge)
+        explicit MPMCQueue(size_t capacity = static_cast<size_t>(QueueSize::Huge))
             : size((capacity & (capacity - 1)) == 0 && capacity > 0
                        ? capacity
                        : throw std::invalid_argument("Capacity must be a power of two")),

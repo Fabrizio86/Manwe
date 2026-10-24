@@ -41,121 +41,37 @@ namespace Telegraph {
      *
      * Args must be copy-constructible, since every handler / waiter
      * receives an independent copy.
+     *
+     * Lifetime and disconnect. Every emission works from a snapshot of
+     * the handler list, so @ref disconnect does NOT wait for, or stop, a
+     * call that is already running or already dispatched by @c emitAsync:
+     * the handler can still run once after @c disconnect returns. A
+     * handler that captures an object by pointer or reference must
+     * therefore not rely on @c disconnect alone to make that object safe
+     * to destroy; hold the captured state in a @c shared_ptr, or have the
+     * handler check a flag. @ref connectScoped gives an RAII handle that
+     * disconnects on destruction (with the same caveat).
+     *
+     * A removed handler is destroyed after the Signal's lock is released,
+     * so its captures (a @ref ScopedConnection, say) may call back into the
+     * Signal from their destructors. @ref connect and @ref disconnect edit
+     * the handler list in place unless an emission is running, in which
+     * case they copy it: registering many handlers stays cheap.
+     *
+     * Handler exceptions: @c emit runs every handler and rethrows the
+     * first exception after the last; @c emitAsync reports an exception
+     * through @c YarnBall::setUnhandledExceptionHandler.
+     *
+     * Destroying the Signal wakes every parked @c next() waiter with
+     * @c YarnBall::CancelledException, and a @c next() awaited after that
+     * throws it at once. The caller must still make sure no
+     * @c emit / @c emitAsync call is running on it.
      */
     template<typename... Args>
     class Signal {
     public:
         using Handler = std::function<void(Args...)>;
         using SlotId = std::uint64_t;
-
-        Signal() = default;
-
-        Signal(const Signal &) = delete;
-        Signal(Signal &&) = delete;
-        Signal &operator=(const Signal &) = delete;
-        Signal &operator=(Signal &&) = delete;
-
-        ~Signal() = default;
-
-        /**
-         * @brief Register a handler. Returns an opaque @c SlotId that can
-         *        be passed to @ref disconnect.
-         */
-        SlotId connect(Handler h) {
-            std::lock_guard<std::mutex> lk(this->mu);
-            const SlotId id = this->next_id++;
-            this->handlers.emplace_back(id, std::move(h));
-            return id;
-        }
-
-        /**
-         * @brief Remove a previously-connected handler. An emission
-         *        already in flight works from a snapshot, so the handler
-         *        may still run once after this returns.
-         * @return @c true if the slot existed and was removed.
-         */
-        bool disconnect(SlotId id) {
-            std::lock_guard<std::mutex> lk(this->mu);
-            for (auto it = this->handlers.begin(); it != this->handlers.end(); ++it) {
-                if (it->first == id) {
-                    this->handlers.erase(it);
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        /**
-         * @brief Number of currently connected handlers (excludes pending
-         *        one-shot @c next() awaiters).
-         */
-        std::size_t handlerCount() const {
-            std::lock_guard<std::mutex> lk(this->mu);
-            return this->handlers.size();
-        }
-
-        /**
-         * @brief Synchronously broadcast to all connected handlers and to
-         *        all pending one-shot @c next() awaiters.
-         *
-         * Handlers fire on the calling thread in registration order.
-         * @c next() awaiters are resumed via Yarn::run, so their bodies
-         * run on workers.
-         */
-        void emit(Args... args) {
-            // Snapshot handlers + pending waiters under the lock; release
-            // the lock before invoking either, so handlers can connect /
-            // disconnect freely without re-entrant deadlock.
-            std::vector<std::pair<SlotId, Handler>> handlers_copy;
-            std::vector<std::shared_ptr<NextSlot>> waiters_copy;
-            {
-                std::lock_guard<std::mutex> lk(this->mu);
-                handlers_copy = this->handlers;
-                waiters_copy = std::move(this->pending);
-                this->pending.clear();
-                for (auto &slot : waiters_copy) slot->queued.store(false, std::memory_order_release);
-            }
-
-            for (auto &slot : waiters_copy) {
-                slot->value.emplace(args...);
-                // Wake on a worker rather than recursively resuming here.
-                std::unique_ptr<YarnBall::ITask> ct{
-                    new YarnBall::detail::CoroutineITask(slot->handle)};
-                YarnBall::Yarn::instance()->run(std::move(ct));
-            }
-            for (auto &[id, h] : handlers_copy) {
-                h(args...);
-            }
-        }
-
-        /**
-         * @brief Dispatch each connected handler as a separate task on the
-         *        Yarn pool. Returns immediately. One-shot @c next() awaiters
-         *        are resumed exactly as in @ref emit (also on the pool).
-         */
-        void emitAsync(Args... args) {
-            std::vector<std::pair<SlotId, Handler>> handlers_copy;
-            std::vector<std::shared_ptr<NextSlot>> waiters_copy;
-            {
-                std::lock_guard<std::mutex> lk(this->mu);
-                handlers_copy = this->handlers;
-                waiters_copy = std::move(this->pending);
-                this->pending.clear();
-                for (auto &slot : waiters_copy) slot->queued.store(false, std::memory_order_release);
-            }
-
-            for (auto &slot : waiters_copy) {
-                slot->value.emplace(args...);
-                std::unique_ptr<YarnBall::ITask> ct{
-                    new YarnBall::detail::CoroutineITask(slot->handle)};
-                YarnBall::Yarn::instance()->run(std::move(ct));
-            }
-
-            // Dispatch each handler as a TaskAdapter on the pool.
-            for (auto &[id, h] : handlers_copy) {
-                this->dispatch_handler(h, std::make_tuple(args...));
-            }
-        }
 
         /**
          * @brief Awaiter helper. Stored as @c shared_ptr so the awaiter, the
@@ -166,22 +82,293 @@ namespace Telegraph {
             std::coroutine_handle<> handle{};
             std::optional<std::tuple<Args...>> value;
             std::atomic<bool> queued{false};
+            bool gone = false; // the Signal was destroyed while parked (written under the lock before the wake)
         };
 
+    private:
+        using HandlerList = std::vector<std::pair<SlotId, std::shared_ptr<const Handler>>>;
+
+        /**
+         * @brief The state shared by the Signal, its parked @c next()
+         *        awaiters and its scoped connections, so none of them
+         *        touches freed memory if it outlives the Signal.
+         */
+        struct Core {
+            mutable std::mutex mu;
+            SlotId next_id = 1;
+            // Copy-on-write under mu while an emission holds it (copying only shared_ptrs); null when empty. Edited
+            // in place when the Core holds the only reference, i.e. no emission has taken a snapshot of it.
+            std::shared_ptr<const HandlerList> handlers;
+            std::vector<std::shared_ptr<NextSlot>> pending;
+            bool dead = false; ///< the Signal was destroyed: a next() that parks now would never be woken
+
+            SlotId connect(std::shared_ptr<const Handler> h) {
+                std::lock_guard<std::mutex> lk(this->mu);
+                const SlotId id = this->next_id++;
+                if (this->handlers && this->handlers.use_count() == 1) {
+                    // Emissions take their snapshot under mu, so none holds this list: append in place (amortised O(1)).
+                    const_cast<HandlerList &>(*this->handlers).emplace_back(id, std::move(h));
+                    return id;
+                }
+                // Copy-on-write: a running emission holds the current list by shared_ptr, so it is never mutated.
+                auto next = this->handlers ? std::make_shared<HandlerList>(*this->handlers) : std::make_shared<HandlerList>();
+                next->emplace_back(id, std::move(h));
+                this->handlers = std::move(next);
+                return id;
+            }
+
+            bool disconnect(SlotId id) {
+                // Declared before the lock, so they are destroyed after it is released: the dying handler's captures
+                // may call back into the signal (e.g. a ScopedConnection), which locks mu again.
+                std::shared_ptr<const Handler> dying;
+                std::shared_ptr<const HandlerList> oldList;
+                std::lock_guard<std::mutex> lk(this->mu);
+                if (!this->handlers) return false;
+                auto &cur = const_cast<HandlerList &>(*this->handlers);
+                auto it = std::find_if(cur.begin(), cur.end(), [id](const auto &e) { return e.first == id; });
+                if (it == cur.end()) return false;
+                if (this->handlers.use_count() == 1) {
+                    // No emission holds a snapshot: erase in place, without allocating.
+                    dying = std::move(it->second);
+                    cur.erase(it);
+                    if (cur.empty()) oldList = std::move(this->handlers);
+                } else {
+                    auto next = std::make_shared<HandlerList>(cur);
+                    next->erase(next->begin() + (it - cur.begin()));
+                    oldList = std::move(this->handlers);
+                    this->handlers = next->empty() ? nullptr : std::move(next);
+                }
+                return true;
+            }
+        };
+
+    public:
+        Signal() : core(std::make_shared<Core>()) {
+        }
+
+        Signal(const Signal &) = delete;
+        Signal(Signal &&) = delete;
+        Signal &operator=(const Signal &) = delete;
+        Signal &operator=(Signal &&) = delete;
+
+        ~Signal() {
+            std::vector<std::shared_ptr<NextSlot>> orphans;
+            std::shared_ptr<const HandlerList> dropped;
+            {
+                std::lock_guard<std::mutex> lk(this->core->mu);
+                orphans = std::move(this->core->pending);
+                this->core->pending.clear();
+                for (auto &slot : orphans) {
+                    slot->gone = true;
+                    slot->queued.store(false, std::memory_order_release);
+                }
+                this->core->dead = true;
+                dropped = std::move(this->core->handlers);
+            }
+            // Resume outside the lock, on the pool: each next() throws CancelledException from its await_resume.
+            for (auto &slot : orphans) YarnBall::detail::resumeOnPool(slot->handle);
+        }
+
+        /**
+         * @brief RAII handle for a connected handler: disconnects it when
+         *        destroyed (or on @ref disconnect). Move-only. Safe to
+         *        outlive the Signal. Like @ref Signal::disconnect it does
+         *        not wait for a call that is already in flight.
+         */
+        class ScopedConnection {
+        public:
+            ScopedConnection() = default;
+            ScopedConnection(const ScopedConnection &) = delete;
+            ScopedConnection &operator=(const ScopedConnection &) = delete;
+            ScopedConnection(ScopedConnection &&o) noexcept
+                : owner(std::move(o.owner)), id(std::exchange(o.id, 0)) {
+            }
+            ScopedConnection &operator=(ScopedConnection &&o) noexcept {
+                if (this != &o) {
+                    this->disconnect();
+                    this->owner = std::move(o.owner);
+                    this->id = std::exchange(o.id, 0);
+                }
+                return *this;
+            }
+            ~ScopedConnection() { this->disconnect(); }
+
+            /// @return @c true if the handler was still connected and is now removed. Allocation-free unless an
+            /// emission is running; if memory runs out then, the handler stays connected and this returns @c false.
+            bool disconnect() noexcept {
+                const SlotId slot = std::exchange(this->id, 0);
+                auto c = std::exchange(this->owner, {}).lock();
+                if (!c || slot == 0) return false;
+                try {
+                    return c->disconnect(slot);
+                } catch (...) {
+                    return false;
+                }
+            }
+
+            /// Give up ownership: the handler stays connected. Returns its id.
+            SlotId release() noexcept {
+                this->owner.reset();
+                return std::exchange(this->id, 0);
+            }
+
+            SlotId slot() const noexcept { return this->id; }
+
+        private:
+            friend class Signal;
+            ScopedConnection(std::weak_ptr<Core> c, SlotId s) noexcept : owner(std::move(c)), id(s) {
+            }
+
+            std::weak_ptr<Core> owner;
+            SlotId id = 0;
+        };
+
+        /**
+         * @brief Register a handler. Returns an opaque @c SlotId that can
+         *        be passed to @ref disconnect.
+         */
+        SlotId connect(Handler h) {
+            return this->core->connect(std::make_shared<const Handler>(std::move(h)));
+        }
+
+        /**
+         * @brief Like @ref connect, but the returned handle disconnects the
+         *        handler when it is destroyed.
+         */
+        [[nodiscard]] ScopedConnection connectScoped(Handler h) {
+            return ScopedConnection{this->core, this->connect(std::move(h))};
+        }
+
+        /**
+         * @brief Remove a previously-connected handler. An emission
+         *        already in flight works from a snapshot, so the handler
+         *        may still run once after this returns (see the class
+         *        notes).
+         * @return @c true if the slot existed and was removed.
+         */
+        bool disconnect(SlotId id) {
+            return this->core->disconnect(id);
+        }
+
+        /**
+         * @brief Number of currently connected handlers (excludes pending
+         *        one-shot @c next() awaiters).
+         */
+        std::size_t handlerCount() const {
+            std::lock_guard<std::mutex> lk(this->core->mu);
+            return this->core->handlers ? this->core->handlers->size() : 0;
+        }
+
+        /**
+         * @brief Number of parked @c next() awaiters (a snapshot). Lets a
+         *        caller wait until a coroutine is actually listening before
+         *        emitting, since @c next() does not see earlier emissions.
+         */
+        std::size_t waiterCount() const {
+            std::lock_guard<std::mutex> lk(this->core->mu);
+            return this->core->pending.size();
+        }
+
+        /**
+         * @brief Synchronously broadcast to all connected handlers and to
+         *        all pending one-shot @c next() awaiters.
+         *
+         * Handlers fire on the calling thread in registration order.
+         * @c next() awaiters are resumed via Yarn::run, so their bodies
+         * run on workers.
+         *
+         * Every handler runs even if an earlier one throws: the first
+         * exception is rethrown after the last handler has run.
+         */
+        void emit(Args... args) {
+            // Snapshot handlers + pending waiters under the lock; release
+            // the lock before invoking either, so handlers can connect /
+            // disconnect freely without re-entrant deadlock.
+            std::shared_ptr<const HandlerList> handlers_copy;
+            std::vector<std::shared_ptr<NextSlot>> waiters_copy;
+            this->snapshot(handlers_copy, waiters_copy);
+
+            this->wake(waiters_copy, args...);
+            if (!handlers_copy) return;
+            std::exception_ptr first;
+            for (const auto &entry : *handlers_copy) {
+                try {
+                    (*entry.second)(args...);
+                } catch (...) {
+                    if (!first) first = std::current_exception();
+                }
+            }
+            if (first) std::rethrow_exception(first);
+        }
+
+        /**
+         * @brief Dispatch each connected handler as a separate task on the
+         *        Yarn pool. Returns immediately. One-shot @c next() awaiters
+         *        are resumed exactly as in @ref emit (also on the pool).
+         *
+         * A handler that throws is reported through the process-wide
+         * handler installed with @c YarnBall::setUnhandledExceptionHandler
+         * (by default logged); it does not affect the other handlers. There
+         * is no backpressure: every emission queues one pool task per
+         * handler, so a producer that outruns the pool grows the queue
+         * without bound.
+         */
+        void emitAsync(Args... args) {
+            std::shared_ptr<const HandlerList> handlers_copy;
+            std::vector<std::shared_ptr<NextSlot>> waiters_copy;
+            this->snapshot(handlers_copy, waiters_copy);
+
+            this->wake(waiters_copy, args...);
+
+            // Dispatch each handler as a TaskAdapter on the pool.
+            if (handlers_copy) {
+                for (const auto &entry : *handlers_copy) {
+                    this->dispatch_handler(entry.second, args...);
+                }
+            }
+        }
+
+    private:
+        void snapshot(std::shared_ptr<const HandlerList> &handlers_copy,
+                      std::vector<std::shared_ptr<NextSlot>> &waiters_copy) {
+            std::lock_guard<std::mutex> lk(this->core->mu);
+            handlers_copy = this->core->handlers;
+            if (!this->core->pending.empty()) {
+                waiters_copy = std::move(this->core->pending);
+                this->core->pending.clear();
+                for (auto &slot : waiters_copy) slot->queued.store(false, std::memory_order_release);
+            }
+        }
+
+        /// Hand the emission to every waiter taken out of the pending list and resume it on the pool. Nothing
+        /// here throws past a waiter, so handlers are never skipped because of a wake.
+        static void wake(std::vector<std::shared_ptr<NextSlot>> &waiters, const Args &... args) {
+            for (auto &slot : waiters) {
+                try {
+                    slot->value.emplace(args...);
+                } catch (...) {
+                    slot->gone = true; // the copy failed: the waiter throws CancelledException rather than hang
+                }
+                YarnBall::detail::resumeOnPool(slot->handle);
+            }
+        }
+
+    public:
         /**
          * @brief Awaiter returned from @ref next. Suspends until the next
          *        emission, then resumes with a tuple of the emitted args.
          *        Cancellable (see @c Cancellation.h): inside a stopped scope
          *        it leaves the pending list and throws
          *        @c YarnBall::CancelledException; a frame destroyed while
-         *        parked also leaves it.
+         *        parked also leaves it. If the Signal is destroyed while
+         *        parked it throws @c YarnBall::CancelledException too.
          */
         struct NextAwaiter {
-            Signal *sig;
+            std::shared_ptr<Core> sig;
             std::shared_ptr<NextSlot> slot;
 
-            NextAwaiter(Signal *s, std::shared_ptr<NextSlot> sl) noexcept
-                : sig(s), slot(std::move(sl)) {
+            NextAwaiter(std::shared_ptr<Core> s, std::shared_ptr<NextSlot> sl) noexcept
+                : sig(std::move(s)), slot(std::move(sl)) {
             }
             NextAwaiter(const NextAwaiter &) = delete;
             NextAwaiter &operator=(const NextAwaiter &) = delete;
@@ -213,6 +400,11 @@ namespace Telegraph {
                             this->cancelled = true;
                             return false;
                         }
+                        if (sig->dead) {
+                            // The Signal is already destroyed and nothing will ever wake this waiter.
+                            this->slot->gone = true;
+                            return false;
+                        }
                         if (!core || armed) {
                             slot->handle = this->proxy.publish(h);
                             slot->queued.store(true, std::memory_order_release);
@@ -230,7 +422,7 @@ namespace Telegraph {
             }
 
             std::tuple<Args...> await_resume() {
-                if (this->cancelled) throw YarnBall::CancelledException{};
+                if (this->cancelled || this->slot->gone || !this->slot->value) throw YarnBall::CancelledException{};
                 return std::move(*slot->value);
             }
 
@@ -254,14 +446,7 @@ namespace Telegraph {
                         self->earlyCancel = true;
                     }
                 }
-                if (h) {
-                    try {
-                        std::unique_ptr<YarnBall::ITask> ct{new YarnBall::detail::CoroutineITask(h)};
-                        YarnBall::Yarn::instance()->run(std::move(ct));
-                    } catch (...) {
-                        h.resume();
-                    }
-                }
+                if (h) YarnBall::detail::resumeOnPool(h);
             }
 
             bool earlyCancel = false; // guarded by sig->mu
@@ -275,7 +460,7 @@ namespace Telegraph {
          *        Single-fire: re-await for subsequent emissions.
          */
         NextAwaiter next() {
-            return NextAwaiter{this, std::make_shared<NextSlot>()};
+            return NextAwaiter{this->core, std::make_shared<NextSlot>()};
         }
 
     private:
@@ -284,31 +469,37 @@ namespace Telegraph {
          *        arguments. Used by @ref emitAsync.
          */
         struct HandlerTask : public YarnBall::ITask {
-            Handler h;
+            std::shared_ptr<const Handler> h;
             std::tuple<Args...> args;
 
-            HandlerTask(Handler hh, std::tuple<Args...> aa)
+            HandlerTask(std::shared_ptr<const Handler> hh, std::tuple<Args...> aa)
                 : h(std::move(hh)), args(std::move(aa)) {
             }
 
             void run() override {
-                std::apply(this->h, this->args);
+                std::apply(*this->h, this->args);
             }
 
-            void exception(std::exception_ptr) override {
+            void exception(std::exception_ptr e) override {
+                YarnBall::detail::reportDetachedException(e);
             }
         };
 
-        void dispatch_handler(Handler h, std::tuple<Args...> args) {
-            std::unique_ptr<YarnBall::ITask> task{
-                new HandlerTask(std::move(h), std::move(args))};
-            YarnBall::Yarn::instance()->run(std::move(task));
+        static void dispatch_handler(const std::shared_ptr<const Handler> &h, const Args &... args) {
+            try {
+                std::unique_ptr<YarnBall::ITask> task{new HandlerTask(h, std::tuple<Args...>(args...))};
+                YarnBall::Yarn::instance()->run(std::move(task));
+            } catch (...) {
+                // The pool refused the task: run it here instead, so the handler is never silently skipped.
+                try {
+                    (*h)(args...);
+                } catch (...) {
+                    YarnBall::detail::reportDetachedException(std::current_exception());
+                }
+            }
         }
 
-        mutable std::mutex mu;
-        SlotId next_id = 1;
-        std::vector<std::pair<SlotId, Handler>> handlers;
-        std::vector<std::shared_ptr<NextSlot>> pending;
+        std::shared_ptr<Core> core;
     };
 
 }

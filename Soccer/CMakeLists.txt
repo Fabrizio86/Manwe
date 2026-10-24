@@ -41,6 +41,36 @@ find_path(LIBNGHTTP2_INCLUDE_DIR nghttp2/nghttp2.h
 find_library(LIBNGHTTP2_LIBRARY nghttp2
         HINTS /opt/homebrew/lib /usr/local/lib /usr/lib)
 
+# Each hardening option of the HTTP/2 sessions is probed for by symbol, not by
+# version number: distributions backport CVE fixes (Ubuntu 24.04 ships 1.59 with
+# nghttp2_option_set_max_continuations), so the version says little. A library
+# lacking an option still gets HTTP/2; that option is just not set.
+set(SOCCER_USE_NGHTTP2 FALSE)
+set(SOCCER_NGHTTP2_DEFS "")
+if (LIBNGHTTP2_INCLUDE_DIR AND LIBNGHTTP2_LIBRARY)
+    set(SOCCER_USE_NGHTTP2 TRUE)
+    include(CheckCXXSourceCompiles)
+    set(CMAKE_REQUIRED_INCLUDES ${LIBNGHTTP2_INCLUDE_DIR})
+    set(CMAKE_REQUIRED_LIBRARIES ${LIBNGHTTP2_LIBRARY})
+    foreach (_opt max_continuations max_settings max_outbound_ack)
+        string(TOUPPER "${_opt}" _OPT)
+        # check_cxx_source_compiles caches its answer: after nghttp2 is upgraded a cached
+        # "No" would silently keep the hardening option off. Probe afresh every configure.
+        unset(SOCCER_NGHTTP2_HAS_${_OPT} CACHE)
+        check_cxx_source_compiles("
+            #include <nghttp2/nghttp2.h>
+            int main() { nghttp2_option *o = nullptr; nghttp2_option_set_${_opt}(o, 8); return 0; }"
+                SOCCER_NGHTTP2_HAS_${_OPT})
+        if (SOCCER_NGHTTP2_HAS_${_OPT})
+            list(APPEND SOCCER_NGHTTP2_DEFS SOCCER_NGHTTP2_HAS_${_OPT}=1)
+        else ()
+            message(STATUS "Soccer: nghttp2 lacks nghttp2_option_set_${_opt}; that bound is not applied.")
+        endif ()
+    endforeach ()
+    unset(CMAKE_REQUIRED_INCLUDES)
+    unset(CMAKE_REQUIRED_LIBRARIES)
+endif ()
+
 set(SOCCER_SOURCES
         src/SocketAddress.cpp
         src/TcpStream.cpp
@@ -80,7 +110,7 @@ if (LIBTLS_INCLUDE_DIR AND LIBTLS_LIBRARY)
     include_directories(${LIBTLS_INCLUDE_DIR})
 endif ()
 
-if (LIBNGHTTP2_INCLUDE_DIR AND LIBNGHTTP2_LIBRARY)
+if (SOCCER_USE_NGHTTP2)
     list(APPEND SOCCER_SOURCES src/Http2.cpp)
     include_directories(${LIBNGHTTP2_INCLUDE_DIR})
 endif ()
@@ -115,12 +145,13 @@ else ()
             "Install LibreSSL (brew install libressl) to enable.")
 endif ()
 
-if (LIBNGHTTP2_INCLUDE_DIR AND LIBNGHTTP2_LIBRARY)
+if (SOCCER_USE_NGHTTP2)
     target_link_libraries(Soccer PUBLIC
             $<BUILD_INTERFACE:${LIBNGHTTP2_LIBRARY}>
             $<INSTALL_INTERFACE:nghttp2>)
     target_include_directories(Soccer PRIVATE ${LIBNGHTTP2_INCLUDE_DIR})
     target_compile_definitions(Soccer PUBLIC SOCCER_HAS_HTTP2=1)
+    target_compile_definitions(Soccer PRIVATE ${SOCCER_NGHTTP2_DEFS})
 else ()
     message(STATUS "Soccer: nghttp2 not found; HTTP/2 stays a stub. "
             "Install nghttp2 (brew install nghttp2) to enable.")

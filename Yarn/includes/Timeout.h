@@ -8,6 +8,14 @@
 // sleep, ...) is woken with CancelledException and unwinds; work that is
 // not parked finishes on its own and its result is discarded.
 //
+// The loser is not joined: withTimeout returns (or throws TimeoutException) as
+// soon as the race is decided, while a cancelled task may still be unwinding.
+// Whatever the task borrows by reference (a stack buffer, a caller-owned
+// stream) must therefore outlive the task itself, not just the withTimeout
+// call; see the lifetime rule in WhenAny.h. A value the task produces at the
+// instant the timer wins is destroyed, not delivered, so withTimeout is not a
+// lossless way to receive from a channel.
+//
 
 #ifndef YARN_TIMEOUT_H
 #define YARN_TIMEOUT_H
@@ -22,6 +30,7 @@
 #include <utility>
 #include <vector>
 
+#include "Cancellation.h"
 #include "Coroutines.h"
 #include "Timers.h"
 #include "WhenAny.h"
@@ -83,6 +92,25 @@ namespace YarnBall {
             co_return;
         }
 
+        /**
+         * @brief Body of a @ref deadlineToken timer: sleep on the Reactor, then stop @p src. Ends quietly, without
+         *        stopping @p src, when @p cancel is stopped first.
+         */
+        template<typename Rep, typename Period>
+        Task<> deadlineSleeper(std::shared_ptr<std::stop_source> src, std::stop_token cancel,
+                                    std::chrono::duration<Rep, Period> duration) {
+            try {
+                if (cancel.stop_possible()) {
+                    co_await withCancellation(cancel, timeout_sleeper(duration));
+                } else {
+                    co_await timeout_sleeper(duration);
+                }
+            } catch (const CancelledException &) {
+                co_return;
+            }
+            src->request_stop();
+        }
+
     } // namespace detail
 
 
@@ -100,6 +128,12 @@ namespace YarnBall {
      * described in @ref whenAny; in particular the sleeper is woken
      * and torn down as soon as the task finishes, instead of keeping
      * its frame alive for the whole timeout.
+     *
+     * @warning On timeout the task is cancelled but not joined: it may still
+     *          be running when this throws. Do not hand it references to
+     *          locals or caller-owned buffers/streams that die with the
+     *          caller (share ownership instead), and do not rely on it to
+     *          receive from a channel without loss.
      */
     template<typename T, typename Rep, typename Period>
     Task<T> withTimeout(Task<T> task,
@@ -158,21 +192,24 @@ namespace YarnBall {
      * }
      * @endcode
      *
-     * @note The signal fires from a detached helper thread that
-     *       @c sleep_for s the duration. This is OK for one-shot
-     *       deadlines, but creating thousands of deadlineTokens per
-     *       second would be wasteful -- prefer reusing a single
-     *       @c std::stop_source paired with a Reactor-driven timer
-     *       in that case.
+     * The deadline is a Reactor timer driving a detached coroutine, so no
+     * thread is held for its duration. Pass @p cancel to withdraw it early:
+     * if that token is stopped first, the timer is torn down and the returned
+     * token is never signalled. (Without it the timer lives until it fires: a
+     * suspended coroutine and a Reactor timer stay pinned for the whole
+     * @p duration even if the returned token is dropped at once, so for
+     * long durations that are usually abandoned early, pass @p cancel.)
+     *
+     * @note Needs a running Yarn pool and Reactor; throws whatever
+     *       @c coSpawn throws if the timer cannot be started.
      */
     template<typename Rep, typename Period>
-    std::stop_token deadlineToken(std::chrono::duration<Rep, Period> duration) {
+    std::stop_token deadlineToken(std::chrono::duration<Rep, Period> duration,
+                                  std::stop_token cancel = {}) {
         auto src = std::make_shared<std::stop_source>();
-        std::thread([src, duration]() {
-            std::this_thread::sleep_for(duration);
-            src->request_stop();
-        }).detach();
-        return src->get_token();
+        std::stop_token token = src->get_token();
+        coSpawn(detail::deadlineSleeper(std::move(src), std::move(cancel), duration));
+        return token;
     }
 
 }

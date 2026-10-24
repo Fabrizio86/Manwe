@@ -4,7 +4,9 @@
 
 #include "Metrics.h"
 
+#include <algorithm>
 #include <bit>
+#include <charconv>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -50,6 +52,9 @@ namespace YarnBall::metrics {
 
         // Atomic CAS-loop add for sum. std::atomic<double>::fetch_add
         // is C++20 but is missing on some older libc++ shims.
+        // A non-finite value still counts in the buckets above (+Inf lands in the +Inf bucket only) but must not enter
+        // the sum: one +Inf would make it +Inf (or NaN with a later -Inf) for the life of the process.
+        if (!std::isfinite(x)) return;
         std::uint64_t curBits = this->sumBits.load(std::memory_order_relaxed);
         while (true) {
             double cur = std::bit_cast<double>(curBits);
@@ -81,6 +86,11 @@ namespace YarnBall::metrics {
         out.emplace_back(std::numeric_limits<double>::infinity(),
                           this->bucketCounts[this->bounds.size()].load(
                               std::memory_order_relaxed));
+        // The buckets are read one by one while observers keep adding, so a later bucket can be read before an
+        // increment that an earlier read already included. Cumulative counts must never decrease with the bound.
+        for (std::size_t i = 1; i < out.size(); ++i) {
+            out[i].second = std::max(out[i].second, out[i - 1].second);
+        }
         return out;
     }
 
@@ -94,6 +104,24 @@ namespace YarnBall::metrics {
     }
 
     namespace {
+        /**
+         * @brief Prometheus metric names are [a-zA-Z_:][a-zA-Z0-9_:]*. The name is written verbatim into the exposition
+         *        text, so anything else (a space, newline or brace) would let a caller inject extra lines or labels.
+         */
+        void validateName(const std::string &name) {
+            bool ok = !name.empty();
+            for (std::size_t i = 0; ok && i < name.size(); ++i) {
+                const char c = name[i];
+                const bool alpha = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == ':';
+                const bool digit = c >= '0' && c <= '9';
+                ok = alpha || (i > 0 && digit);
+            }
+            if (!ok) {
+                throw std::invalid_argument(
+                    "metrics::Registry: invalid metric name (must match [a-zA-Z_:][a-zA-Z0-9_:]*)");
+            }
+        }
+
         /**
          * @brief The registry's own doc comment promises "a metric is
          *        uniquely identified by name" across all three metric
@@ -114,27 +142,59 @@ namespace YarnBall::metrics {
                 "metrics::Registry: \"" + name +
                 "\" already registered as a different metric type");
         }
+
+        constexpr const char *kHistogramSuffixes[] = {"_bucket", "_count", "_sum"};
+
+        bool endsWith(const std::string &s, const std::string &suffix) {
+            return s.size() >= suffix.size() && s.compare(s.size() - suffix.size(), suffix.size(), suffix) == 0;
+        }
+
+        [[noreturn]] void throwSuffixCollision(const std::string &name, const std::string &other) {
+            throw std::logic_error(
+                "metrics::Registry: \"" + name + "\" collides with the series of histogram \"" + other +
+                "\" (a histogram exposes <name>_bucket, <name>_count and <name>_sum)");
+        }
+    }
+
+    void Registry::checkSuffixCollisionLocked(const std::string &name, bool isHistogram) const {
+        const auto registered = [this](const std::string &n) {
+            return this->counters.count(n) || this->gauges.count(n) || this->histograms.count(n);
+        };
+        for (const char *suffix : kHistogramSuffixes) {
+            const std::string sfx(suffix);
+            // A new series named <histogram><suffix> would duplicate one the histogram already exposes...
+            if (endsWith(name, sfx)) {
+                const std::string base = name.substr(0, name.size() - sfx.size());
+                if (this->histograms.count(base)) throwSuffixCollision(name, base);
+            }
+            // ...and a new histogram would expose series that an existing metric already owns.
+            if (isHistogram && registered(name + sfx)) throwSuffixCollision(name + sfx, name);
+        }
     }
 
     Counter &Registry::counter(const std::string &name, const std::string &help) {
+        validateName(name);
         std::lock_guard<std::mutex> lk(this->mu);
         auto it = this->counters.find(name);
         if (it != this->counters.end()) return *it->second;
         if (this->gauges.count(name) || this->histograms.count(name)) {
             throwNameCollision(name);
         }
+        this->checkSuffixCollisionLocked(name, /*isHistogram=*/false);
         auto [ins, _] = this->counters.emplace(name, std::make_unique<Counter>(help));
         this->registrationOrder.push_back(name);
         return *ins->second;
     }
 
     Gauge &Registry::gauge(const std::string &name, const std::string &help) {
+        validateName(name);
         std::lock_guard<std::mutex> lk(this->mu);
         auto it = this->gauges.find(name);
         if (it != this->gauges.end()) return *it->second;
         if (this->counters.count(name) || this->histograms.count(name)) {
             throwNameCollision(name);
         }
+        this->checkSuffixCollisionLocked(name, /*isHistogram=*/false);
         auto [ins, _] = this->gauges.emplace(name, std::make_unique<Gauge>(help));
         this->registrationOrder.push_back(name);
         return *ins->second;
@@ -143,6 +203,7 @@ namespace YarnBall::metrics {
     Histogram &Registry::histogram(const std::string &name,
                                       std::vector<double> buckets,
                                       const std::string &help) {
+        validateName(name);
         std::lock_guard<std::mutex> lk(this->mu);
         auto it = this->histograms.find(name);
         if (it != this->histograms.end()) {
@@ -156,6 +217,7 @@ namespace YarnBall::metrics {
         if (this->counters.count(name) || this->gauges.count(name)) {
             throwNameCollision(name);
         }
+        this->checkSuffixCollisionLocked(name, /*isHistogram=*/true);
         auto [ins, _] = this->histograms.emplace(
             name, std::make_unique<Histogram>(std::move(buckets), help));
         this->registrationOrder.push_back(name);
@@ -172,11 +234,28 @@ namespace YarnBall::metrics {
         std::string fmtDouble(double x) {
             if (std::isinf(x)) return x > 0 ? "+Inf" : "-Inf";
             if (std::isnan(x)) return "NaN";
-            std::ostringstream os;
-            os.imbue(std::locale::classic());
-            os.precision(15);
-            os << x;
-            return os.str();
+            // Shortest representation that round-trips: close bucket bounds stay distinct, and 0.1 stays "0.1".
+#if defined(__APPLE__) && defined(__ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__) && \
+    __ENVIRONMENT_MAC_OS_X_VERSION_MIN_REQUIRED__ < 130300
+            // std::to_chars(double) needs macOS 13.3 at run time; with a lower deployment target fall back to the
+            // shortest of 15..17 significant digits that parses back to the same value, in the classic locale.
+            for (int precision = 15; precision <= 17; ++precision) {
+                std::ostringstream os;
+                os.imbue(std::locale::classic());
+                os.precision(precision);
+                os << x;
+                std::istringstream is(os.str());
+                is.imbue(std::locale::classic());
+                double back = 0;
+                is >> back;
+                if (back == x || precision == 17) return os.str();
+            }
+            return "NaN";
+#else
+            char buf[64];
+            const auto res = std::to_chars(buf, buf + sizeof(buf), x);
+            return std::string(buf, res.ptr);
+#endif
         }
     }
 
@@ -226,7 +305,8 @@ namespace YarnBall::metrics {
                 for (const auto &[bound, count] : snap) {
                     os << name << "_bucket{le=\"" << fmtDouble(bound) << "\"} " << count << "\n";
                 }
-                os << name << "_count " << h.count() << "\n";
+                // _count must equal the +Inf bucket of this same snapshot, not a separately sampled counter.
+                os << name << "_count " << snap.back().second << "\n";
                 os << name << "_sum " << fmtDouble(h.sum()) << "\n";
                 continue;
             }

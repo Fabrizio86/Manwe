@@ -8,9 +8,11 @@
 #include <atomic>
 #include <cmath>
 #include <exception>
+#include <new>
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 #ifndef _WIN32
@@ -51,6 +53,10 @@ namespace YarnBall {
         try {
             std::rethrow_exception(e);
         } catch (const CancelledException &) {
+            return;
+        } catch (const PoolShutdownError &) {
+            // A callable that never ran because the pool was torn down: expected at exit, not a failure to report (and
+            // the user's handler must not be entered during static teardown for it).
             return;
         } catch (const std::exception &ex) {
             what = ex.what();
@@ -108,6 +114,18 @@ namespace YarnBall {
          *        fiber. Avoids growing on transient single-task spikes.
          */
         constexpr size_t kGrowBacklogThreshold = 64;
+
+        /**
+         * @brief Period of the stall detector's check while work is outstanding.
+         */
+        constexpr auto kStallTick = std::chrono::milliseconds(10);
+
+        /**
+         * @brief Consecutive checks (@ref kStallTick apart) with queued work, no parked worker and not a single task
+         *        finished before the pool is considered stalled (every worker blocked) and one more worker is added, or
+         *        a parked one is poked. Bounds the growth rate to one worker per @c kStallTicks * kStallTick.
+         */
+        constexpr int kStallTicks = 5;
 
         /**
          * @brief Thread-local trampoline queue for
@@ -199,6 +217,10 @@ namespace YarnBall {
     static thread_local std::mt19937 tls_stealRng{std::random_device{}()};
 
     namespace {
+        // Written once, from the worker that runs ~Yarn (exit() inside a task); see shutdownWorkers. Volatile so the
+        // store is not dropped as dead: the pointer is what keeps the allocation reachable for leak checkers.
+        sFiber *volatile g_exitingWorkerKeepAlive = nullptr;
+
         void computeThreadCounts(int &minCount, int &maxCount) {
             minCount = std::max<int>(
                 kMinThreadsFloor,
@@ -216,8 +238,8 @@ namespace YarnBall {
     }
 
     Yarn::Yarn()
-        : injection(std::make_shared<InjectionQueue>(QueueSize::Huge)),
-          fiberSnapshot(std::make_shared<const Fibers>()),
+        : fiberSnapshot(std::make_shared<const Fibers>()),
+          injection(std::make_shared<InjectionQueue>(static_cast<std::size_t>(QueueSize::Huge))),
           scheduler(std::make_shared<RandomScheduler>()) {
 #ifndef _WIN32
         // Suppress SIGPIPE so a peer disconnecting mid-write does not
@@ -228,26 +250,56 @@ namespace YarnBall {
         std::signal(SIGPIPE, SIG_IGN);
 #endif
         threadCountsInit(Yarn::MinThreadCount, Yarn::MaxThreadCount);
-        std::lock_guard<std::mutex> lk(this->cmu);
-        this->fibers.resize(Yarn::MaxThreadCount);
-        for (int i = 0; i < Yarn::MinThreadCount; ++i) {
-            this->initializeNewThreadLocked(static_cast<FiberId>(i), /*markAsTemp=*/false);
+        try {
+            std::lock_guard<std::mutex> lk(this->cmu);
+            this->fibers.resize(Yarn::MaxThreadCount);
+            for (int i = 0; i < Yarn::MinThreadCount; ++i) {
+                this->initializeNewThreadLocked(static_cast<FiberId>(i), /*markAsTemp=*/false);
+            }
+            this->rebuildSnapshotLocked();
+        } catch (...) {
+            // The destructor does not run for a throwing constructor, and the members the already-started workers use
+            // (cmu and schedMu are declared last, so they go first) are destroyed during unwinding: stop and join the
+            // workers before letting the exception leave.
+            this->shutdownWorkers();
+            throw;
         }
-        this->rebuildSnapshotLocked();
     }
 
     Yarn::~Yarn() {
-        // Phase 1: stop all workers so anyone parked or mid-spin returns.
+        this->shutdownWorkers();
+    }
+
+    void Yarn::shutdownWorkers() {
+        // Phase 1: stop all workers so anyone parked or mid-spin returns. Retired-but-unreaped fibers are collected
+        // too: their thread may still be finishing its last drain, which reads pushPending.
         Fibers workers;
         {
             std::lock_guard<std::mutex> lk(this->cmu);
+            // From here on no worker may be added: one spawned after the sweep below would never be stopped.
+            this->shuttingDown = true;
             for (auto &f : this->fibers) {
                 if (f) {
                     f->stop();
                     workers.push_back(f);
                 }
             }
+            for (auto &f : this->graveyard) {
+                if (f) workers.push_back(f);
+            }
         }
+        // ~Yarn can run on a worker thread (exit() called from a task). That worker cannot join itself and keeps
+        // running on its own Fiber after we return, so its Fiber must outlive this call: leak one reference on
+        // purpose, skip joining/abandoning it, and let the process wind down.
+        // The reference lives in a namespace-scope pointer, so the allocation stays reachable (leak checkers do not flag it).
+        Fiber *const self = tls_currentFiber;
+        for (auto &f : workers) {
+            if (f.get() == self) {
+                g_exitingWorkerKeepAlive = new sFiber(f);
+                break;
+            }
+        }
+        this->stopWatchdog();
         // Phase 1b: wait for every worker thread to be gone BEFORE any member of this
         // object is destroyed. Relying on ~Fiber to join (phase 2) is not enough: each
         // worker's thread_local snapshot cache holds a reference to every Fiber until that
@@ -255,14 +307,18 @@ namespace YarnBall {
         // ~Fiber does not run, ~Yarn returns, and a worker still inside stealFromPeers /
         // currentSnapshot then locks the destroyed `cmu` ("mutex lock failed: Invalid
         // argument" at process exit). Joined outside `cmu`: a worker may need it to finish.
-        for (auto &f : workers) f->join();
-        // Tasks still sitting in a worker's inbox are forwarded by ~Fiber through pushPending -> Yarn::dispatch, which would run against
-        // this half-destroyed object (and recurse through the snapshot's Fiber references). Nothing runs them any more: let ~Fiber delete them.
-        for (auto &f : workers) f->abandonPending();
+        for (auto &f : workers) {
+            if (f.get() != self) f->join();
+        }
+        // Tasks still sitting in a worker's inbox or deque are forwarded by ~Fiber through pushPending -> Yarn::dispatch, which would run against
+        // this half-destroyed object (and recurse through the snapshot's Fiber references). Nothing runs them any more: let ~Fiber fail and delete them.
+        for (auto &f : workers) {
+            if (f.get() != self) f->abandonPending();
+        }
         workers.clear();
-        // Phase 2: dropping the sFibers triggers ~Fiber which joins. We are
-        // never the worker thread here (destruction is driven by static
-        // teardown on the main thread), so no self-join.
+        // Phase 2: dropping the sFibers triggers ~Fiber which joins. A worker
+        // thread only gets here via the `self` path above, which never
+        // destroys its own Fiber.
         {
             std::lock_guard<std::mutex> lk(this->cmu);
             this->fibers.clear();
@@ -271,12 +327,12 @@ namespace YarnBall {
         // Phase 3: collect any fibers that retired but were never reaped.
         this->reap();
 
-        // Phase 4: anything stuck in the injection queue at shutdown is lost
-        // on purpose — the InjectionQueue destructor will free the raw
-        // pointers we leaked. Patch that:
+        // Phase 4: anything stuck in the injection queue at shutdown never runs;
+        // fail it (so Waitable::wait and friends return) and free it rather
+        // than leaving the raw pointers to the queue destructor.
         TaskPtr t = nullptr;
         while (this->injection && this->injection->dequeue(t)) {
-            delete t;
+            detail::discardTask(t);
         }
     }
 
@@ -311,25 +367,93 @@ namespace YarnBall {
         return s;
     }
 
+    namespace {
+        /// Test hook state (see Yarn::failSubmissionsForTest), per thread so that unrelated pool traffic cannot consume
+        /// it: submissions to let through, then submissions to fail.
+        thread_local int tlsFailSkip = 0;
+        thread_local int tlsFailCount = 0;
+
+        /// Throws std::bad_alloc when the test hook says this submission must fail. One TLS load when unused.
+        inline void maybeInjectSubmitFailure() {
+            if (tlsFailCount <= 0) return;
+            if (tlsFailSkip > 0) {
+                --tlsFailSkip;
+                return;
+            }
+            --tlsFailCount;
+            throw std::bad_alloc();
+        }
+
+        /// Run a task on the calling thread and free it: the last resort when it cannot be queued anywhere.
+        inline void runInlineAndFree(TaskPtr t) noexcept {
+            try { t->run(); } catch (...) {
+                try { t->exception(std::current_exception()); } catch (...) { }
+            }
+            delete t;
+        }
+    }
+
+    bool Yarn::awaitQuiescence(std::chrono::milliseconds timeout) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        constexpr int kSettlePolls = 5;
+        int idlePolls = 0;
+        for (;;) {
+            bool idle = this->injection->Size() == 0;
+            if (idle) {
+                const auto snap = this->currentSnapshot();
+                if (snap) {
+                    for (const auto &f : *snap) {
+                        if (f && (!f->isParked() || f->hasStealableWork())) {
+                            idle = false;
+                            break;
+                        }
+                    }
+                }
+            }
+            idlePolls = idle ? idlePolls + 1 : 0;
+            if (idlePolls >= kSettlePolls) return true;
+            if (std::chrono::steady_clock::now() >= deadline) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    }
+
+    void Yarn::failSubmissionsForTest(int skip, int count) noexcept {
+        tlsFailSkip = skip;
+        tlsFailCount = count;
+    }
+
     void Yarn::run(uITask task) {
         if (!task) return;
+        // Anything that throws before dispatch() leaves the task in this by-value parameter, which destroys it once.
+        maybeInjectSubmitFailure();
         this->reap();
         this->dispatch(task.release());
     }
 
     void Yarn::run(sITask task) {
         if (!task) return;
+        maybeInjectSubmitFailure();
         this->reap();
         // One small allocation per submission carries the shared_ptr to the
         // worker. The pool fast path itself never sees a shared_ptr.
-        this->dispatch(new SharedOwnerAdapter(std::move(task)));
+        uITask adapter{new SharedOwnerAdapter(std::move(task))};
+        this->dispatch(adapter.release());
     }
 
-    void Yarn::dispatch(TaskPtr task) {
+    void Yarn::dispatch(TaskPtr task) noexcept {
+        // dispatch owns the task from here on and cannot fail: every step either publishes it (queue or inline run) or
+        // is a best-effort extra (snapshot, wake, grow) whose failure only means the next step is tried. A throw out of
+        // seed()/tryPushInbox() can only come from the wake-up that follows the (noexcept) push, i.e. the task is
+        // already published, so it is treated as success.
+
         // In-worker fast path: push directly to our own local deque. No lock,
         // no atomic CAS, no shared_ptr touch.
         if (Fiber *self = tls_currentFiber) {
-            if (self->seed(task)) return;
+            try {
+                if (self->seed(task)) return;
+            } catch (...) {
+                return;
+            }
             // Local deque full -- fall through to express / injection.
         }
 
@@ -338,7 +462,8 @@ namespace YarnBall {
         // workers so the central injection queue's tail counter is not
         // contended with peer dequeues. Workers drain their inbox first
         // in their process loop.
-        auto snap = this->currentSnapshot();
+        std::shared_ptr<const Fibers> snap;
+        try { snap = this->currentSnapshot(); } catch (...) { }
         if (snap && !snap->empty()) {
             const std::size_t n = snap->size();
             const std::size_t base =
@@ -349,30 +474,38 @@ namespace YarnBall {
             // back to the central injection queue.
             for (std::size_t probe = 0; probe < 3; ++probe) {
                 Fiber *target = (*snap)[(base + probe) % n].get();
-                if (target && target->tryPushInbox(task)) return;
+                try {
+                    if (target && target->tryPushInbox(task)) return;
+                } catch (...) {
+                    return;
+                }
             }
         }
 
         this->enqueueInjection(task);
     }
 
-    void Yarn::enqueueInjection(TaskPtr task) {
+    void Yarn::enqueueInjection(TaskPtr task) noexcept {
         if (this->injection->enqueue(task)) {
-            // Hot path: just wake someone. cmu is *not* taken unless we
-            // observe genuine backlog with no parked worker to absorb it.
-            if (this->wakeOneParked()) return;
-            if (this->injection->Size() < kGrowBacklogThreshold) return;
+            // The task is published; waking or growing is best effort (the running workers drain the queue anyway).
+            try {
+                // Hot path: just wake someone. cmu is *not* taken unless we
+                // observe genuine backlog with no parked worker to absorb it.
+                if (this->wakeOneParked()) return;
+                if (this->injection->Size() < kGrowBacklogThreshold) return;
 
-            // Skip the cmu acquire entirely when the pool is already at
-            // its temp-fiber ceiling -- there's nothing maybeGrowLocked
-            // would do that we'd care about.
-            const int maxTemps = Yarn::MaxThreadCount - Yarn::MinThreadCount;
-            if (this->tempFiberCount.load(std::memory_order_acquire) >= maxTemps) {
-                return;
+                // Skip the cmu acquire entirely when the pool is already at
+                // its temp-fiber ceiling -- there's nothing maybeGrowLocked
+                // would do that we'd care about.
+                const int maxTemps = Yarn::MaxThreadCount - Yarn::MinThreadCount;
+                if (this->tempFiberCount.load(std::memory_order_acquire) >= maxTemps) {
+                    return;
+                }
+
+                std::lock_guard<std::mutex> lk(this->cmu);
+                this->maybeGrowLocked();
+            } catch (...) {
             }
-
-            std::lock_guard<std::mutex> lk(this->cmu);
-            this->maybeGrowLocked();
             return;
         }
 
@@ -393,20 +526,30 @@ namespace YarnBall {
         // holding cmu, so the Fiber stays alive even if it retires
         // concurrently between releasing the lock and calling seed().
         sFiber grown;
-        {
+        try {
             std::lock_guard<std::mutex> lk(this->cmu);
             int newId = this->maybeGrowLocked();
             if (newId >= 0 && this->fibers[newId]) grown = this->fibers[newId];
+        } catch (...) {
+            // Could not grow (e.g. thread creation failed): fall through to the inline fallback.
         }
         // The deque is single-producer (owner only); this thread is a foreign producer, so go through the MPMC inbox.
-        if (grown && grown->tryPushInbox(task)) return;
+        try {
+            if (grown && grown->tryPushInbox(task)) return;
+        } catch (...) {
+            return; // published; only the wake-up threw
+        }
 
         // Trampoline instead of recurse -- see tlsInlineDrainQueue's
         // comment for the full rationale. A nested re-entry (this
         // thread is already draining) just parks the task and returns;
         // O(1), no added native stack depth.
         if (tlsInlineDrainQueue) {
-            tlsInlineDrainQueue->push_back(task);
+            try {
+                tlsInlineDrainQueue->push_back(task);
+            } catch (...) {
+                runInlineAndFree(task); // out of memory: nest rather than lose the task
+            }
             return;
         }
 
@@ -432,20 +575,23 @@ namespace YarnBall {
             }
             ~DrainQueueGuard() noexcept { tlsInlineDrainQueue = nullptr; }
         };
-        std::vector<TaskPtr> drain{task};
+        std::vector<TaskPtr> drain;
+        try {
+            drain.push_back(task);
+        } catch (...) {
+            runInlineAndFree(task);
+            return;
+        }
         DrainQueueGuard guard(drain);
         while (!drain.empty()) {
             TaskPtr t = drain.back();
             drain.pop_back();
-            try { t->run(); } catch (...) {
-                try { t->exception(std::current_exception()); } catch (...) { }
-            }
-            delete t;
+            runInlineAndFree(t);
         }
     }
 
     int Yarn::maybeGrowLocked() {
-        if (this->maxLimitReachedLocked()) return -1;
+        if (this->shuttingDown || this->maxLimitReachedLocked()) return -1;
         const FiberId id = this->firstUnusedTempIdLocked();
         if (id >= this->fibers.size()) return -1;
         this->initializeNewThreadLocked(id, /*markAsTemp=*/true);
@@ -464,6 +610,10 @@ namespace YarnBall {
          *        @ref Yarn::releaseThreadSnapshotCache before they exit,
          *        avoiding a self-join during thread_local teardown.
          */
+        //
+        // The cache is refreshed only when this thread next asks for a snapshot after a version bump, so a thread that
+        // stops submitting keeps its last snapshot, and with it the retired Fibers in it, alive until it submits again
+        // or exits. That only delays the final ~Fiber (a joined, thread-less object) of a few retired temp fibers.
         thread_local std::shared_ptr<const Fibers> tlsCachedSnapshot;
         thread_local std::uint64_t tlsCachedSnapshotVersion = 0;
     }
@@ -488,25 +638,139 @@ namespace YarnBall {
     }
 
     bool Yarn::wakeOneParked() {
+        // The caller has just published work (queue enqueue); pairs with the fence in Fiber::park() so a worker that
+        // is about to sleep either is counted here or finds the work in its re-check.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        // Whoever publishes work makes sure the stall detector is watching it: a wake can be wasted (the woken worker
+        // may pick another task and then block), and only the detector notices a pool in which every worker is stuck.
+        this->armWatchdog();
         // Fast skip: when no worker is parked, no walk, no snapshot
         // copy, no shared_ptr ref-count traffic. Steady-state submit
         // loads with all workers busy hit this branch unconditionally,
         // which is the win the parkedWorkers counter exists for.
-        // The caller has just published work (queue enqueue); pairs with the fence in Fiber::park() so a worker that
-        // is about to sleep either is counted here or finds the work in its re-check.
-        std::atomic_thread_fence(std::memory_order_seq_cst);
         if (this->parkedWorkers.load(std::memory_order_acquire) == 0) {
             return false;
         }
         auto snap = this->currentSnapshot();
         if (!snap) return false;
         for (const auto &f : *snap) {
-            if (f && f->isParked()) {
+            // A parked fiber stays "parked" until it actually runs again, so without the claim a burst of submissions
+            // would poke the same first fiber every time and leave the others asleep next to queued work.
+            if (f && f->isParked() && f->claimWake()) {
                 f->poke();
                 return true;
             }
         }
         return false;
+    }
+
+    void Yarn::armWatchdog() noexcept {
+        if (this->wdArmed.load(std::memory_order_acquire)) return;
+        try {
+            std::lock_guard<std::mutex> lk(this->wdMu);
+            if (this->wdStop) return;
+            if (!this->wdThread.joinable()) {
+                this->wdThread = std::thread(&Yarn::watchdogLoop, this);
+            }
+            this->wdArmed.store(true, std::memory_order_seq_cst);
+        } catch (...) {
+            // No watchdog thread (resource exhaustion): the pool still works, it just cannot repair a stall.
+            return;
+        }
+        this->wdCv.notify_one();
+    }
+
+    void Yarn::stopWatchdog() noexcept {
+        {
+            std::lock_guard<std::mutex> lk(this->wdMu);
+            this->wdStop = true;
+        }
+        this->wdCv.notify_all();
+        // Never self-join: the watchdog thread does not run ~Yarn, but a worker may; the watchdog is a different thread.
+        if (this->wdThread.joinable() && this->wdThread.get_id() != std::this_thread::get_id()) {
+            this->wdThread.join();
+        }
+    }
+
+    bool Yarn::hasOutstandingWork() {
+        if (!this->injection->empty()) return true;
+        const auto snap = this->currentSnapshot();
+        if (!snap) return false;
+        for (const auto &f : *snap) {
+            if (f && f->hasStealableWork()) return true;
+        }
+        return false;
+    }
+
+    std::uint64_t Yarn::completedTotal() {
+        std::uint64_t total = 0;
+        const auto snap = this->currentSnapshot();
+        if (snap) {
+            for (const auto &f : *snap) {
+                if (f) total += f->completedCount();
+            }
+        }
+        return total;
+    }
+
+    void Yarn::watchdogLoop() {
+        // Detects a pool in which every worker is blocked (a task waiting on work that sits in a queue behind it) and
+        // repairs it by adding a worker. It sleeps on a condition variable until a submission arms it, ticks only while
+        // work is outstanding, and disarms itself the moment the queues are empty, so an idle pool costs nothing.
+        std::unique_lock<std::mutex> lk(this->wdMu);
+        while (!this->wdStop) {
+            this->wdCv.wait(lk, [this] { return this->wdStop || this->wdArmed.load(std::memory_order_acquire); });
+            std::uint64_t last = 0;
+            bool haveLast = false;
+            int stagnant = 0;
+            while (!this->wdStop && this->wdArmed.load(std::memory_order_acquire)) {
+                this->wdCv.wait_for(lk, kStallTick, [this] { return this->wdStop; });
+                if (this->wdStop) break;
+                lk.unlock();
+                try {
+                    if (!this->hasOutstandingWork()) {
+                        // Disarm, then look again: a producer that published after the check above but before the
+                        // flag was cleared saw the flag still set and did not re-arm. Pairs with the fence in wakeOneParked.
+                        this->wdArmed.store(false, std::memory_order_seq_cst);
+                        std::atomic_thread_fence(std::memory_order_seq_cst);
+                        if (this->hasOutstandingWork()) this->wdArmed.store(true, std::memory_order_seq_cst);
+                        haveLast = false;
+                        stagnant = 0;
+                    } else {
+                        const std::uint64_t now = this->completedTotal();
+                        if (!haveLast || now != last) {
+                            last = now;
+                            haveLast = true;
+                            stagnant = 0;
+                        } else if (++stagnant >= kStallTicks) {
+                            stagnant = 0;
+                            this->resolveStall();
+                        }
+                    }
+                } catch (...) {
+                    // Best effort; try again on the next tick.
+                }
+                lk.lock();
+            }
+        }
+        lk.unlock();
+        this->releaseThreadSnapshotCache();
+    }
+
+    void Yarn::resolveStall() {
+        // Work is queued and nothing has completed for kStallTicks ticks. If a worker is asleep it missed its wake:
+        // poke it. Otherwise every worker is busy or blocked: add one.
+        if (this->parkedWorkers.load(std::memory_order_acquire) > 0) {
+            const auto snap = this->currentSnapshot();
+            if (snap) {
+                for (const auto &f : *snap) {
+                    if (f && f->isParked()) f->poke();
+                }
+            }
+            return;
+        }
+        std::lock_guard<std::mutex> lk(this->cmu);
+        this->maybeGrowLocked();
     }
 
     TaskPtr Yarn::stealFromPeers(FiberId selfId) {
@@ -618,6 +882,15 @@ namespace YarnBall {
             return this->stealFromPeers(fid);
         };
 
+        AnyPeerWork anyPeerWork = [this](FiberId fid) {
+            auto snap = this->currentSnapshot();
+            if (!snap) return false;
+            for (const auto &peer : *snap) {
+                if (peer && peer->id() != fid && peer->hasStealableWork()) return true;
+            }
+            return false;
+        };
+
         WakeOneIdle wakeOneIdle = [this]() {
             this->wakeOneParked();
         };
@@ -630,7 +903,9 @@ namespace YarnBall {
             std::move(pushPending),
             std::move(tryStealFromPeers),
             std::move(wakeOneIdle),
-            markAsTemp);
+            markAsTemp,
+            std::move(anyPeerWork),
+            this);
         this->fibers[id] = std::move(fiber);
     }
 

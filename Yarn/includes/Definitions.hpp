@@ -90,6 +90,13 @@ namespace YarnBall {
     using WakeOneIdle = std::function<void()>;
 
     /**
+     * @brief Returns @c true if any peer fiber (other than the given one) holds work a steal could take: a non-empty
+     *        local deque or inbox. Lets a fiber about to sleep notice work that was pushed to a peer's queues without
+     *        a wake reaching it.
+     */
+    using AnyPeerWork = std::function<bool(FiberId selfId)>;
+
+    /**
      * @brief Platform handle to a Fiber's underlying OS thread.
      */
     using OsHandler = std::thread::native_handle_type;

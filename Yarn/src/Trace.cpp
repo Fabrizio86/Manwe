@@ -4,6 +4,7 @@
 
 #include "Trace.h"
 
+#include <atomic>
 #include <random>
 
 namespace YarnBall::trace {
@@ -41,13 +42,12 @@ namespace YarnBall::trace {
         }
 
         /**
-         * @brief Decode a hex character to its 4-bit value, or @c -1
-         *        if the character is not a hex digit.
+         * @brief Decode a lowercase hex character to its 4-bit value, or
+         *        @c -1 otherwise. W3C traceparent forbids uppercase hex.
          */
         int hexNibble(char c) {
             if (c >= '0' && c <= '9') return c - '0';
             if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
             return -1;
         }
 
@@ -95,6 +95,8 @@ namespace YarnBall::trace {
     }
 
     Context newChild(const Context &parent) {
+        // An empty parent has no trace to continue; a child sharing its all-zero trace id would be invalid.
+        if (parent.empty()) return newRoot();
         Context c = parent;
         std::uint64_t s = rng()();
         for (std::size_t i = 0; i < c.spanId.size(); ++i) {
@@ -144,16 +146,64 @@ namespace YarnBall::trace {
         return std::string(buf, 16);
     }
 
+    namespace detail {
+        /**
+         * @brief What a Scope leaves behind for its owning thread: the context to go back to, the enclosing scope's
+         *        state, and whether the scope has been destroyed (possibly on another thread).
+         */
+        struct ScopeState {
+            Context saved;
+            std::shared_ptr<ScopeState> outer;
+            std::atomic<bool> released{false};
+        };
+    }
+
+    namespace {
+        /// Innermost live (or released but not yet unwound) scope of this thread.
+        thread_local std::shared_ptr<detail::ScopeState> g_top;
+
+        /// Unwind scopes that were destroyed since this thread last looked, innermost first.
+        void unwindReleased() noexcept {
+            while (g_top && g_top->released.load(std::memory_order_acquire)) {
+                g_current = g_top->saved;
+                auto outer = std::move(g_top->outer);
+                g_top = std::move(outer);
+            }
+        }
+    }
+
     const Context &current() noexcept {
+        unwindReleased();
         return g_current;
     }
 
-    Scope::Scope(const Context &ctx) noexcept : saved(g_current) {
+    Scope::Scope(const Context &ctx) noexcept : owner(std::this_thread::get_id()) {
+        unwindReleased();
+        this->saved = g_current;
+        try {
+            auto st = std::make_shared<detail::ScopeState>();
+            st->saved = g_current;
+            st->outer = g_top;
+            g_top = st;
+            this->state = std::move(st);
+        } catch (...) {
+            // No bookkeeping possible: fall back to restoring through the members, on the owning thread only.
+        }
         g_current = ctx;
     }
 
     Scope::~Scope() noexcept {
-        g_current = this->saved;
+        if (this->state) {
+            // Mark the scope finished. On the owning thread unwind right away; from any other thread the owner does it
+            // on its next look (writing another running thread's thread-local from here would be a data race, and
+            // writing this thread's would clobber an unrelated context).
+            this->state->released.store(true, std::memory_order_release);
+            if (this->owner == std::this_thread::get_id()) unwindReleased();
+            return;
+        }
+        if (this->owner == std::this_thread::get_id()) {
+            g_current = this->saved;
+        }
     }
 
 }
