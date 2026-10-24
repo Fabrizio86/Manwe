@@ -49,13 +49,13 @@ namespace Soccer {
         UdpSocket(const UdpSocket &) = delete;
         UdpSocket &operator=(const UdpSocket &) = delete;
 
-        UdpSocket(UdpSocket &&other) noexcept : sock(std::move(other.sock)) {
+        UdpSocket(UdpSocket &&other) : sock(std::move(other.sock)) {
         }
 
         UdpSocket &operator=(UdpSocket &&other) noexcept {
             if (this != &other) {
                 this->close();
-                this->sock.reset(other.sock.take());
+                this->sock.adopt(other.sock);
             }
             return *this;
         }
@@ -85,12 +85,33 @@ namespace Soccer {
                                             const SocketAddress &destination);
 
         /**
+         * @brief Send one datagram to the peer set by @ref connect, suspending on
+         *        writability if the local send buffer is full. Use this (not
+         *        @ref sendTo) once the socket is connected: BSD and macOS refuse a
+         *        destination on a connected socket (@c EISCONN), and an unconnected
+         *        socket has no peer (@c EDESTADDRREQ).
+         * @return Number of bytes sent.
+         * @throws SocketException on error, including a closed socket.
+         */
+        YarnBall::Task<std::size_t> send(std::span<const std::byte> buf);
+
+        /**
+         * @brief Receive one datagram on a connected socket, suspending until
+         *        readable; same as @ref recvFrom without the sender (it is the peer
+         *        set by @ref connect, and the kernel drops datagrams from anyone else).
+         * @param truncated See @ref recvFrom.
+         */
+        YarnBall::Task<std::size_t> recv(std::span<std::byte> buf, bool *truncated = nullptr);
+
+        /**
          * @brief Set the default destination for unaddressed sends.
          *
-         * After @c connect, @c ::send / @c WSASend on this socket route to
-         * @p peer without needing a per-call @c sockaddr. The kernel also
-         * starts filtering inbound datagrams to those originating from
-         * @p peer (matching the BSD-sockets contract).
+         * After @c connect, @ref send (and @c ::send / @c WSASend) route to
+         * @p peer without needing a per-call @c sockaddr, and @ref recv receives
+         * from it. The kernel also starts filtering inbound datagrams to those
+         * originating from @p peer (matching the BSD-sockets contract). On
+         * BSD/macOS, @ref sendTo to an address then fails with @c EISCONN: use
+         * @ref send.
          *
          * Required before issuing a Windows proactor-style
          * @c asyncSendOverlapped on a UDP socket: @c WSASend does not
@@ -182,7 +203,7 @@ namespace Soccer {
         void close() noexcept;
 
     private:
-        explicit UdpSocket(int fd) noexcept : sock(fd) {
+        explicit UdpSocket(int fd) : sock(fd) {
         }
 
         detail::SocketSlot sock;

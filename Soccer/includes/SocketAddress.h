@@ -32,6 +32,10 @@ namespace Soccer {
          * @brief Resolve @p host as either an IPv4 / IPv6 literal or a
          *        DNS name, paired with @p port. Returns the first AI_*
          *        result. Throws @c SocketException on resolution failure.
+         *        An empty @p host means the wildcard address (@c AI_PASSIVE with
+         *        a null node: @c 0.0.0.0 / @c ::), the same on every platform;
+         *        it is what @c bind("") listens on. Connecting to a wildcard
+         *        address reaches the local machine on most systems.
          *
          * @note Synchronous: runs @c getaddrinfo on the calling thread.
          *       For non-blocking flows use @c resolveAsync, which hops

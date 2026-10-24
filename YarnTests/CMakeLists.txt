@@ -16,6 +16,7 @@ endif ()
 
 add_executable(YarnTests main.cpp soccer_limits_tests.cpp cancellation_tests.cpp
         audit_core_tests.cpp audit_async_tests.cpp audit_wire_tests.cpp audit_soccer_net_tests.cpp audit_soccer_http_tests.cpp audit_embedded_tests.cpp
+        audit3_core_tests.cpp audit3_async_tests.cpp audit3_net_tests.cpp audit3_http_tests.cpp audit3_wire_tests.cpp
         test_framework.hpp)
 
 # Link against the CMake targets (not raw .a paths) so that PUBLIC compile

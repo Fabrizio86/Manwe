@@ -31,12 +31,10 @@ namespace Soccer {
      *
      * Every accepted TCP connection has @c TCP_NODELAY set (see @c TcpStream).
      *
-     * @note @c close() shuts the listening socket down on Linux (to wake a parked
-     *       accept), and a shutdown acts on the socket, not on one descriptor. A
-     *       process that @c fork()s without @c exec shares the socket with its child,
-     *       so a @c close() in the child would also stop the parent's listener.
-     *       Forking without exec is not supported with Yarn running threads anyway;
-     *       exec the child (descriptors are close-on-exec) instead.
+     * @note A parked @c accept() is woken by the Reactor (@c cancelFd), on every platform, so
+     *       @c close() and @c interruptAccept() never shut the socket down or touch the
+     *       connections queued on it. (Forking without @c exec is still not supported with
+     *       Yarn running threads; exec the child, descriptors are close-on-exec.)
      */
     class TcpListener final {
     public:
@@ -105,14 +103,18 @@ namespace Soccer {
         TcpListener(const TcpListener &) = delete;
         TcpListener &operator=(const TcpListener &) = delete;
 
-        TcpListener(TcpListener &&other) noexcept
+        /// Not @c noexcept: the new listener allocates its slot state (@c std::bad_alloc, @p other untouched).
+        /// The listener carries @p other's interrupted state (see @ref interruptAccept).
+        TcpListener(TcpListener &&other)
             : sock(std::move(other.sock)), lockFd(std::exchange(other.lockFd, -1)) {
         }
 
+        /// Closes this listener, then adopts @p other's socket and its interrupted state: an
+        /// interrupted listener assigned a fresh one accepts again.
         TcpListener &operator=(TcpListener &&other) noexcept {
             if (this != &other) {
                 this->close();
-                this->sock.reset(other.sock.take());
+                this->sock.adopt(other.sock);
                 this->lockFd = std::exchange(other.lockFd, -1);
             }
             return *this;
@@ -141,12 +143,15 @@ namespace Soccer {
         std::optional<TcpStream> tryAccept(SocketAddress *peer = nullptr);
 
         /**
-         * @brief Make an @c accept() parked on this listener return (it throws) without
-         *        closing the listener or queueing a connection. Sticky: every later
-         *        @c accept() throws too (@c tryAccept is unaffected).
-         * @return @c true if the wake was issued; @c false on Windows, or if the listener is
-         *         closed. Callers then have to knock on the listener's own address instead
-         *         (see @c tcpServe).
+         * @brief Make an @c accept() parked on this listener throw ("accept interrupted")
+         *        without closing the listener, shutting it down or queueing a connection.
+         *        Sticky: every later @c accept() throws too, until the listener is replaced
+         *        by move-assignment from a fresh one (a moved-to listener carries exactly the
+         *        state of the one it adopted). @c tryAccept is unaffected, and connections
+         *        already queued or still arriving are neither reset nor refused: the same on
+         *        every platform.
+         * @return @c true if the wake was issued; @c false if the listener is closed (an
+         *         @c accept() then throws on its own).
          */
         bool interruptAccept() noexcept;
 
@@ -161,13 +166,13 @@ namespace Soccer {
         int fd() const noexcept { return this->sock.get(); }
 
         /**
-         * @brief Close the listener. Idempotent. Pending @c accept()
-         *        suspensions will see the fd close on the next syscall.
+         * @brief Close the listener. Idempotent. A pending @c accept() is woken and
+         *        throws "accept on closed TcpListener"; so does every later one.
          */
         void close() noexcept;
 
     private:
-        explicit TcpListener(int fd) noexcept : sock(fd) {
+        explicit TcpListener(int fd) : sock(fd) {
         }
 
         detail::SocketSlot sock;

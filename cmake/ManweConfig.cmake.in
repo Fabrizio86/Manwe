@@ -4,6 +4,50 @@
 
 @PACKAGE_INIT@
 
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+# The optional native libraries this build of Manwe was linked with. The installed targets
+# name them through the imported targets below, resolved on THIS machine, so the package
+# stays relocatable and works with keg-only prefixes (the hint directories are where the
+# build found them).
+set(_manwe_hints "@MANWE_LIB_HINTS@")
+
+macro(_manwe_find_lib var name)
+    find_library(${var} NAMES ${name} HINTS ${_manwe_hints})
+    if (NOT ${var})
+        set(Manwe_FOUND FALSE)
+        set(Manwe_NOT_FOUND_MESSAGE "Manwe was built with lib${name}, which was not found. Add its prefix to CMAKE_PREFIX_PATH.")
+        return()
+    endif ()
+endmacro()
+
+if (NOT TARGET Manwe::TlsDeps)
+    add_library(Manwe::TlsDeps INTERFACE IMPORTED)
+    if (@MANWE_HAS_TLS@)
+        _manwe_find_lib(MANWE_LIBTLS tls)
+        _manwe_find_lib(MANWE_LIBSSL ssl)
+        _manwe_find_lib(MANWE_LIBCRYPTO crypto)
+        target_link_libraries(Manwe::TlsDeps INTERFACE "${MANWE_LIBTLS}" "${MANWE_LIBSSL}" "${MANWE_LIBCRYPTO}")
+    endif ()
+endif ()
+
+if (NOT TARGET Manwe::Nghttp2Deps)
+    add_library(Manwe::Nghttp2Deps INTERFACE IMPORTED)
+    if (@MANWE_HAS_NGHTTP2@)
+        _manwe_find_lib(MANWE_LIBNGHTTP2 nghttp2)
+        target_link_libraries(Manwe::Nghttp2Deps INTERFACE "${MANWE_LIBNGHTTP2}")
+    endif ()
+endif ()
+
+if (NOT TARGET Manwe::UringDeps)
+    add_library(Manwe::UringDeps INTERFACE IMPORTED)
+    if (@MANWE_HAS_URING@)
+        _manwe_find_lib(MANWE_LIBURING uring)
+        target_link_libraries(Manwe::UringDeps INTERFACE "${MANWE_LIBURING}")
+    endif ()
+endif ()
+
 include("${CMAKE_CURRENT_LIST_DIR}/ManweTargets.cmake")
 
 check_required_components(Manwe)

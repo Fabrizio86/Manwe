@@ -52,6 +52,38 @@ to [SemVer](https://semver.org/).
   block `request_stop` for up to 250 ms, and queued a stray connection, remains only on Windows.
   A listener whose accept was interrupted fails every later `accept()` (`tryAccept` is unaffected).
 
+### Fixed (third audit pass)
+- **Timeouts / races:** `withTimeout`, `deadlineToken`, `receiveFor` and `sendFor` saturate huge durations
+  (`seconds::max()` used to overflow and fire at once); a joined `withTimeout` no longer hangs when spawning
+  the runner fails after the timer fired; `joinLosers` destroys a loser's result before the caller resumes;
+  a dead Reactor reports `ReactorError` instead of a false `TimeoutException`; `fs::writeString`/`writeBytes`/
+  `File::close` report a failed final flush; Windows timers clamp and reschedule duplicates; the io_uring wake
+  poll can no longer be lost when the submission queue is full.
+- **Allocation:** Task frames honour over-alignment on Clang (GCC ignores aligned frame allocation: documented);
+  the pool statics are immortal (no use of a destroyed mutex at exit), the pooled and plain paths are
+  interchangeable, `poolAlloc` obeys the same sanitizer switch; metric registration is exception-safe.
+- **Sockets:** `IoDeadline` can no longer shut down an unrelated connection that reused a dead stream's fd
+  number; `interruptAccept` behaves the same on Linux and macOS (no shutdown, backlog untouched) and its
+  sticky flag follows the listener through moves; Windows `close()` wakes parked operations; deadlines saturate;
+  unnamed AF_UNIX peers print as ""; `resolve("")` is the wildcard; `connectAny` reports the real error.
+- **HTTP/2, HTTP, WebSocket:** `Http2Server` has a `writeTimeout` (a peer that never reads no longer pins a
+  connection), a progressing download is no longer cut by `idleTimeout`, the client rejects a stream that
+  ended without a complete response, hop-by-hop and malformed headers are vetted, `localAddress()` works
+  after `serve()`, VT/FF are no longer trimmed from header values, close codes 1012-1014 are accepted,
+  nghttp2 callbacks fail the connection instead of terminating on `bad_alloc`, WebSocket continuation
+  fragments are checked against the cap before being read.
+- **Wire / Embedded / build:** `Signal` no longer races in-place handler edits against emissions (TSan);
+  `channelSelect` recovers from a failed spawn; `receiveFor`/`sendFor` prefer the caller's cancellation;
+  `FdSlot` no longer wakes a reused descriptor's waiter; the installed CMake package works for a plain
+  `find_package(Manwe)` (Threads, TLS, nghttp2, liburing located on the consumer), `SameMajorVersion`,
+  PIC via `CMAKE_POSITION_INDEPENDENT_CODE`, no forced Release/`enable_testing()` as a subproject;
+  more standard baud rates; doc snippets that did not compile or were use-after-free corrected.
+
+### Added (third audit pass)
+- `UdpSocket::send` / `recv` for connected sockets, `TcpStream::shutdownWrite()`, `Http2ServerOptions::writeTimeout`.
+- Test framework: `TestFailure` no longer derives from `std::exception` (it cannot be swallowed by an
+  `EXPECT_THROWS_AS`), `EXPECT_EQ` compares by reference. Regression tests in `YarnTests/audit3_*_tests.cpp`.
+
 ### Fixed (code audit)
 - **Reactor / cancellation:** epoll `registerFd` no longer resumes a waiter twice when `EPOLL_CTL_MOD`
   fails; epoll timer registration is atomic against `cancelTimer` (no double delete / foreign fd close);

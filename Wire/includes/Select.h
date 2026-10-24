@@ -144,6 +144,26 @@ namespace Telegraph {
             co_return;
         }
 
+        /**
+         * @brief A pull could not be started (the pool refused it): record the failure unless a pull already won, stop
+         *        the pulls that did start so none stays parked on its channel to consume a value nobody reads, and
+         *        account for the @p unspawned ones that will never finish. The select then completes, rethrowing the
+         *        failure, once the started pulls have unwound and put back whatever they obtained.
+         */
+        template<typename T>
+        void failSelect(SelectState<T> &st, std::exception_ptr ex, std::size_t unspawned) noexcept {
+            {
+                std::lock_guard<std::mutex> lk(st.mu);
+                if (!st.decided) {
+                    st.decided = true;
+                    st.exception = std::move(ex);
+                }
+                st.outstanding -= unspawned;
+                if (st.outstanding == 0) st.published = true; // nobody can be parked yet: the caller has not awaited
+            }
+            st.stop.request_stop();
+        }
+
         template<typename T, typename Chan>
         YarnBall::Task<SelectResult<T>> selectImpl(std::vector<std::shared_ptr<Chan>> channels) {
             auto st = std::make_shared<SelectState<T>>();
@@ -158,9 +178,14 @@ namespace Telegraph {
             // favoured by its position in the vector.
             static std::atomic<std::size_t> rotor{0};
             const std::size_t start = rotor.fetch_add(1, std::memory_order_relaxed) % n;
-            for (std::size_t k = 0; k < n; ++k) {
-                const std::size_t i = (start + k) % n;
-                YarnBall::coSpawn(selectPull<T, Chan>(st, i, channels[i]));
+            std::size_t spawned = 0;
+            try {
+                for (; spawned < n; ++spawned) {
+                    const std::size_t i = (start + spawned) % n;
+                    YarnBall::coSpawn(selectPull<T, Chan>(st, i, channels[i]));
+                }
+            } catch (...) {
+                failSelect(*st, std::current_exception(), n - spawned);
             }
             co_await YarnBall::detail::WhenAnyAwaiter<SelectState<T>>{st};
             SelectResult<T> out;

@@ -29,7 +29,8 @@ namespace YarnBall {
      *    kernel's tick granularity).
      *  - epoll + timerfd: CLOCK_MONOTONIC nanoseconds.
      *  - io_uring: IORING_OP_TIMEOUT with kernel timespec.
-     *  - Stub backends: zero — resume happens immediately.
+     *  - Backends without a timer implementation (the stub): registerTimer does nothing, so the sleeper is not
+     *    resumed by the Reactor.
      */
     struct SleepAwaiter {
         std::chrono::nanoseconds duration;
@@ -140,6 +141,12 @@ namespace YarnBall {
             if (d.count() >= kMax) return std::chrono::nanoseconds::max();
             return std::chrono::nanoseconds{static_cast<std::chrono::nanoseconds::rep>(d.count())};
         }
+
+        /// @ref clampToNanos for any duration type (hours::max(), years(1000), a double of seconds, ...).
+        template<typename Rep, typename Period>
+        inline std::chrono::nanoseconds toNanos(std::chrono::duration<Rep, Period> d) noexcept {
+            return clampToNanos(std::chrono::duration<long double, std::nano>(d));
+        }
     }
 
     /**
@@ -148,8 +155,7 @@ namespace YarnBall {
      */
     template<typename Rep, typename Period>
     inline SleepAwaiter sleepFor(std::chrono::duration<Rep, Period> duration) noexcept {
-        return SleepAwaiter{detail::clampToNanos(
-            std::chrono::duration<long double, std::nano>(duration))};
+        return SleepAwaiter{detail::toNanos(duration)};
     }
 
     /**

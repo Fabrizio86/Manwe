@@ -63,13 +63,13 @@ namespace Soccer {
         RawSocket(const RawSocket &) = delete;
         RawSocket &operator=(const RawSocket &) = delete;
 
-        RawSocket(RawSocket &&other) noexcept : sock(std::move(other.sock)) {
+        RawSocket(RawSocket &&other) : sock(std::move(other.sock)) {
         }
 
         RawSocket &operator=(RawSocket &&other) noexcept {
             if (this != &other) {
                 this->close();
-                this->sock.reset(other.sock.take());
+                this->sock.adopt(other.sock);
             }
             return *this;
         }
@@ -94,7 +94,7 @@ namespace Soccer {
         void close() noexcept;
 
     private:
-        explicit RawSocket(int fd) noexcept : sock(fd) {
+        explicit RawSocket(int fd) : sock(fd) {
         }
 
         detail::SocketSlot sock;

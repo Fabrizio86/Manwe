@@ -70,15 +70,19 @@ namespace Soccer {
         inline constexpr int kHttpMaxInterimResponses = 8;
 
         /**
-         * @brief Trim leading + trailing ASCII whitespace from @p s
-         *        in place. Used to clean up header values after the
-         *        @c name:value split.
+         * @brief Trim leading + trailing optional whitespace (SP and HTAB, RFC 9110
+         *        5.6.3) from @p s. Used to clean up header values after the
+         *        @c name:value split. Other whitespace (VT, FF, ...) is left in
+         *        place on purpose: it is a control character the field-value check
+         *        then rejects, and stripping it here would let a strict peer and
+         *        this parser read the same bytes differently.
          */
         inline std::string trimAscii(std::string s) {
+            const auto ows = [](char c) { return c == ' ' || c == '\t'; };
             std::size_t b = 0;
-            while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
+            while (b < s.size() && ows(s[b])) ++b;
             std::size_t e = s.size();
-            while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
+            while (e > b && ows(s[e - 1])) --e;
             return s.substr(b, e - b);
         }
 
@@ -490,6 +494,12 @@ namespace Soccer {
          *         Test/diagnostic helper; not a stable scrape source.
          */
         std::size_t idleCount(std::string_view host, std::uint16_t port) const;
+
+        /**
+         * @return Number of hosts that currently have an entry in the table (a host with
+         *         nothing idle keeps none). Diagnostic helper, mainly for tests.
+         */
+        std::size_t hostCount() const;
 
         /**
          * @brief Default longest an idle connection may sit in the pool before
@@ -1308,6 +1318,11 @@ namespace Soccer {
             return;
         }
         dq.push_back(IdleConn{std::move(stream), now});
+    }
+
+    inline std::size_t HttpConnectionPool::hostCount() const {
+        std::lock_guard<std::mutex> lk(this->mu);
+        return this->idle.size();
     }
 
     inline std::size_t

@@ -97,16 +97,35 @@ namespace Telegraph {
             mutable std::mutex mu;
             SlotId next_id = 1;
             // Copy-on-write under mu while an emission holds it (copying only shared_ptrs); null when empty. Edited
-            // in place when the Core holds the only reference, i.e. no emission has taken a snapshot of it.
+            // in place only when no emission is running (active == 0, read under mu).
             std::shared_ptr<const HandlerList> handlers;
+            // Emissions that took a snapshot and have not yet released it. Incremented under mu when the snapshot is
+            // taken, decremented (release) once the emission dropped its reference; the writer's acquire load of 0
+            // under mu therefore orders its in-place edit after every reader's last access to the list. (The
+            // shared_ptr's use_count() is a relaxed load and gives no such edge.)
+            std::atomic<std::size_t> active{0};
             std::vector<std::shared_ptr<NextSlot>> pending;
             bool dead = false; ///< the Signal was destroyed: a next() that parks now would never be woken
+
+            /// An emission's view of the handler list; releasing it (destructor) re-enables in-place edits.
+            struct Snapshot {
+                Core *core = nullptr;
+                std::shared_ptr<const HandlerList> list;
+                Snapshot() = default;
+                Snapshot(const Snapshot &) = delete;
+                Snapshot &operator=(const Snapshot &) = delete;
+                ~Snapshot() {
+                    if (!this->core) return;
+                    this->list.reset(); // drop the reference before telling writers the list is theirs again
+                    this->core->active.fetch_sub(1, std::memory_order_release);
+                }
+            };
 
             SlotId connect(std::shared_ptr<const Handler> h) {
                 std::lock_guard<std::mutex> lk(this->mu);
                 const SlotId id = this->next_id++;
-                if (this->handlers && this->handlers.use_count() == 1) {
-                    // Emissions take their snapshot under mu, so none holds this list: append in place (amortised O(1)).
+                if (this->handlers && this->active.load(std::memory_order_acquire) == 0) {
+                    // No emission is running (they take their snapshot under mu): append in place (amortised O(1)).
                     const_cast<HandlerList &>(*this->handlers).emplace_back(id, std::move(h));
                     return id;
                 }
@@ -127,8 +146,8 @@ namespace Telegraph {
                 auto &cur = const_cast<HandlerList &>(*this->handlers);
                 auto it = std::find_if(cur.begin(), cur.end(), [id](const auto &e) { return e.first == id; });
                 if (it == cur.end()) return false;
-                if (this->handlers.use_count() == 1) {
-                    // No emission holds a snapshot: erase in place, without allocating.
+                if (this->active.load(std::memory_order_acquire) == 0) {
+                    // No emission is running: erase in place, without allocating.
                     dying = std::move(it->second);
                     cur.erase(it);
                     if (cur.empty()) oldList = std::move(this->handlers);
@@ -284,14 +303,14 @@ namespace Telegraph {
             // Snapshot handlers + pending waiters under the lock; release
             // the lock before invoking either, so handlers can connect /
             // disconnect freely without re-entrant deadlock.
-            std::shared_ptr<const HandlerList> handlers_copy;
+            typename Core::Snapshot handlers_copy;
             std::vector<std::shared_ptr<NextSlot>> waiters_copy;
             this->snapshot(handlers_copy, waiters_copy);
 
             this->wake(waiters_copy, args...);
-            if (!handlers_copy) return;
+            if (!handlers_copy.list) return;
             std::exception_ptr first;
-            for (const auto &entry : *handlers_copy) {
+            for (const auto &entry : *handlers_copy.list) {
                 try {
                     (*entry.second)(args...);
                 } catch (...) {
@@ -314,25 +333,29 @@ namespace Telegraph {
          * without bound.
          */
         void emitAsync(Args... args) {
-            std::shared_ptr<const HandlerList> handlers_copy;
+            typename Core::Snapshot handlers_copy;
             std::vector<std::shared_ptr<NextSlot>> waiters_copy;
             this->snapshot(handlers_copy, waiters_copy);
 
             this->wake(waiters_copy, args...);
 
             // Dispatch each handler as a TaskAdapter on the pool.
-            if (handlers_copy) {
-                for (const auto &entry : *handlers_copy) {
+            if (handlers_copy.list) {
+                for (const auto &entry : *handlers_copy.list) {
                     this->dispatch_handler(entry.second, args...);
                 }
             }
         }
 
     private:
-        void snapshot(std::shared_ptr<const HandlerList> &handlers_copy,
+        void snapshot(typename Core::Snapshot &handlers_copy,
                       std::vector<std::shared_ptr<NextSlot>> &waiters_copy) {
             std::lock_guard<std::mutex> lk(this->core->mu);
-            handlers_copy = this->core->handlers;
+            if (this->core->handlers) {
+                handlers_copy.list = this->core->handlers;
+                handlers_copy.core = this->core.get();
+                this->core->active.fetch_add(1, std::memory_order_relaxed);
+            }
             if (!this->core->pending.empty()) {
                 waiters_copy = std::move(this->core->pending);
                 this->core->pending.clear();

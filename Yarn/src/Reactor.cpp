@@ -762,7 +762,10 @@ namespace YarnBall {
 
                 if (this->running.load(std::memory_order_acquire)) {
                     std::lock_guard<std::mutex> lk(this->sqMu);
-                    io_uring_sqe *sqe = ::io_uring_get_sqe(this->ring);
+                    // The watch must be re-armed or later pokes (and stop()) no longer wake the loop: keep trying for a
+                    // slot rather than give up when the queue is full for a moment.
+                    io_uring_sqe *sqe = this->getSqeLocked();
+                    while (!sqe && this->running.load(std::memory_order_acquire)) sqe = this->getSqeLocked();
                     if (sqe) {
                         ::io_uring_prep_poll_add(sqe, this->wakefd, POLLIN);
                         ::io_uring_sqe_set_data(sqe, reinterpret_cast<void *>(kWakeUserData));
@@ -1540,18 +1543,36 @@ namespace YarnBall {
             this->schedule(h);
             return;
         }
-        const auto deadline = std::chrono::steady_clock::now() +
-                              (duration.count() > 0 ? duration : std::chrono::nanoseconds{0});
+        // Clamp like the other backends: now() + nanoseconds::max() would overflow the clock (about 100 years is plenty).
+        constexpr long long kMaxTimerNs = 3'000'000'000'000'000'000LL;
+        const long long ns = duration.count() < 0 ? 0 : (duration.count() > kMaxTimerNs ? kMaxTimerNs : duration.count());
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::nanoseconds(ns);
         bool resumeNow = false;
         {
             std::lock_guard<std::mutex> lk(this->winstate->pollMu);
-            if (this->winstate->dead) {
+            // Not tracked (loop dead, handle already armed, out of memory): wake it now rather than strand it or
+            // overwrite the live registration of the same handle.
+            if (this->winstate->dead || this->winstate->liveTimers.contains(h.address())) {
                 resumeNow = true;
             } else {
-                const std::uint64_t id = ++this->winstate->nextTimerId;
-                this->winstate->liveTimers[h.address()] = id;
-                this->winstate->timers.push(TimerEntry{deadline, h, id});
-                compactTimersLocked(*this->winstate);
+                try {
+                    const std::uint64_t id = ++this->winstate->nextTimerId;
+                    this->winstate->liveTimers.emplace(h.address(), id);
+                    try {
+                        this->winstate->timers.push(TimerEntry{deadline, h, id});
+                    } catch (...) {
+                        this->winstate->liveTimers.erase(h.address());
+                        throw;
+                    }
+                } catch (...) {
+                    resumeNow = true;
+                }
+                if (!resumeNow) {
+                    try {
+                        compactTimersLocked(*this->winstate); // only housekeeping: skipping it is harmless
+                    } catch (...) {
+                    }
+                }
             }
         }
         if (resumeNow) {

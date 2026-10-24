@@ -99,9 +99,15 @@ namespace Soccer {
         /// at least this often. Cuts off slow-header / slow-body (slowloris) peers.
         std::chrono::milliseconds requestTimeout{30000};
         /// A connection with nothing in flight is closed after this long without progress (a
-        /// request begun or finished); PING, SETTINGS and other frames that carry no work do
-        /// not restart the clock.
+        /// request begun or finished, or a chunk of response written); PING, SETTINGS and other
+        /// frames that carry no work do not restart the clock.
         std::chrono::milliseconds idleTimeout{60000};
+        /// A write to the peer must move at least a chunk (64 KiB) within this long, or the
+        /// connection is closed: a peer that asks for a large response and never reads it
+        /// (or advertises a huge window and stops draining its socket) cannot pin the
+        /// connection. The clock restarts with every chunk written, so a slow but steady
+        /// reader is not cut off. Also counts as progress against @c idleTimeout.
+        std::chrono::milliseconds writeTimeout{30000};
         /// Connections served at once; further ones are closed on accept. Zero: unlimited.
         std::size_t maxConnections{1024};
         /// Open streams per connection (advertised as SETTINGS_MAX_CONCURRENT_STREAMS and
@@ -161,6 +167,10 @@ namespace Soccer {
             std::size_t headerBytes{0};
             int interimCount{0};
             bool finalSeen{false};
+            // The peer finished the stream normally: END_STREAM arrived on the final
+            // response (headers, data or trailers). Without it a stream closed by
+            // RST_STREAM(NO_ERROR) is not a complete response.
+            bool endStreamSeen{false};
             bool informational{false};
             bool statusInBlock{false};
             // Latched when the response headers exceed the cap; the stream is reset.
@@ -373,6 +383,13 @@ namespace Soccer {
     class Http2ConnectionPool final {
     public:
         /**
+         * @param maxEntries Most distinct connections kept at once (default
+         *        @ref kMaxEntries); past it the table is not grown.
+         */
+        explicit Http2ConnectionPool(std::size_t maxEntries = kMaxEntries) noexcept
+            : limit(maxEntries) {}
+
+        /**
          * @brief Process-wide default pool used by helpers like
          *        @c http2GetPooled. Constructed lazily.
          */
@@ -425,6 +442,7 @@ namespace Soccer {
         mutable std::mutex mu;
         std::unordered_map<std::string,
                             std::shared_ptr<Http2Connection>> entries;
+        std::size_t limit;
 
         static std::string keyOf(std::string_view host, std::uint16_t port) {
             std::string k(host);

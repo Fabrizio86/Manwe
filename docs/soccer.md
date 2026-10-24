@@ -38,6 +38,12 @@ coroutine handle with the Reactor; the Reactor resumes the handle via
 - `release()` (on `TcpStream`) hands the fd off to a higher-level wrapper
   (e.g. `TlsStream` after a server-side handshake). The source is left
   empty (`fd == -1`) so its destructor does not double-close.
+- `TcpStream::shutdownWrite()` half-closes (sends FIN, keeps reading). `close()` on a
+  stream with unread received data makes the kernel send a RST, so a peer may lose
+  data it has not read: half-close, read to EOF, then close for a clean end.
+- `TlsStream::read` returns 0 both for a TLS close_notify and for a TCP connection
+  that ended without one (libtls does not tell them apart); frame your data if
+  truncation matters.
 - Listeners own their listening fd; each `accept()` produces an
   independently-owned `TcpStream`.
 
@@ -186,6 +192,10 @@ supports stream sockets only.
   use: pick `eth0` vs `wlan0` by their IP. macOS loopback test
   use: pass `"127.0.0.1"`.
 
+After `connect(peer)` a socket talks to one peer: use `send(buf)` and
+`recv(buf)` (BSD and macOS fail `sendTo` on a connected socket with
+`EISCONN`).
+
 Per-interface IPv6 selection is by interface index rather than
 address and is not exposed; users who need it drop to `fd()` +
 `IPV6_MULTICAST_IF` directly.
@@ -320,8 +330,9 @@ YarnBall::Task<void> https_server(std::uint16_t port,
 
 ### `BufferedReader<Stream>`
 
-Wraps any Soccer stream (`TcpStream`, `TlsStream`, `UdpSocket`,
-`RawSocket`) to add line- and delimiter-bounded reads on top of the
+Wraps any Soccer stream (`TcpStream`, `TlsStream`, or anything with a
+coroutine `read(span<byte>)`; the datagram sockets `UdpSocket` /
+`RawSocket` are not streams and need an adapter) to add line- and delimiter-bounded reads on top of the
 fixed-byte primitives. Uses a single contiguous buffer with read /
 write cursors; one underlying read per refill; hard-bounded line size
 (64 KiB) so an adversarial peer that never sends the delimiter cannot
@@ -349,9 +360,16 @@ co_await tcpServe(std::move(listener),
     });
 ```
 
-A passed `std::stop_token` causes the loop to return after the next
-accept once `stopRequested()` becomes true. In-flight handlers are NOT
-cancelled — pass the same token through if you want them to shorten.
+A passed `std::stop_token` makes the loop return as soon as a stop is
+requested: the pending `accept` is woken through the Reactor
+(`TcpListener::interruptAccept`) on every platform, without shutting the
+socket down or queueing a connection, so no handler sees a stray client.
+In-flight handlers are NOT cancelled — pass the same token through if you
+want them to shorten.
+
+`interruptAccept()` is sticky (every later `accept()` throws "accept
+interrupted"; `tryAccept()` is unaffected). A moved-to listener carries the
+state of the one it adopted, so assigning a fresh listener clears it.
 
 ### `HttpClient::get / post`
 

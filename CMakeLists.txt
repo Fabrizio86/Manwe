@@ -11,9 +11,13 @@ if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_FLAGS MATCHES "fsanitize=[
 endif()
 
 # Default to an optimised build so benchmarks are meaningful.
-if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+# Only when Manwe is the top-level project: a parent that embeds it keeps its own build type.
+if (CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR AND NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif ()
+
+# Position-independent code for every library, so BUILD_SHARED_LIBS=ON links with any compiler.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # ---- Build outputs go to bin/ (tracked) ----------------------------------
 # Only when Manwe is the top-level project; as a subdirectory it must not
@@ -35,7 +39,9 @@ option(MANWE_BUILD_TESTS "Build YarnTests" ON)
 option(MANWE_BUILD_EXAMPLES "Build the examples/ executables" ON)
 option(MANWE_BUILD_BENCHMARKS "Build the benchmarks/ executables" ON)
 
-enable_testing()
+if (CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
+    enable_testing()
+endif ()
 add_subdirectory(Yarn)
 add_subdirectory(Wire)
 add_subdirectory(Soccer)
@@ -79,7 +85,33 @@ install(EXPORT ManweTargets
 write_basic_package_version_file(
         "${CMAKE_CURRENT_BINARY_DIR}/ManweConfigVersion.cmake"
         VERSION ${PROJECT_VERSION}
-        COMPATIBILITY SameMinorVersion)
+        COMPATIBILITY SameMajorVersion)
+
+# What the installed config must locate on the consumer's machine. Only the directories
+# the libraries were found in are recorded, as search hints; the consumer's config
+# resolves the libraries itself (see cmake/ManweConfig.cmake.in).
+set(MANWE_HAS_TLS 0)
+set(MANWE_HAS_NGHTTP2 0)
+set(MANWE_HAS_URING 0)
+set(MANWE_LIB_HINTS "")
+if (LIBTLS_INCLUDE_DIR AND LIBTLS_LIBRARY AND LIBSSL_LIBRARY AND LIBCRYPTO_LIBRARY)
+    set(MANWE_HAS_TLS 1)
+    foreach (_lib ${LIBTLS_LIBRARY} ${LIBSSL_LIBRARY} ${LIBCRYPTO_LIBRARY})
+        get_filename_component(_dir "${_lib}" DIRECTORY)
+        list(APPEND MANWE_LIB_HINTS "${_dir}")
+    endforeach ()
+endif ()
+if (SOCCER_USE_NGHTTP2)
+    set(MANWE_HAS_NGHTTP2 1)
+    get_filename_component(_dir "${LIBNGHTTP2_LIBRARY}" DIRECTORY)
+    list(APPEND MANWE_LIB_HINTS "${_dir}")
+endif ()
+if (YARN_USE_IO_URING OR YARN_IO_URING_SQPOLL)
+    set(MANWE_HAS_URING 1)
+    get_filename_component(_dir "${LIBURING_LIBRARY}" DIRECTORY)
+    list(APPEND MANWE_LIB_HINTS "${_dir}")
+endif ()
+list(REMOVE_DUPLICATES MANWE_LIB_HINTS)
 
 configure_package_config_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/cmake/ManweConfig.cmake.in"

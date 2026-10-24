@@ -339,20 +339,14 @@ namespace Soccer {
     }
 
     bool TcpListener::interruptAccept() noexcept {
-#ifndef _WIN32
         auto use = this->sock.begin();
         if (use.fd() < 0) return false;
         // The flag makes a parked accept fail when it is woken, and a wait that registers after this point wakes
-        // itself (see SlotWait), so no wakeup is lost; the shutdown on Linux only makes the fd readable as well.
+        // itself (see SlotWait), so no wakeup is lost. Nothing is done to the socket: the backlog and new
+        // connections are left alone.
         this->sock.interrupt();
-#if defined(__linux__)
-        (void) ::shutdown(use.fd(), SHUT_RD);
-#endif
         (void) YarnBall::Reactor::instance()->cancelFd(use.fd());
         return true;
-#else
-        return false;
-#endif
     }
 
     void TcpListener::close() noexcept {
@@ -366,16 +360,9 @@ namespace Soccer {
         }
 #endif
         if (fd >= 0) {
-#if defined(__linux__)
-            // Closing alone leaves an accept() parked on this fd asleep. On Linux a
-            // shutdown makes the fd readable, so the pending accept wakes and fails.
-            // (This is also why fork() without exec is unsupported: see the class comment.)
-            (void) ::shutdown(fd, SHUT_RD);
-#endif
-#ifndef _WIN32
             // Wake any coroutine still parked on this fd before it is closed (and the number reused).
+            // The woken accept finds the slot empty and fails.
             (void) YarnBall::Reactor::instance()->cancelFd(fd);
-#endif
             this->sock.retire(fd);
         }
     }

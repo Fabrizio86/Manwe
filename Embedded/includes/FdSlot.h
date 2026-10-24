@@ -96,6 +96,11 @@ namespace Embedded::detail {
                     // Locals only after the inner suspend: once registered, the wait may complete and free this awaiter.
                     const std::shared_ptr<FdSlot> s = this->slot;
                     const int fd = this->value;
+                    // Hold the descriptor for the whole call. Once registered, the coroutine may resume on another
+                    // thread, finish and drop its own Guard; if close() already retired the fd, the number would be
+                    // closed and reusable while this thread is still about to cancel it, waking an unrelated waiter.
+                    // With this extra count the ::close() waits until the late cancel below is done.
+                    Guard hold(s);
                     if (!this->inner.await_suspend(h)) return false;
                     if (s->get() != fd) (void) YarnBall::Reactor::instance()->cancelFd(fd);
                     return true;

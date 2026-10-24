@@ -299,7 +299,7 @@ namespace Soccer {
                        const std::uint8_t *name, std::size_t namelen,
                        const std::uint8_t *value, std::size_t valuelen,
                        std::uint8_t /*flags*/,
-                       void *user_data) noexcept {
+                       void *user_data) noexcept try {
             auto *state = static_cast<Http2Connection::State *>(user_data);
             if (frame->hd.type != NGHTTP2_HEADERS) return 0;
             std::string_view nm(reinterpret_cast<const char *>(name), namelen);
@@ -346,6 +346,10 @@ namespace Soccer {
                                              frame->hd.stream_id, NGHTTP2_ENHANCE_YOUR_CALM);
             }
             return 0;
+        } catch (...) {
+            // Out of memory while storing a header: a callback may not throw through
+            // nghttp2, so fail the session; the driver then ends the connection.
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
         }
 
         /**
@@ -367,7 +371,7 @@ namespace Soccer {
                           std::uint8_t /*flags*/,
                           std::int32_t stream_id,
                           const std::uint8_t *data, std::size_t len,
-                          void *user_data) noexcept {
+                          void *user_data) noexcept try {
             auto *state = static_cast<Http2Connection::State *>(user_data);
             std::lock_guard<std::mutex> lk(state->mapMu); // see onHeader
             auto sit = state->streams.find(stream_id);
@@ -383,6 +387,25 @@ namespace Soccer {
                 return 0;
             }
             st->response.body.append(reinterpret_cast<const char *>(data), len);
+            return 0;
+        } catch (...) {
+            return NGHTTP2_ERR_CALLBACK_FAILURE; // out of memory, see onHeader
+        }
+
+        /**
+         * @brief on_frame_recv_callback: note that the peer ended a stream normally
+         *        (END_STREAM on the response's HEADERS or DATA). A stream that merely
+         *        closes -- RST_STREAM(NO_ERROR), say -- has not delivered a response.
+         */
+        int onFrameRecv(::nghttp2_session * /*session*/,
+                          const ::nghttp2_frame *frame,
+                          void *user_data) noexcept {
+            if ((frame->hd.type != NGHTTP2_HEADERS && frame->hd.type != NGHTTP2_DATA) ||
+                (frame->hd.flags & NGHTTP2_FLAG_END_STREAM) == 0) return 0;
+            auto *state = static_cast<Http2Connection::State *>(user_data);
+            std::lock_guard<std::mutex> lk(state->mapMu);
+            auto it = state->streams.find(frame->hd.stream_id);
+            if (it != state->streams.end()) it->second->endStreamSeen = true;
             return 0;
         }
 
@@ -492,17 +515,23 @@ namespace Soccer {
                 // When this write began: a timeout that finds one stuck for its whole
                 // length shuts the connection down (see requestDeadline).
                 state->writeStartedNs.store(steadyNowNs(), std::memory_order_release);
+                // The server bounds each chunk with its write deadline (see
+                // Http2ServerConnectionState::beginWrite); the client has its own
+                // per-request deadlines instead.
                 try {
+                    if constexpr (requires { state->beginWrite(); }) state->beginWrite();
                     co_await state->pipe->writeAll(std::span<const std::byte>(
                         reinterpret_cast<const std::byte *>(chunk.data()),
                         chunk.size()));
                 } catch (...) {
                     state->writeStartedNs.store(0, std::memory_order_release);
+                    if constexpr (requires { state->endWrite(false); }) state->endWrite(false);
                     std::lock_guard<std::mutex> lk(state->sessionMu);
                     state->writing = false;
                     throw;
                 }
                 state->writeStartedNs.store(0, std::memory_order_release);
+                if constexpr (requires { state->endWrite(true); }) state->endWrite(true);
             }
         }
 
@@ -663,6 +692,7 @@ namespace Soccer {
             ::nghttp2_session_callbacks_set_on_begin_headers_callback(cb, &onBeginHeaders);
             ::nghttp2_session_callbacks_set_on_header_callback(cb, &onHeader);
             ::nghttp2_session_callbacks_set_on_data_chunk_recv_callback(cb, &onDataChunk);
+            ::nghttp2_session_callbacks_set_on_frame_recv_callback(cb, &onFrameRecv);
             ::nghttp2_session_callbacks_set_on_stream_close_callback(cb, &onStreamClose);
             return cb;
         }
@@ -706,6 +736,7 @@ namespace Soccer {
                 struct Taken {
                     Http2Response response;
                     bool bodyRejected, headersRejected, connectionLost, timedOut;
+                    bool finalSeen, endStreamSeen;
                     int errorCode;
                 } st;
                 {
@@ -716,7 +747,8 @@ namespace Soccer {
                     }
                     detail::Http2Stream &src = *it->second;
                     st = Taken{std::move(src.response), src.bodyRejected, src.headersRejected,
-                               src.connectionLost, src.timedOut, src.errorCode};
+                               src.connectionLost, src.timedOut, src.finalSeen, src.endStreamSeen,
+                               src.errorCode};
                     src.consumed = true;
                     if (src.sessionClosed) state->streams.erase(it);
                 }
@@ -745,6 +777,17 @@ namespace Soccer {
                 if (st.errorCode != 0) {
                     throw std::runtime_error("HTTP/2 stream error: nghttp2 code " +
                                               std::to_string(st.errorCode));
+                }
+                // A stream that closed without error but never delivered a complete
+                // response (RST_STREAM(NO_ERROR) before :status, or part-way through the
+                // body) is not a success: nothing here may be passed off as one.
+                if (!st.finalSeen) {
+                    throw std::runtime_error(
+                        "HTTP/2 stream closed before a response was received");
+                }
+                if (!st.endStreamSeen) {
+                    throw std::runtime_error(
+                        "HTTP/2 stream closed before the response completed");
                 }
                 return std::move(st.response);
             }
@@ -922,16 +965,52 @@ namespace Soccer {
             });
         };
 
-        add(":method", method);
-        add(":scheme", state->scheme);
-        add(":authority", state->authority);
-        add(":path", path);
+        // The same refusals as the HTTP/1 client: a method or header name that is not a
+        // token, a control character in a header value or the target, a caller-framed body.
+        if (!detail::isHttpToken(method) || path.empty() || detail::hasTargetCtl(path)) {
+            throw std::runtime_error("Http2Connection::request: invalid method or target");
+        }
+        const std::string *authority = &state->authority;
         std::vector<std::string> lowerNames;
         lowerNames.reserve(headers.size());
-        for (const auto &h : headers) {
-            lowerNames.push_back(lowerAscii(h.name));
-            add(lowerNames.back(), h.value);
+        std::vector<std::size_t> kept; // indices into `headers` that go on the wire
+        for (std::size_t i = 0; i < headers.size(); ++i) {
+            const auto &h = headers[i];
+            if (!detail::isHttpToken(h.name) || detail::hasFieldValueCtl(h.value) ||
+                detail::iequalsAscii(h.name, "Transfer-Encoding")) {
+                throw std::runtime_error("Http2Connection::request: invalid header in request");
+            }
+            // Connection-specific fields have no meaning in HTTP/2 and a peer resets the
+            // stream over them (RFC 9113 8.2.2); a caller's HTTP/1-style copy is dropped.
+            // The length is always the real one (as in the HTTP/1 client), and a caller's
+            // Host replaces :authority, which stands in for it.
+            if (detail::iequalsAscii(h.name, "Connection") || detail::iequalsAscii(h.name, "Keep-Alive") ||
+                detail::iequalsAscii(h.name, "Proxy-Connection") || detail::iequalsAscii(h.name, "Upgrade") ||
+                detail::iequalsAscii(h.name, "Content-Length")) {
+                continue;
+            }
+            if (detail::iequalsAscii(h.name, "TE")) {
+                if (!detail::iequalsAscii(detail::trimAscii(h.value), "trailers")) continue;
+            } else if (detail::iequalsAscii(h.name, "Host")) {
+                if (h.value.empty()) throw std::runtime_error("Http2Connection::request: invalid header in request");
+                authority = &h.value;
+                continue;
+            }
+            kept.push_back(i);
         }
+        add(":method", method);
+        add(":scheme", state->scheme);
+        add(":authority", *authority);
+        add(":path", path);
+        for (const std::size_t i : kept) {
+            lowerNames.push_back(lowerAscii(headers[i].name));
+            add(lowerNames.back(), headers[i].value);
+        }
+        const bool expectsBody = detail::iequalsAscii(method, "POST") ||
+                                 detail::iequalsAscii(method, "PUT") ||
+                                 detail::iequalsAscii(method, "PATCH");
+        const std::string contentLength = std::to_string(body.size());
+        if (!body.empty() || expectsBody) add("content-length", contentLength);
 
         // Create per-stream state, set body for the data provider.
         auto streamState = std::make_unique<detail::Http2Stream>();
@@ -1154,12 +1233,18 @@ namespace Soccer {
         /// runs from here, so frames that carry no work (PING, SETTINGS, ...) cannot
         /// keep an idle connection alive by resetting it.
         std::atomic<std::int64_t> lastProgressNs{steadyNowNs()};
+        /// Response body has been pulled into the output since the last write finished
+        /// (set by the body read callback, consumed by endWrite).
+        std::atomic<bool> bodyPulled{false};
 
         /// Deadline against stalled peers, re-armed as the connection's state
         /// changes (see updateDeadline). Declared after `pipe` so it is destroyed
         /// -- disarmed -- before the socket closes.
         std::mutex deadlineMu;
         IoDeadline deadline;
+        /// A chunk is being written and `deadline` is the write deadline (guarded by
+        /// deadlineMu); updateDeadline leaves it alone until the write ends.
+        bool writeArmed{false};
 
         Http2ServerConnectionState(std::unique_ptr<Http2Pipe> p,
                                        std::shared_ptr<const std::unordered_map<std::string, HttpRouteHandler>> r,
@@ -1175,10 +1260,50 @@ namespace Soccer {
          */
         void updateDeadline() {
             std::lock_guard<std::mutex> dl(this->deadlineMu);
+            this->updateDeadlineLocked();
+        }
+
+        /**
+         * @brief A chunk of output is about to be written: the peer must take it within
+         *        writeTimeout. Without this a peer that requests a large response and
+         *        never reads it (the write parks on a full socket buffer, and the
+         *        read-side deadlines are off while a handler runs) would hold the
+         *        connection, its descriptor and its slot for ever. Replaces the read-side
+         *        deadline for the duration of the write.
+         */
+        void beginWrite() {
+            std::lock_guard<std::mutex> dl(this->deadlineMu);
+            if (this->closed.load(std::memory_order_acquire)) return;
+            this->writeArmed = true;
+            this->deadline.arm(this->pipe->fd(), this->opts.writeTimeout);
+        }
+
+        /// The chunk was written (@p progressed) or the write failed: count the progress
+        /// towards the idle clock and go back to the deadline the connection's state calls for.
+        void endWrite(bool progressed) {
+            // Only a chunk that carried response body counts as progress: PING and SETTINGS
+            // replies are written too, and must not keep an idle connection (or one whose
+            // peer has stopped granting window) alive.
+            if (progressed && this->bodyPulled.exchange(false, std::memory_order_acq_rel)) {
+                this->lastProgressNs.store(steadyNowNs(), std::memory_order_release);
+            }
+            std::lock_guard<std::mutex> dl(this->deadlineMu);
+            this->writeArmed = false;
+            try {
+                this->updateDeadlineLocked();
+            } catch (...) {
+                // Could not re-arm (the sweeper failed to start): run without a deadline
+                // rather than fail a write that went through.
+                this->deadline.disarm();
+            }
+        }
+
+        void updateDeadlineLocked() {
             if (this->closed.load(std::memory_order_acquire)) {
                 this->deadline.disarm();
                 return;
             }
+            if (this->writeArmed) return; // the write deadline stands until the chunk is out
             bool incomplete = false;
             {
                 std::lock_guard<std::mutex> lk(this->streamsMu);
@@ -1260,12 +1385,18 @@ namespace Soccer {
                                    std::uint8_t *buf, std::size_t length,
                                    std::uint32_t *data_flags,
                                    ::nghttp2_data_source *source,
-                                   void * /*user_data*/) noexcept {
+                                   void *user_data) noexcept try {
             auto *st = static_cast<ServerStream *>(source->ptr);
             const std::size_t remaining = st->respBody.size() - st->respBodyOffset;
             const std::size_t toCopy = std::min(remaining, length);
             std::memcpy(buf, st->respBody.data() + st->respBodyOffset, toCopy);
             st->respBodyOffset += toCopy;
+            if (toCopy != 0) {
+                // The peer's window let body out: the download is moving (see endWrite).
+                auto *state = static_cast<Http2ServerConnectionState *>(user_data);
+                state->lastProgressNs.store(steadyNowNs(), std::memory_order_release);
+                state->bodyPulled.store(true, std::memory_order_release);
+            }
             if (st->respBodyOffset == st->respBody.size()) {
                 *data_flags |= NGHTTP2_DATA_FLAG_EOF;
                 if (!st->respTrailers.empty()) {
@@ -1303,6 +1434,9 @@ namespace Soccer {
                 }
             }
             return static_cast<::ssize_t>(toCopy);
+        } catch (...) {
+            // Out of memory building the trailers: reset this stream, keep the connection.
+            return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
         }
 
         /**
@@ -1485,7 +1619,7 @@ namespace Soccer {
 
         int serverOnBeginHeaders(::nghttp2_session *session,
                                    const ::nghttp2_frame *frame,
-                                   void *user_data) noexcept {
+                                   void *user_data) noexcept try {
             if (frame->hd.type != NGHTTP2_HEADERS ||
                 frame->headers.cat != NGHTTP2_HCAT_REQUEST) return 0;
             auto *state = static_cast<Http2ServerConnectionState *>(user_data);
@@ -1504,6 +1638,10 @@ namespace Soccer {
             state->streams.emplace(frame->hd.stream_id, std::move(st));
             state->lastProgressNs.store(steadyNowNs(), std::memory_order_release);
             return 0;
+        } catch (...) {
+            // Out of memory: a callback may not throw through nghttp2. Failing the
+            // session ends the connection (the driver sees the error from mem_recv).
+            return NGHTTP2_ERR_CALLBACK_FAILURE;
         }
 
         int serverOnHeader(::nghttp2_session *session,
@@ -1511,7 +1649,7 @@ namespace Soccer {
                              const std::uint8_t *name, std::size_t namelen,
                              const std::uint8_t *value, std::size_t valuelen,
                              std::uint8_t /*flags*/,
-                             void *user_data) noexcept {
+                             void *user_data) noexcept try {
             if (frame->hd.type != NGHTTP2_HEADERS) return 0;
             auto *state = static_cast<Http2ServerConnectionState *>(user_data);
 
@@ -1584,13 +1722,15 @@ namespace Soccer {
             }
             st->req.headers.push_back({std::string(nm), std::string(va)});
             return 0;
+        } catch (...) {
+            return NGHTTP2_ERR_CALLBACK_FAILURE; // out of memory, see serverOnBeginHeaders
         }
 
         int serverOnDataChunk(::nghttp2_session *session,
                                 std::uint8_t /*flags*/,
                                 std::int32_t stream_id,
                                 const std::uint8_t *data, std::size_t len,
-                                void *user_data) noexcept {
+                                void *user_data) noexcept try {
             auto *state = static_cast<Http2ServerConnectionState *>(user_data);
             std::lock_guard<std::mutex> lk(state->streamsMu);
             auto it = state->streams.find(stream_id);
@@ -1639,6 +1779,8 @@ namespace Soccer {
             st.bodyBytes += len;
             state->bodyBytesInFlight += len;
             return 0;
+        } catch (...) {
+            return NGHTTP2_ERR_CALLBACK_FAILURE; // out of memory, see serverOnBeginHeaders
         }
 
         /**
@@ -1879,13 +2021,16 @@ namespace Soccer {
 
     struct Http2Server::ServerState {
         TcpListener listener;
+        /// The listener's address, read at construction: serve() moves the listener away
+        /// (on whichever thread first resumes it), after which it cannot be asked.
+        SocketAddress bound;
         std::unordered_map<std::string, HttpRouteHandler> routes;
         Http2ServerOptions opts;
         /// Set by the first serve(): it consumes the listener.
         std::atomic<bool> served{false};
 
-        ServerState(TcpListener l, const Http2ServerOptions &o) noexcept
-            : listener(std::move(l)), opts(o) {}
+        ServerState(TcpListener l, const Http2ServerOptions &o)
+            : listener(std::move(l)), bound(listener.localAddress()), opts(o) {}
     };
 
     Http2Server::Http2Server(const std::string &host, std::uint16_t port, Http2ServerOptions options)
@@ -1903,7 +2048,7 @@ namespace Soccer {
     }
 
     SocketAddress Http2Server::localAddress() const {
-        return this->serverState->listener.localAddress();
+        return this->serverState->bound;
     }
 
     namespace {
@@ -2064,13 +2209,13 @@ namespace Soccer {
             found->second = conn;
             return conn;
         }
-        if (this->entries.size() >= kMaxEntries) {
+        if (this->entries.size() >= this->limit) {
             for (auto it = this->entries.begin(); it != this->entries.end();) {
                 it = it->second->isClosed() ? this->entries.erase(it) : std::next(it);
             }
             // Still full of live connections: this one is handed back uncached rather
             // than letting the table grow with every host ever contacted.
-            if (this->entries.size() >= kMaxEntries) return conn;
+            if (this->entries.size() >= this->limit) return conn;
         }
         this->entries.emplace(k, conn);
         return conn;

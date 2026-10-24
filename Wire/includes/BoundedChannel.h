@@ -199,10 +199,12 @@ namespace Telegraph {
         template<typename Rep, typename Period>
         YarnBall::Task<bool> sendFor(T value, std::chrono::duration<Rep, Period> timeout) {
             detail::DeadlineGuard guard(timeout);
+            YarnBall::detail::TaskPromiseCore *self = co_await YarnBall::detail::CurrentScopeAwaiter{};
             try {
                 co_return co_await YarnBall::withCancellation(guard.token(), this->send(std::move(value)));
             } catch (const YarnBall::CancelledException &) {
-                if (guard.expired()) throw YarnBall::TimeoutException("BoundedChannel::sendFor");
+                // The caller's own cancellation wins over a deadline that expired at the same time.
+                if (guard.expired() && !(self && self->isCancellationRequested())) throw YarnBall::TimeoutException("BoundedChannel::sendFor");
                 throw;
             }
         }
@@ -219,10 +221,12 @@ namespace Telegraph {
         template<typename Rep, typename Period>
         YarnBall::Task<std::optional<T>> receiveFor(std::chrono::duration<Rep, Period> timeout) {
             detail::DeadlineGuard guard(timeout);
+            YarnBall::detail::TaskPromiseCore *self = co_await YarnBall::detail::CurrentScopeAwaiter{};
             try {
                 co_return co_await YarnBall::withCancellation(guard.token(), this->receive());
             } catch (const YarnBall::CancelledException &) {
-                if (guard.expired()) throw YarnBall::TimeoutException("BoundedChannel::receiveFor");
+                // The caller's own cancellation wins over a deadline that expired at the same time.
+                if (guard.expired() && !(self && self->isCancellationRequested())) throw YarnBall::TimeoutException("BoundedChannel::receiveFor");
                 throw;
             }
         }

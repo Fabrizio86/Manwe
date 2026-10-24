@@ -185,9 +185,9 @@ namespace YarnBall {
          * @brief Schedule @p h to be resumed after @p duration elapses.
          *
          * Backend specifics:
-         *  - kqueue: EVFILT_TIMER, one-shot, with handle as both ident
-         *    and udata. Nanosecond units via NOTE_NSECONDS (the kernel may
-         *    still coarsen the actual resolution).
+         *  - kqueue: deadlines in an ordered table served by one
+         *    EVFILT_TIMER knote (absolute, NOTE_NSECONDS) armed for the
+         *    earliest; a cancel is an O(log n) table erase.
          *  - epoll: deadlines in an ordered table served by one shared
          *    @c timerfd armed for the earliest; a cancel is an O(log n)
          *    table erase.
@@ -200,8 +200,9 @@ namespace YarnBall {
          * @note Sub-millisecond durations may be coarsened by the kernel
          *       depending on the backend; treat the resume time as a
          *       lower bound, not a hard real-time guarantee.
-         * @note If the event loop has died (@ref isDead) @p h is scheduled
-         *       at once instead of being queued forever.
+         * @note If the event loop has died (@ref isDead), @p h is already
+         *       registered, or the timer table cannot grow, @p h is scheduled
+         *       at once instead of being queued forever or lost.
          */
         void registerTimer(std::chrono::nanoseconds duration,
                             std::coroutine_handle<> h) noexcept;

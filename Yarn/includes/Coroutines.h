@@ -129,6 +129,16 @@ namespace YarnBall {
 
             static void operator delete(void *p, std::size_t n) noexcept { frameFree(p, n); }
 
+            /// A frame holding an over-aligned local across a suspension needs that alignment: declaring the plain
+            /// operators above hides the global aligned ones, so forward them (such frames bypass the pools). Clang uses them for a
+            /// frame whose alignment exceeds the default; GCC always calls the plain operator new for a frame, so on GCC an
+            /// over-aligned local across a suspension is only as aligned as the pooled block (16 bytes).
+            static void *operator new(std::size_t n, std::align_val_t a) { return ::operator new(n, a); }
+
+            static void operator delete(void *p, std::size_t n, std::align_val_t a) noexcept {
+                ::operator delete(p, n, a);
+            }
+
             /**
              * @brief Cancellation flag for this promise. Set by
              *        @c Task::requestCancel. Read by @c checkCancel and

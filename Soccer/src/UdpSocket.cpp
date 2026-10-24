@@ -161,6 +161,36 @@ namespace Soccer {
         }
     }
 
+    YarnBall::Task<std::size_t> UdpSocket::send(std::span<const std::byte> buf) {
+        while (true) {
+            auto use = this->sock.begin(); // held across the wait, see recvFrom()
+            const int fd = use.fd();
+            if (fd < 0) {
+                throw SocketException("send on closed UdpSocket");
+            }
+            ::ssize_t n;
+            do {
+                n = ::send(fd,
+                           reinterpret_cast<const char *>(buf.data()),
+                           static_cast<int>(std::min<std::size_t>(buf.size(), 0x7fffffffu)),
+                           detail::kSendFlags);
+            } while (n < 0 && YarnBall::isEintr(YarnBall::lastSocketError()));
+
+            if (n >= 0) co_return static_cast<std::size_t>(n);
+            const int err = YarnBall::lastSocketError();
+            if (YarnBall::isWouldBlock(err)) {
+                co_await detail::waitWritable(use);
+                continue;
+            }
+            throw SocketException("send", err);
+        }
+    }
+
+    YarnBall::Task<std::size_t> UdpSocket::recv(std::span<std::byte> buf, bool *truncated) {
+        // recvmsg on a connected socket reports the peer as the sender; it is simply not asked for.
+        co_return co_await this->recvFrom(buf, nullptr, truncated);
+    }
+
     namespace {
         /**
          * @brief Auto-detect IPv4 vs IPv6 from an address literal and
@@ -375,10 +405,8 @@ namespace Soccer {
         // rather than using a descriptor number that is about to be reused.
         const int fd = this->sock.take();
         if (fd >= 0) {
-#ifndef _WIN32
             // Wake any coroutine still parked on this fd before it is closed (and the number reused).
             (void) YarnBall::Reactor::instance()->cancelFd(fd);
-#endif
             this->sock.retire(fd);
         }
     }

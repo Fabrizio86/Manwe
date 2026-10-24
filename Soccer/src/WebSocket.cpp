@@ -413,7 +413,11 @@ namespace Soccer {
             std::vector<std::byte> payload;
         };
 
-        YarnBall::Task<WsFrame> readFrame(WsConnection::Impl &im, bool assembling) {
+        /// @p assembledBytes: payload already gathered for the fragmented message in progress
+        /// (0 when none), so a continuation that would push it past maxMessageBytes is refused
+        /// from its header, before its payload is read into memory.
+        YarnBall::Task<WsFrame> readFrame(WsConnection::Impl &im, bool assembling,
+                                          std::size_t assembledBytes) {
             TcpStream &s = im.stream;
             const bool isServer = im.serverSide;
             const WsOptions &o = im.opts;
@@ -480,7 +484,8 @@ namespace Soccer {
                 if (!f.fin) {
                     throw WsFrameError(1002, "fragmented control frame");
                 }
-            } else if (o.maxMessageBytes != 0 && plen > o.maxMessageBytes) {
+            } else if (o.maxMessageBytes != 0 &&
+                       (assembledBytes > o.maxMessageBytes || plen > o.maxMessageBytes - assembledBytes)) {
                 throw WsFrameError(1009, "data frame payload exceeds the message size cap");
             }
 
@@ -1118,7 +1123,7 @@ namespace Soccer {
                 std::uint16_t violationCode = 0;
                 std::string violation;
                 try {
-                    f = co_await readFrame(*im, assembling);
+                    f = co_await readFrame(*im, assembling, assembling ? assemblyBuf.size() : 0);
                 } catch (const WsFrameError &e) {
                     // co_await is not allowed in a handler: fail just below.
                     violationCode = e.code;
@@ -1217,7 +1222,7 @@ namespace Soccer {
                                 (std::to_integer<unsigned>(f.payload[0]) << 8) |
                                 std::to_integer<unsigned>(f.payload[1]);
                             const bool okCode =
-                                (code >= 1000 && code <= 1011 && code != 1004 &&
+                                (code >= 1000 && code <= 1014 && code != 1004 &&
                                  code != 1005 && code != 1006) ||
                                 (code >= 3000 && code <= 4999);
                             bad = !okCode ||

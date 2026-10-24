@@ -162,7 +162,7 @@ namespace Soccer {
          *        @ref localAddress.
          */
         HttpServer(const std::string &host, std::uint16_t port, HttpServerOptions options = {})
-            : listener(TcpListener::bind(host, port)), opts(options) {
+            : listener(TcpListener::bind(host, port)), bound(listener.localAddress()), opts(options) {
         }
 
         HttpServer(const HttpServer &) = delete;
@@ -240,10 +240,11 @@ namespace Soccer {
         /**
          * @return The address the listener bound to. Useful when the
          *         caller passed port 0 and wants the kernel-assigned
-         *         port back.
+         *         port back. Recorded at construction, so it stays valid
+         *         after @ref serve has taken the listener over.
          */
         SocketAddress localAddress() const {
-            return this->listener.localAddress();
+            return this->bound;
         }
 
     private:
@@ -653,6 +654,7 @@ namespace Soccer {
         }
 
         TcpListener listener;
+        SocketAddress bound; ///< listener's address, read before serve() moves it away
         RouteTable routes;
         HttpServerOptions opts;
         bool served{false};

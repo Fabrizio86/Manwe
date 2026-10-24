@@ -23,12 +23,14 @@ cmake --build build -j
 
 | Component | Dependency | Notes |
 |---|---|---|
-| Yarn / Wire | none | header-only or self-contained |
+| Yarn | none | static library, no third-party dependencies |
+| Wire | none | header-only (links Yarn) |
+| Soccer (HTTP/2) | `nghttp2` | optional; auto-detected by CMake |
 | Soccer (TLS) | LibreSSL `libtls` | optional; auto-detected by CMake |
 | Soccer (io_uring backend, Linux) | `liburing` | optional; opt-in via `-DYARN_USE_IO_URING=ON` |
 
 On macOS: `brew install libressl`. On Debian/Ubuntu: `apt-get install
-libtls-dev liburing-dev`.
+libtls-dev libnghttp2-dev liburing-dev`.
 
 ### Configure-time options
 
@@ -36,6 +38,9 @@ libtls-dev liburing-dev`.
 |---|---|---|
 | `YARN_USE_IO_URING` | OFF | Replace the default epoll backend on Linux with io_uring (via liburing). |
 | `YARN_IO_URING_SQPOLL` | OFF | When io_uring is enabled, set `IORING_SETUP_SQPOLL` so the kernel polls the SQ. Subsumes `YARN_USE_IO_URING`. |
+| `MANWE_BUILD_TESTS` | ON | Build the `YarnTests` executable. |
+| `MANWE_BUILD_EXAMPLES` | ON | Build the `examples/` executables. |
+| `MANWE_BUILD_BENCHMARKS` | ON | Build the `benchmarks/` executables. |
 
 ## Running tests
 
@@ -43,8 +48,8 @@ libtls-dev liburing-dev`.
 ./bin/YarnTests
 ```
 
-The suite is 62 cases (as of v0.3); typical wall time ~250 ms. Run it
-five times in a row to catch flakes:
+The suite runs in a few seconds. Run it five times in a row to catch
+flakes:
 
 ```bash
 for i in $(seq 1 5); do ./bin/YarnTests > /dev/null && echo "run $i ok"; done

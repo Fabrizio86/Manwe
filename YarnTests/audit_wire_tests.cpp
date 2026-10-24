@@ -102,7 +102,9 @@ namespace {
         long got = 0;
         int last[2] = {-1, -1};
         for (;;) {
-            auto r = co_await Telegraph::channelSelect<int>({a, b});
+            // Built outside the co_await expression: MinGW GCC 13 has an internal compiler error on a braced list there.
+            std::vector<std::shared_ptr<Telegraph::Channel<int>>> sources{a, b};
+            auto r = co_await Telegraph::channelSelect<int>(std::move(sources));
             if (!r.value) break;
             ++got;
             if (*r.value < last[r.index]) *reordered = true;
@@ -265,6 +267,10 @@ TEST(audit_wire_signal_emit_runs_every_handler_then_rethrows_the_first_exception
 
 TEST(audit_wire_signal_emit_async_reports_handler_exceptions) {
     std::atomic<int> reported{0};
+    // Restores the default handler on every exit path: the lambda below captures locals of this test by reference.
+    struct HandlerReset {
+        ~HandlerReset() { YarnBall::setUnhandledExceptionHandler({}); }
+    } handlerReset;
     YarnBall::setUnhandledExceptionHandler([&](std::exception_ptr) { reported.fetch_add(1); });
     Telegraph::Signal<int> sig;
     std::atomic<int> ran{0};
@@ -272,7 +278,6 @@ TEST(audit_wire_signal_emit_async_reports_handler_exceptions) {
     sig.connect([&](int) { ran.fetch_add(1); });
     sig.emitAsync(0);
     EXPECT_TRUE(wire_wait_for([&] { return ran.load() == 2 && reported.load() == 1; }, 5s));
-    YarnBall::setUnhandledExceptionHandler({});
 }
 
 TEST(audit_wire_signal_scoped_connection_disconnects_and_survives_the_signal) {
@@ -503,13 +508,35 @@ TEST(audit_wire_signal_disconnect_of_a_handler_owning_a_connection_does_not_dead
 }
 
 TEST(audit_wire_signal_registering_many_handlers_is_cheap_and_keeps_snapshot_semantics) {
+    // Registration must stay linear: a full list copy per connect makes 4x the handlers cost ~16x the time. An
+    // absolute bound would depend on the machine's load, so compare two sizes instead (best of three, to ride out
+    // a noisy run).
+    const auto connectNanos = [](int count) {
+        long long best = -1;
+        for (int round = 0; round < 3; ++round) {
+            Telegraph::Signal<int> probe;
+            long sink = 0;
+            const auto start = std::chrono::steady_clock::now();
+            for (int i = 0; i < count; ++i) probe.connect([&sink](int v) { sink += v; });
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+            if (best < 0 || ns < best) best = ns;
+        }
+        return best;
+    };
+    // A burst of load from other processes can slow one measurement by a large factor, so a failing attempt is
+    // repeated; a quadratic registration fails every attempt.
+    bool linear = false;
+    for (int attempt = 0; attempt < 4 && !linear; ++attempt) {
+        const long long small = connectNanos(8000);
+        const long long large = connectNanos(32000);
+        linear = large < 10 * std::max<long long>(small, 1); // linear ~4x, quadratic ~16x
+    }
+    EXPECT_TRUE(linear);
+
     Telegraph::Signal<int> s;
     std::vector<Telegraph::Signal<int>::SlotId> ids;
     long sum = 0;
-    const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < 20000; ++i) ids.push_back(s.connect([&sum](int v) { sum += v; }));
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
-    EXPECT_TRUE(ms < 400); // was ~1100 ms with a full list copy per connect
     EXPECT_EQ(s.handlerCount(), std::size_t{20000});
     s.emit(1);
     EXPECT_EQ(sum, 20000L);

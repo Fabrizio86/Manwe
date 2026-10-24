@@ -3027,11 +3027,12 @@ TEST(http_pool_returns_empty_when_no_idle) {
 TEST(http_pool_release_then_acquire_returns_same_stream) {
     // Spin up a TCP listener so we have real, healthy streams to pool.
     // The listener accepts and immediately closes; we never actually
-    // send HTTP -- this test exercises the pool's bookkeeping only.
+    // send HTTP -- this test exercises the pool's bookkeeping only. It
+    // accepts exactly the one client that connects, so the task ends.
     auto listener = Soccer::TcpListener::bind("127.0.0.1", 0);
     const std::uint16_t port = listener.localAddress().port();
     auto accepter = [](Soccer::TcpListener l) -> YarnBall::Task<void> {
-        for (int i = 0; i < 4; ++i) {
+        for (int i = 0; i < 1; ++i) {
             (void) co_await l.accept();
         }
         co_return;
@@ -3056,7 +3057,7 @@ TEST(http_pool_respects_max_idle_per_host) {
     auto listener = Soccer::TcpListener::bind("127.0.0.1", 0);
     const std::uint16_t port = listener.localAddress().port();
     auto accepter = [](Soccer::TcpListener l) -> YarnBall::Task<void> {
-        for (int i = 0; i < 5; ++i) {
+        for (int i = 0; i < 3; ++i) {
             (void) co_await l.accept();
         }
         co_return;

@@ -60,12 +60,12 @@ srv.route("GET", "/metrics", [](HttpRequest) -> Task<HttpResponse> {
     co_return HttpResponse{
         .status = 200,
         .headers = {{"content-type", "text/plain; version=0.0.4"}},
-        .body = Registry::instance().scrapeProm(),
+        .body = Registry::instance().scrape(),
     };
 });
 ```
 
-`scrapeProm()` returns the Prometheus text exposition format — drop
+`scrape()` returns the Prometheus text exposition format — drop
 it behind a `/metrics` route and any Prometheus / OpenTelemetry
 collector picks it up unchanged. Labels are not in v1 (a metric is
 uniquely identified by name); add labelled flavours when a real

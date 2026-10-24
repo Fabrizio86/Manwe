@@ -136,14 +136,16 @@ channel->send(2);
 channel->close();
 
 // Consumer coroutine
-YarnBall::coSpawn([channel]() -> YarnBall::Task<void> {
+// The channel is a coroutine PARAMETER (copied into the frame), not a lambda capture:
+// a capturing lambda temporary is destroyed while the coroutine is parked in receive().
+YarnBall::coSpawn([](std::shared_ptr<Telegraph::Channel<int>> ch) -> YarnBall::Task<void> {
     while (true) {
-        auto v = co_await channel->receive();
+        auto v = co_await ch->receive();
         if (!v) break;
         std::cout << *v << "\n";
     }
     co_return;
-}());
+}(channel));
 ```
 
 ---

@@ -4,12 +4,13 @@ The `Manwe::Embedded` library exposes hardware-adjacent I/O
 primitives composed on top of Yarn's Reactor. The coroutine model,
 `co_await` ergonomics, and lock-free hot path are shared with Soccer.
 
-Edge-event latency: `co_await line.waitForEvent()` resumes on a Yarn
-worker via symmetric transfer in ~30 ns from the kernel readiness
-event. Equivalent callback paths in interpreter-hosted runtimes
-(`gpiozero` in CPython, `onoff` in Node) typically measure 50–100 µs
-per event due to GIL acquisition, interpreter dispatch, and per-event
-heap allocation.
+Edge events: `co_await line.waitForEvent()` parks the coroutine on the
+Reactor and resumes it on a Yarn pool worker once the descriptor is
+readable. The kernel-edge-to-handler latency (reactor wake-up plus the
+pool dispatch) has not been measured; the only related figure the
+repository measures is the cost of an in-process `co_await` hop,
+~33 ns on Apple M1 Max (`bench_yarn`), which excludes the kernel and
+the reactor entirely.
 
 > **Validation status.** This component is marked
 > `MANWE_UNTESTED_PLATFORM` in v1: the development machine (Apple
@@ -27,9 +28,10 @@ heap allocation.
 Embedded/includes/
   SerialPort.h     — UART / USB-CDC via POSIX termios
   Gpio.h           — Linux /dev/gpiochip* character-device GPIO
+  FdSlot.h         — shared helper: one-waiter-at-a-time fd slot with close()-safe waits
 ```
 
-Both headers are part of the `Manwe::Embedded` CMake target. Consumers
+The three headers are part of the `Manwe::Embedded` CMake target. Consumers
 link with `target_link_libraries(my_app PRIVATE Manwe::Embedded)` and
 include the headers under `<manwe/embedded/...>` after install.
 
@@ -103,8 +105,10 @@ without arguments is the one-liner.
 ### Supported baud rates
 
 ```
-1200 1800 2400 4800 9600 19200 38400 57600 115200 230400
-460800 (Linux)  921600 (Linux)
+50 75 110 134 150 200 300 600 1200 1800 2400 4800 9600 19200 38400
+57600 115200 230400
+460800 500000 576000 921600 1000000 1152000 1500000 2000000
+2500000 3000000 3500000 4000000   (Linux; each only where the platform defines it)
 ```
 
 Custom rates (`BOTHER` on Linux) are deliberately not exposed in v1;
@@ -240,10 +244,10 @@ trade-offs differ on three axes:
 
 | Axis | Interpreter-hosted | Manwe |
 |---|---|---|
-| Edge-event latency | 50–100 µs per event (GIL acquire + dispatch + per-event allocation) | ~30 ns per event (kernel-fd readiness → symmetric-transfer resume) |
+| Edge-event latency | Not measured here | Not measured here; the reactor wake-up and pool dispatch sit between the kernel event and the handler (an in-process `co_await` hop is ~33 ns, see above) |
 | Deployment footprint | Interpreter + virtual environment + dependency tree | Static libraries; a Pi Zero W binary is ~4 MB |
 | Runtime homogeneity | Different runtime from the cloud side that aggregates the data | Same `Task<T>`, `Reactor`, and profiling tools on both sides |
 
 For workloads that are not latency-sensitive, the interpreter-hosted
-options are adequate. The above table covers the cases where the
-extra cost matters.
+options are adequate. Measure the edge-to-handler latency on the
+target hardware before choosing on that axis.

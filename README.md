@@ -1,7 +1,7 @@
 # Manwe
 
-**A C++23 async runtime. 50-await DB-shaped request: 570 ns. Tokio
-published: ~5,000 ns.**
+**A C++23 async runtime. 50-await DB-shaped request: ~400 ns
+(`bench_async_server`, M1 Max). Tokio published: ~5,000 ns.**
 
 One library: work-stealing thread pool, C++20 coroutines with
 symmetric transfer, kqueue / epoll / io_uring / IOCP reactor, TCP /
@@ -14,7 +14,7 @@ Silicon, x86_64 Linux, and MSVC Windows.
 ```bash
 git clone https://github.com/Fabrizio86/Manwe.git && cd Manwe
 cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
-./bin/YarnTests           # 155 tests on macOS/Linux, ~5 seconds
+./bin/YarnTests           # the full suite, a few seconds
 ./bin/bench_async_server  # the numbers below on your own hardware
 ```
 
@@ -22,7 +22,10 @@ cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
 
 ## Measured performance
 
-Apple M1 Max, Release build, sustained throughput.
+Apple M1 Max, Release build, `bench_async_server`. Per-request time is what
+the benchmark prints; throughput is its inverse (1e9 / ns). The figures
+move with machine load: re-running the same build while the machine was
+busy (load average around 10) printed ~700 ns for the 50-await row.
 
 | Workload                               | Per request | Per await | Throughput              |
 |----------------------------------------|-------------|-----------|-------------------------|
@@ -42,9 +45,9 @@ handler, the database, or the network.
 |----------------------------------------|----------------|-------------------|--------------|
 | Submit dispatch                        | **~310 ns**    | ~300 ns           | ~500-1500 ns |
 | `co_await` chain hop                   | **~33 ns**     | ~80-150 ns        | n/a          |
-| 10-await endpoint, end-to-end          | **~500 ns**    | ~1100 ns          | n/a          |
-| 50-await DB endpoint, end-to-end       | **~570 ns**    | ~5000 ns          | n/a          |
-| Throughput / core (50-await endpoint)  | **1.7 M req/s**| ~200 K req/s      | n/a          |
+| 10-await endpoint, end-to-end          | **~370 ns**    | ~1100 ns          | n/a          |
+| 50-await DB endpoint, end-to-end       | **~400 ns**    | ~5000 ns          | n/a          |
+| Throughput / core (50-await endpoint)  | **2.5 M req/s**| ~200 K req/s      | n/a          |
 
 For a service handling 100,000 requests per second of mixed traffic,
 this is approximately **10–15 Manwe cores against 50 Tokio cores**.
@@ -74,8 +77,8 @@ Design rationale in [`PHILOSOPHY.md`](PHILOSOPHY.md).
 | **Wire** — push notifications | Coroutine-aware `Telegraph::Signal<Args...>` multicast, unbounded `Channel<T>`, fixed-capacity `BoundedChannel<T>`, `channelSelect` (race N channels). |
 | **Signals** | `SignalSet({SIGINT, SIGTERM})` + `co_await sigs.next()` — POSIX signals as coroutine events: `EVFILT_SIGNAL` on macOS/BSD, a self-pipe under `sigaction` elsewhere. Any number of sets may coexist. |
 | **Observability** | `YarnBall::metrics` — Counter / Gauge / Histogram + Prometheus text exposition. `YarnBall::log` — structured JSON logger with levels and typed fields. `YarnBall::trace` — W3C `traceparent` propagation carried on the coroutine promise so context survives suspend / resume across workers. |
-| **Embedded** | `SerialPort` (POSIX termios), `GpioChip` + `GpioLine` (Linux character-device `/dev/gpiochip*`, edge-triggered `co_await waitForEvent`). Same Reactor, same `co_await`; ~30 ns from kernel edge to handler. |
-| **Tests** | In-tree minimal harness. 157 declared cases, 155 enabled on macOS/Linux with TLS + nghttp2. Full suite runs in ~5 seconds. |
+| **Embedded** | `SerialPort` (POSIX termios), `GpioChip` + `GpioLine` (Linux character-device `/dev/gpiochip*`, edge-triggered `co_await waitForEvent`). Same Reactor, same `co_await`. |
+| **Tests** | In-tree minimal harness. Every case is enabled on macOS/Linux with TLS + nghttp2; the full suite runs in a few seconds. |
 | **Examples** | Echo server, HTTP GET, HTTP server, HTTP/2 GET, signal-driven chat, channel pipeline, ICMP ping, WebSocket echo, graceful-shutdown HTTP server. |
 | **Benchmarks** | `bench_yarn` (deque / MPMC / submit / Task chain), `bench_async_server` (end-to-end request shapes), `bench_signal` (`Telegraph::Signal` emit cost). |
 
@@ -101,9 +104,14 @@ int main() {
 An HTTP/2 client:
 
 ```cpp
+#include <iostream>
+
 #include "Soccer/includes/Http2.h"
+#include "Yarn/includes/Coroutines.h"
+#include "Yarn/includes/Yarn.hpp"
 
 using namespace Soccer;
+using YarnBall::Task;
 
 Task<void> fetch() {
     TlsClientOptions tls{ .alpnProtocols = "h2", .caBundleFile = "/etc/ssl/cert.pem" };
@@ -187,7 +195,7 @@ query, and an HTTP/2 response.
   End-to-end verified against `nghttp2.org`.
 - **Documented surface.** Every public class and non-obvious
   invariant carries a Doxygen block. The in-tree test harness runs
-  155 enabled cases. Reproducer benchmarks live in `benchmarks/`.
+  the full suite on every build. Reproducer benchmarks live in `benchmarks/`.
   Incomplete features (Windows IOCP file I/O, native io_uring file
   paths) are listed as planned work rather than as supported.
 
@@ -198,7 +206,7 @@ query, and an HTTP/2 response.
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j
-./bin/YarnTests           # 155 enabled cases, ~5 s
+./bin/YarnTests           # the full suite, a few seconds
 ./bin/bench_async_server  # the numbers from the table above
 ./bin/echo_server         # see examples/ for more
 ```
@@ -228,7 +236,7 @@ cmake --install build
 In a consumer project:
 
 ```cmake
-find_package(Manwe 1.0 REQUIRED)
+find_package(Manwe 1.1 REQUIRED)   # any 1.x >= 1.1 is accepted
 
 add_executable(my_app main.cpp)
 target_link_libraries(my_app PRIVATE
@@ -266,7 +274,7 @@ Manwe follows [SemVer](https://semver.org/). Patch versions are
 strictly non-breaking, minor versions add API without removing,
 breaking changes land only in major versions.
 
-Current version: **1.0.0**. See [`CHANGELOG.md`](CHANGELOG.md).
+Current version: **1.1.0**. See [`CHANGELOG.md`](CHANGELOG.md).
 
 ## License
 

@@ -7,11 +7,12 @@
 // handler for each, and never blocks on a slow handler.
 //
 // Cancellation: pass a std::stop_token. tcpServe registers a
-// std::stop_callback that closes the listener fd on stop request,
-// which cancels any in-flight accept (kernel returns EBADF). The
-// resulting SocketException is swallowed if stop_requested() is
-// true, so the loop exits cleanly even when blocked in accept.
-// In-flight handlers keep running until they complete.
+// std::stop_callback that interrupts the listener's pending accept
+// (TcpListener::interruptAccept: the Reactor wakes the parked wait; the
+// socket is not shut down or closed and nothing is queued on it). The
+// resulting SocketException ("accept interrupted") is swallowed if
+// stop_requested() is true, so the loop exits cleanly even when blocked
+// in accept. In-flight handlers keep running until they complete.
 //
 
 #ifndef SOCCER_TCP_SERVER_H
@@ -173,9 +174,11 @@ namespace Soccer {
 
         /**
          * @brief Make a parked accept on @p listener return so its loop can see a stop request.
-         *        Where the Reactor can cancel the wait (everywhere but Windows) nothing is queued,
-         *        so no handler ever sees a stray connection and the stop is immediate. On Windows
-         *        it knocks on the listener's own address, see @ref knockOnListener.
+         *        The Reactor cancels the wait (@ref TcpListener::interruptAccept), so nothing is
+         *        queued, no handler ever sees a stray connection and the stop is immediate. Only
+         *        if the listener cannot be interrupted (it is already closed, when its accept
+         *        fails by itself) does it fall back to knocking on the listener's own address,
+         *        see @ref knockOnListener.
          */
         inline void wakeAccept(TcpListener &listener) noexcept {
             if (listener.interruptAccept()) return;
@@ -209,19 +212,12 @@ namespace Soccer {
      *                  what makes the spawn ergonomic; the handler can
      *                  internally co_await other tasks freely.
      * @param stop     Cooperative stop token. When stopped, a
-     *                  @c stop_callback wakes any pending @c accept: on
-     *                  Linux by shutting the listening socket down (no
-     *                  connection is queued), elsewhere by making a brief
-     *                  loopback connection to the listener's own bound
-     *                  address (closing the fd alone does not reliably
-     *                  wake a kqueue-suspended accept on macOS). The loop
-     *                  then observes @c stop_requested() and returns. The
-     *                  loopback connect is non-blocking but may hold the
-     *                  thread calling @c request_stop for up to 250 ms
-     *                  when the backlog is full, and is skipped if the
-     *                  process has no descriptor left for it, in which
-     *                  case the loop only notices the stop when its next
-     *                  connection arrives.
+     *                  @c stop_callback wakes any pending @c accept through
+     *                  the Reactor (@c TcpListener::interruptAccept), on every
+     *                  platform: the socket is left alone, no connection is
+     *                  queued and @c request_stop returns at once. The loop
+     *                  then observes @c stop_requested() and returns. Connections
+     *                  already in the backlog are closed with the listener.
      *
      * @param maxConnections Cap on concurrently running handlers; zero means
      *                  unlimited (the default, kept for compatibility -- a
@@ -244,16 +240,10 @@ namespace Soccer {
      *       handlers to shorten, plumb @p stop through to them and
      *       have them check it cooperatively.
      *
-     * @note Where the stop is delivered by a loopback connection (not Linux), that connection
-     *       is itself accepted and dispatched through
-     *       @p handler exactly like a real client -- it just closes
-     *       immediately without sending anything. Handlers should
-     *       already tolerate a connection that yields immediate EOF
-     *       (a routine occurrence with real clients too: health-check
-     *       probes, port scanners, failed TLS negotiations), but if
-     *       yours does something observable (log a connection event,
-     *       bump a counter) before its first read, expect exactly one
-     *       such event per graceful shutdown.
+     * @note A stop never reaches @p handler as a stray connection: the wake-up is not a
+     *       connection. Handlers should still tolerate a connection that yields immediate
+     *       EOF, which real clients produce too (health-check probes, port scanners,
+     *       failed TLS negotiations).
      */
     inline YarnBall::Task<void>
     tcpServe(TcpListener listener,
@@ -261,15 +251,10 @@ namespace Soccer {
               std::stop_token stop = {},
               std::size_t maxConnections = 0) {
         ConnectionLimiter limiter(maxConnections);
-        // Unblock a pending accept on stop: closing or shutting down
-        // the listener fd does NOT reliably wake a kqueue-suspended
-        // accept on macOS (the kernel drops the filter silently
-        // rather than synthesising an event). The portable way is
-        // to "knock on the door" -- briefly open a loopback
-        // connection to the listener's own bound address, which
-        // forces accept to return one final stream. The loop body
-        // then sees stop_requested() and returns; the probe stream
-        // is discarded by the handler when it sees an immediate EOF.
+        // Unblock a pending accept on stop: closing or shutting down the listener fd does not reliably wake
+        // a kqueue-suspended accept on macOS (the kernel drops the filter silently), so the Reactor is asked
+        // to cancel the wait instead (see TcpListener::interruptAccept). The loop body then sees
+        // stop_requested() and returns.
         std::stop_callback unblock(stop, [&listener]() noexcept {
             detail::wakeAccept(listener);
         });

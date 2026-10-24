@@ -73,6 +73,21 @@ auto contentType = resp.header("content-type");   // case-insensitive
 for (const auto& [k, v] : resp.trailers) { /* ... */ }
 ```
 
+### Request headers and failed streams
+
+`request` validates what it is given, as the HTTP/1.1 client does: a method
+or header name that is not a token, a control character in a header value
+or the target, or a `Transfer-Encoding` header throws `std::runtime_error`.
+Connection-specific fields (`Connection`, `Keep-Alive`, `Proxy-Connection`,
+`Upgrade`, `TE` other than `trailers`) have no meaning in HTTP/2 and are
+dropped, a caller `Content-Length` is replaced by the real body length, and
+a caller `Host` becomes `:authority`.
+
+A response is returned only when it is complete: a stream that the peer
+closes with `RST_STREAM` (even `NO_ERROR`) before a `:status` arrived, or
+before the response ended, throws `std::runtime_error` instead of yielding an
+empty or truncated response.
+
 ### Lifetime
 
 Move-only. The destructor sends `GOAWAY` and closes the socket. A
@@ -113,6 +128,17 @@ Multiplexed: every accepted connection runs an nghttp2 server session
 that hosts N concurrent streams; each request dispatches to its
 handler as a separate coroutine, and the response is shipped back on
 the same stream.
+
+### Timeouts
+
+`Http2ServerOptions` bounds every phase a peer could stall: `requestTimeout`
+(a request must arrive in full), `idleTimeout` (nothing in flight, or a
+response stalled with no bytes written), and `writeTimeout` (default 30 s):
+each chunk of output must be accepted by the peer within it, so a client that
+asks for a large response and never reads it is dropped rather than pinning the
+connection. A client that keeps reading, however slowly, is never cut off by
+`idleTimeout` while its download progresses. `localAddress()` is valid before
+and after `serve()` (it is recorded at construction).
 
 ### Trailers (gRPC)
 

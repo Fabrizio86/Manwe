@@ -2,8 +2,10 @@
 // Created by Fabrizio Paino on 2026-05-15.
 //
 // BufferedReader<Stream>: HTTP-style buffered reads over a Soccer
-// TcpStream / TlsStream / UdpSocket / RawSocket (anything with a
-// coroutine read(span<byte>) -> Task<size_t>). Provides line- and
+// TcpStream / TlsStream (anything with a coroutine read(span<byte>) ->
+// Task<size_t>; UdpSocket and RawSocket are datagram sockets with
+// recvFrom / recv and are not streams, wrap them in a small adapter if
+// needed). Provides line- and
 // delimiter-bounded reads on top of fixed-byte read primitives, and a
 // readExact that handles short reads automatically.
 //

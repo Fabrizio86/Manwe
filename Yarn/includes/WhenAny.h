@@ -7,7 +7,8 @@
 // parked on a timer, an fd, a lock, a channel, ... stop waiting and unwind
 // with CancelledException (discarded) instead of lingering. Work that is not
 // parked in a cancellable await runs to its natural end and its result is
-// dropped. withTimeout is the canonical consumer: whenAny(task, sleepFor(d)).
+// dropped. withTimeout is the canonical consumer; it is built the same way, with one runner for
+// the task and a plain Reactor timer (not a sleepFor branch) as the other side.
 //
 // LOSERS ARE NOT JOINED (by default). whenAny resumes its caller as soon as the
 // winner is known; a cancelled loser is only *asked* to stop and may still be
@@ -175,6 +176,10 @@ namespace YarnBall {
                     }
                 }
             }
+            // A loser's result (or error) dies here, before settleRunner can resume the caller: joinLosers promises
+            // every branch is gone, results included, when whenAny returns.
+            value.reset();
+            error = nullptr;
             settleRunner(*state, won);
             co_return;
         }
@@ -203,6 +208,7 @@ namespace YarnBall {
                 state->winning_index = idx;
                 if (error) state->exception = error;
             }
+            error = nullptr;
             settleRunner(*state, won);
             co_return;
         }

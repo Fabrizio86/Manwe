@@ -86,12 +86,22 @@ namespace Soccer {
 
         public:
             SocketSlot() : st(std::make_shared<State>()) {}
-            explicit SocketSlot(int fd) : st(std::make_shared<State>()) {
+            /// Takes ownership of @p fd, also when the shared block cannot be allocated (it is closed, then bad_alloc).
+            explicit SocketSlot(int fd) {
+                try {
+                    this->st = std::make_shared<State>();
+                } catch (...) {
+                    if (fd >= 0) (void) YarnBall::closeSocket(fd);
+                    throw;
+                }
                 this->st->fdValue.store(fd, std::memory_order_relaxed);
             }
             SocketSlot(const SocketSlot &) = delete;
             SocketSlot &operator=(const SocketSlot &) = delete;
+            /// Allocates a fresh block (so a @ref Watch on @p o does not follow the descriptor); if that throws, @p o is
+            /// untouched. The interrupted flag moves along with the descriptor.
             SocketSlot(SocketSlot &&o) : st(std::make_shared<State>()) {
+                this->st->interrupted.store(o.interrupted(), std::memory_order_relaxed);
                 this->st->fdValue.store(o.take(), std::memory_order_relaxed);
             }
 
@@ -134,8 +144,18 @@ namespace Soccer {
             /// Whether @ref interrupt was called.
             bool interrupted() const noexcept { return this->st->interrupted.load(std::memory_order_seq_cst); }
 
-            /// Put @p fd in an empty slot.
+            /// Put @p fd in an empty slot. The interrupted flag is left as it is.
             void reset(int fd) noexcept { this->st->fdValue.store(fd, std::memory_order_seq_cst); }
+
+            /**
+             * @brief Move-assignment tail: the (already closed) slot takes over @p o's descriptor and its interrupted
+             *        flag, so it ends up exactly like the slot it adopted -- an interrupt on the old occupant does not
+             *        leak into the new one. No allocation.
+             */
+            void adopt(SocketSlot &o) noexcept {
+                this->st->interrupted.store(o.st->interrupted.load(std::memory_order_seq_cst), std::memory_order_seq_cst);
+                this->st->fdValue.store(o.take(), std::memory_order_seq_cst);
+            }
 
             /**
              * @brief Close a descriptor obtained from @ref take, once no @ref Use is left.
@@ -229,14 +249,12 @@ namespace Soccer {
                 // Locals only after the inner registration: the wait may complete, and
                 // destroy this awaiter and the whole frame, on another thread right away.
                 const std::shared_ptr<SocketSlot::State> keep = this->state;
-                [[maybe_unused]] const int waitFd = this->fd;
+                const int waitFd = this->fd;
                 const bool parked = this->inner.await_suspend(h);
-#ifndef _WIN32
                 if (parked && (keep->fdValue.load(std::memory_order_seq_cst) != waitFd
                                || keep->interrupted.load(std::memory_order_seq_cst))) {
                     (void) YarnBall::Reactor::instance()->cancelFd(waitFd);
                 }
-#endif
                 return parked;
             }
 
@@ -353,6 +371,22 @@ namespace Soccer {
             const int on = 1;
             (void) ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY,
                                 reinterpret_cast<const char *>(&on), sizeof(on));
+        }
+
+        /**
+         * @brief @c steady_clock::now() + @p limit, saturating at @c time_point::max() instead of overflowing: a huge
+         *        limit (@c milliseconds::max(), centuries) would otherwise wrap into the past and fire at once. A zero or
+         *        negative limit yields "now".
+         */
+        inline std::chrono::steady_clock::time_point deadlineAfter(std::chrono::milliseconds limit) noexcept {
+            using Clock = std::chrono::steady_clock;
+            const auto now = Clock::now();
+            if (limit.count() <= 0) return now;
+            // Room left before the clock's range ends, rounded down to whole milliseconds so the comparison below is
+            // done in milliseconds (converting a huge limit to the clock's finer unit would itself overflow).
+            const auto room = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::time_point::max() - now);
+            if (limit >= room) return Clock::time_point::max();
+            return now + limit;
         }
 
         /// Smallest share of a connect budget an earlier candidate address gets (see @ref connectSlice).

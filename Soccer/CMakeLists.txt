@@ -126,8 +126,9 @@ target_link_libraries(Soccer PUBLIC Yarn)
 
 # The libraries are linked with absolute paths while building in-tree, but the
 # EXPORTED interface must not bake this machine's paths into an install: it names
-# them plainly (-ltls -lssl -lcrypto) and leaves it to the consumer's linker search
-# path, which is what keeps the installed package relocatable. The same goes for
+# the imported targets Manwe::TlsDeps / Manwe::Nghttp2Deps, which the installed
+# ManweConfig.cmake defines by locating the libraries on the consumer's machine
+# (keg-only prefixes included), which is what keeps the package relocatable. The same goes for
 # the include directories: Soccer's public headers only forward-declare the
 # libtls / nghttp2 types, so those directories stay private to this target.
 if (LIBTLS_INCLUDE_DIR AND LIBTLS_LIBRARY)
@@ -135,9 +136,7 @@ if (LIBTLS_INCLUDE_DIR AND LIBTLS_LIBRARY)
             $<BUILD_INTERFACE:${LIBTLS_LIBRARY}>
             $<BUILD_INTERFACE:${LIBSSL_LIBRARY}>
             $<BUILD_INTERFACE:${LIBCRYPTO_LIBRARY}>
-            $<INSTALL_INTERFACE:tls>
-            $<INSTALL_INTERFACE:ssl>
-            $<INSTALL_INTERFACE:crypto>)
+            $<INSTALL_INTERFACE:Manwe::TlsDeps>)
     target_include_directories(Soccer PRIVATE ${LIBTLS_INCLUDE_DIR})
     target_compile_definitions(Soccer PUBLIC SOCCER_HAS_TLS=1)
 else ()
@@ -148,7 +147,7 @@ endif ()
 if (SOCCER_USE_NGHTTP2)
     target_link_libraries(Soccer PUBLIC
             $<BUILD_INTERFACE:${LIBNGHTTP2_LIBRARY}>
-            $<INSTALL_INTERFACE:nghttp2>)
+            $<INSTALL_INTERFACE:Manwe::Nghttp2Deps>)
     target_include_directories(Soccer PRIVATE ${LIBNGHTTP2_INCLUDE_DIR})
     target_compile_definitions(Soccer PUBLIC SOCCER_HAS_HTTP2=1)
     target_compile_definitions(Soccer PRIVATE ${SOCCER_NGHTTP2_DEFS})

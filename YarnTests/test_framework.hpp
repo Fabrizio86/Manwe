@@ -10,6 +10,7 @@
 #include <exception>
 #include <functional>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -20,10 +21,15 @@ namespace test {
     /**
      * @brief Exception type thrown by EXPECT_* macros on failure. The test
      *        runner catches it and records the failure with the assertion's
-     *        file:line context.
+     *        file:line context. It deliberately does not derive from
+     *        std::exception, so a failed assertion inside an expression passed
+     *        to EXPECT_THROWS_AS (or a catch (const std::exception &) in a
+     *        test) can never be mistaken for the exception being expected.
      */
-    struct TestFailure : std::runtime_error {
-        using std::runtime_error::runtime_error;
+    struct TestFailure {
+        explicit TestFailure(std::string m) : msg(std::move(m)) {}
+        [[nodiscard]] const char *what() const noexcept { return msg.c_str(); }
+        std::string msg;
     };
 
     /**
@@ -76,6 +82,10 @@ namespace test {
                     std::chrono::steady_clock::now() - start).count();
                 std::cout << "[  OK  ] " << tc.name << " (" << us << " us)" << std::endl;
                 ++passed;
+            } catch (const TestFailure &e) {
+                std::cout << "[ FAIL ] " << tc.name << ": " << e.what() << std::endl;
+                ++failed;
+                failures.emplace_back(tc.name);
             } catch (const std::exception &e) {
                 std::cout << "[ FAIL ] " << tc.name << ": " << e.what() << std::endl;
                 ++failed;
@@ -92,6 +102,28 @@ namespace test {
             for (const auto &f : failures) std::cout << "  - " << f << "\n";
         }
         return failed == 0 ? 0 : 1;
+    }
+
+    /**
+     * @brief Compare two operands by const reference (so move-only types work and
+     *        nothing is copied). Returns the "a != b" text on mismatch. The
+     *        comparison runs inside the caller's full-expression, so operands that
+     *        refer into temporaries (e.g. @c *queue.pop_front()) are still alive.
+     */
+    template <class A, class B>
+    std::optional<std::string> eq_mismatch(const A &a, const B &b) {
+        if (a == b) return std::nullopt;
+        std::ostringstream os;
+        os << a << " != " << b;
+        return os.str();
+    }
+
+    template <class A, class B>
+    std::optional<std::string> ne_mismatch(const A &a, const B &b) {
+        if (!(a == b)) return std::nullopt;
+        std::ostringstream os;
+        os << "both = " << a;
+        return os.str();
     }
 
 } // namespace test
@@ -133,17 +165,16 @@ namespace test {
 /**
  * @def EXPECT_EQ(a, b)
  * @brief Assert @c a == @c b. Both operands must be streamable to ostream.
- *        The operands are copied: binding a reference would dangle for an
- *        lvalue that lives inside a temporary (e.g. @c *queue.pop_front()).
+ *        The operands are taken by const reference (never copied), so
+ *        move-only values compare, and an operand that refers into a temporary
+ *        (e.g. @c *queue.pop_front()) is still alive during the comparison.
  */
 #define EXPECT_EQ(a, b)                                                       \
     do {                                                                      \
-        const auto _a = (a);                                                  \
-        const auto _b = (b);                                                  \
-        if (!(_a == _b)) {                                                    \
+        if (auto _m = ::test::eq_mismatch((a), (b))) {                        \
             std::ostringstream _os;                                           \
             _os << __FILE__ << ":" << __LINE__                                \
-                << " EXPECT_EQ(" #a ", " #b ") failed: " << _a << " != " << _b; \
+                << " EXPECT_EQ(" #a ", " #b ") failed: " << *_m;              \
             throw ::test::TestFailure(_os.str());                             \
         }                                                                     \
     } while (0)
@@ -154,12 +185,10 @@ namespace test {
  */
 #define EXPECT_NE(a, b)                                                       \
     do {                                                                      \
-        const auto _a = (a);                                                  \
-        const auto _b = (b);                                                  \
-        if (_a == _b) {                                                       \
+        if (auto _m = ::test::ne_mismatch((a), (b))) {                        \
             std::ostringstream _os;                                           \
             _os << __FILE__ << ":" << __LINE__                                \
-                << " EXPECT_NE(" #a ", " #b ") failed: both = " << _a;        \
+                << " EXPECT_NE(" #a ", " #b ") failed: " << *_m;              \
             throw ::test::TestFailure(_os.str());                             \
         }                                                                     \
     } while (0)
@@ -176,6 +205,8 @@ namespace test {
             (void) (expr);                                                    \
         } catch (const ExceptType &) {                                        \
             _threw_correct = true;                                            \
+        } catch (const ::test::TestFailure &) {                               \
+            throw;                                                            \
         } catch (...) {                                                       \
             std::ostringstream _os;                                           \
             _os << __FILE__ << ":" << __LINE__                                \

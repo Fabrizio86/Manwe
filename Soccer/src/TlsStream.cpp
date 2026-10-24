@@ -86,15 +86,28 @@ namespace Soccer {
     TlsStream::TlsStream() : impl(std::make_shared<Impl>()) {
     }
 
-    TlsStream::TlsStream(::tls *ctx, ::tls_config *cfg, int fd) noexcept
-        : impl(std::make_shared<Impl>()) {
+    /// The shared state for an adopting constructor. The constructor takes ownership of the context, the config
+    /// and the descriptor even when the allocation fails: they are released before the exception propagates.
+    std::shared_ptr<TlsStream::Impl> TlsStream::makeAdoptingImpl(::tls *ctx, ::tls_config *cfg, int fd) {
+        try {
+            return std::make_shared<Impl>();
+        } catch (...) {
+            if (ctx) ::tls_free(ctx);
+            if (cfg) ::tls_config_free(cfg);
+            if (fd >= 0) (void) YarnBall::closeSocket(fd);
+            throw;
+        }
+    }
+
+    TlsStream::TlsStream(::tls *ctx, ::tls_config *cfg, int fd)
+        : impl(makeAdoptingImpl(ctx, cfg, fd)) {
         this->impl->ctx = ctx;
         this->impl->cfg = cfg;
         this->impl->fd = fd;
     }
 
-    TlsStream::TlsStream(::tls *ctx, int fd, std::chrono::milliseconds handshakeTimeout) noexcept
-        : impl(std::make_shared<Impl>()) {
+    TlsStream::TlsStream(::tls *ctx, int fd, std::chrono::milliseconds handshakeTimeout)
+        : impl(makeAdoptingImpl(ctx, nullptr, fd)) {
         this->impl->ctx = ctx;
         this->impl->fd = fd;
         this->impl->hsTimeout = handshakeTimeout;
@@ -268,9 +281,10 @@ namespace Soccer {
         }
         deadline.disarm(); // before the fd changes hands
 
-        TlsStream out(parts.ctx, parts.cfg, tcp.release());
-        parts.ctx = nullptr;
-        parts.cfg = nullptr;
+        // The constructor owns the parts from here on, even if it throws.
+        ::tls *const ctx = std::exchange(parts.ctx, nullptr);
+        ::tls_config *const cfg = std::exchange(parts.cfg, nullptr);
+        TlsStream out(ctx, cfg, tcp.release());
         co_return out;
     }
 

@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <optional>
 
 #ifndef _WIN32
 #include <poll.h>
@@ -42,13 +43,22 @@ namespace Soccer {
         // about to be closed (and may be handed to another connection).
         const int fd = this->sock.take();
         if (fd >= 0) {
-#ifndef _WIN32
             // Wake any coroutine still parked on this fd before it is closed (and the number reused).
             (void) YarnBall::Reactor::instance()->cancelFd(fd);
-#endif
             // The real close waits for any syscall still running on the fd (see SocketSlot).
             this->sock.retire(fd);
         }
+    }
+
+    void TcpStream::shutdownWrite() noexcept {
+        auto use = this->sock.begin(); // the descriptor cannot be closed (and reused) under the call
+        const int fd = use.fd();
+        if (fd < 0) return;
+#ifdef _WIN32
+        (void) ::shutdown(static_cast<SOCKET>(static_cast<unsigned>(fd)), SD_SEND);
+#else
+        (void) ::shutdown(fd, SHUT_WR);
+#endif
     }
 
     YarnBall::Task<std::size_t> TcpStream::read(std::span<std::byte> buf) {
@@ -156,7 +166,7 @@ namespace Soccer {
         // A Linux server whose accept backlog is full answers a non-blocking connect with
         // EAGAIN, and nothing signals when room appears: poll again with a short back-off
         // until the allowance runs out (or the caller's scope is cancelled).
-        const auto giveUp = std::chrono::steady_clock::now() + busyRetry;
+        const auto giveUp = detail::deadlineAfter(busyRetry);
         auto pause = std::chrono::milliseconds{1};
         int rc;
         while (true) {
@@ -270,12 +280,14 @@ namespace Soccer {
         /// a share of it (detail::connectSlice) so a blackholed one does not starve the rest.
         YarnBall::Task<TcpStream> connectAny(std::string host, std::uint16_t port,
                                              std::chrono::milliseconds budget) {
+            // A year is "forever" for a connect, and keeps the arithmetic on the budget (shares, timers) far from overflow.
+            budget = std::min(budget, std::chrono::milliseconds{std::chrono::hours{24 * 365}});
             const auto start = std::chrono::steady_clock::now();
             // Try every candidate getaddrinfo returned, not just the
             // first: a host with multiple A/AAAA records (load-balanced
             // services, CDNs, multi-homed backends) may have working
-            // addresses beyond the head of the list. Only the LAST
-            // candidate's failure is surfaced to the caller; earlier
+            // addresses beyond the head of the list. When none works, the
+            // most recent real failure is surfaced to the caller; earlier
             // failures just move on to the next address. resolveAllAsync
             // hops to a worker before the blocking getaddrinfo call, same
             // as the single-address resolveAsync this replaces. An address
@@ -294,6 +306,9 @@ namespace Soccer {
                 all = co_await SocketAddress::resolveAllAsync(host, port);
             }
 
+            // The most informative failure so far: a real error (refused, unreachable, ...) beats a
+            // plain "timed out", so a refusal from one address is not hidden by a later one that stalled.
+            std::optional<SocketException> realError;
             for (std::size_t i = 0; i < all.size(); ++i) {
                 try {
                     if (budget.count() <= 0) {
@@ -306,16 +321,15 @@ namespace Soccer {
                     co_return co_await tryConnect(all[i], detail::connectSlice(left, all.size() - i));
                 } catch (const YarnBall::TimeoutException &) {
                     // this candidate used up its share: fall through to the next one
-                    if (i + 1 == all.size()) throw SocketException("connect timed out");
-                } catch (const SocketException &) {
-                    if (i + 1 == all.size()) throw;
-                    // else: this candidate failed, try the next one.
+                } catch (const SocketException &e) {
+                    // this candidate failed, try the next one.
+                    realError.emplace(e);
                 }
             }
+            if (realError) throw *realError;
             if (budget.count() > 0) throw SocketException("connect timed out");
             // Unreachable: resolveAll() never returns an empty vector on
-            // success, so the loop above always either returns or
-            // rethrows on its last iteration.
+            // success, so the loop above always either returns or ends with an error.
             throw SocketException("tcpConnect: no addresses to try");
         }
     }

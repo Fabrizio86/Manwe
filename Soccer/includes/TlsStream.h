@@ -176,7 +176,11 @@ namespace Soccer {
 
         /**
          * @brief Read up to @p buf.size() decrypted bytes.
-         * @return Number of bytes read; 0 indicates the TLS half-close.
+         * @return Number of bytes read; 0 means the end of the stream: the peer's
+         *         TLS close_notify, but also a TCP connection that ended without
+         *         one (libtls reports both as 0 and offers no way to tell them
+         *         apart), so a protocol that must detect truncation has to
+         *         frame its data itself (a length, or a terminator).
          */
         YarnBall::Task<std::size_t> read(std::span<std::byte> buf);
 
@@ -190,8 +194,9 @@ namespace Soccer {
         YarnBall::Task<std::size_t> write(std::span<const std::byte> buf);
 
         /**
-         * @brief Close the stream: send the TLS close_notify (best effort, waiting
-         *        a short, bounded time for a stalled peer), free the context and
+         * @brief Close the stream: send the TLS close_notify (best effort: one attempt
+         *        plus one retry after a zero-wait poll; it never waits for the peer,
+         *        and a full send buffer drops the alert), free the context and
          *        close the socket. Idempotent; may be called from any thread while
          *        a @c read / @c write is parked -- those wake and throw.
          */
@@ -214,18 +219,20 @@ namespace Soccer {
 
         /**
          * @brief Adopt an accepted server-side context. Used by
-         *        @c TlsListener::accept after @c tls_accept_socket.
+         *        @c TlsListener::accept after @c tls_accept_socket. Takes ownership of
+         *        all three even if it throws (@c std::bad_alloc).
          */
-        TlsStream(::tls *ctx, ::tls_config *cfg, int fd) noexcept;
+        TlsStream(::tls *ctx, ::tls_config *cfg, int fd);
 
         /**
          * @brief Adopt an accepted server-side context whose handshake has not
          *        run; the first @ref handshake / read / write drives it, bounded
          *        by @p handshakeTimeout (zero or negative: unbounded).
          */
-        TlsStream(::tls *ctx, int fd, std::chrono::milliseconds handshakeTimeout) noexcept;
+        TlsStream(::tls *ctx, int fd, std::chrono::milliseconds handshakeTimeout);
 
         struct Impl;
+        static std::shared_ptr<Impl> makeAdoptingImpl(::tls *ctx, ::tls_config *cfg, int fd);
         static YarnBall::Task<void> driveHandshake(std::shared_ptr<Impl> im);
         // Shared with parked waiters so the descriptor outlives a close() until they leave.
         std::shared_ptr<Impl> impl;

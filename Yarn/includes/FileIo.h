@@ -189,7 +189,13 @@ namespace YarnBall::fs {
         YarnBall::Task<> close() {
             if (!this->stream.is_open()) co_return;
             co_await YarnBall::scheduleOn(YarnBall::Yarn::instance());
+            // Buffered data reaches the OS at close: a failure there (disk full, quota) is a failed write. A failbit left
+            // by an earlier error was already reported, so start clean.
+            this->stream.clear();
             this->stream.close();
+            if (this->stream.fail()) {
+                throw FileIoError("close failed");
+            }
             co_return;
         }
 
@@ -272,6 +278,7 @@ namespace YarnBall::fs {
             throw FileIoError("writeString(" + path + "): open failed");
         }
         f.write(data.data(), static_cast<std::streamsize>(data.size()));
+        f.close(); // the buffer is flushed here, so a full disk shows up now rather than being dropped by the destructor
         if (f.fail()) {
             throw FileIoError("writeString(" + path + "): write failed");
         }
@@ -290,6 +297,7 @@ namespace YarnBall::fs {
         }
         f.write(reinterpret_cast<const char *>(data.data()),
                 static_cast<std::streamsize>(data.size()));
+        f.close(); // the buffer is flushed here, so a full disk shows up now rather than being dropped by the destructor
         if (f.fail()) {
             throw FileIoError("writeBytes(" + path + "): write failed");
         }

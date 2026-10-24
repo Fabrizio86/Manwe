@@ -7,6 +7,7 @@
 
 #include <cstddef>
 #include <cstdlib>
+#include <initializer_list>
 #include <mutex>
 #include <new>
 
@@ -17,7 +18,8 @@ namespace YarnBall::detail {
      * @brief Per-process fixed-size freelist with a thread-local cache.
      *
      * Used to back @c operator @c new / @c operator @c delete on internal
-     * ITask wrappers (CoroutineITask, SharedOwnerAdapter, HandlerTask).
+     * ITask wrappers (CoroutineITask, SharedOwnerAdapter, CallableITask) and,
+     * through @ref frameAlloc, on Task coroutine frames.
      * Replaces the default malloc/free with a freelist hit on the steady
      * state, dropping the alloc/free cost from ~100-200 ns to a handful of
      * ns per pair.
@@ -144,11 +146,12 @@ namespace YarnBall::detail {
             armThreadExit();
             Node *batch;
             {
-                std::lock_guard<std::mutex> lk(globalMu);
-                batch = globalHead;
+                Shared &g = shared();
+                std::lock_guard<std::mutex> lk(g.mu);
+                batch = g.head;
                 if (batch == nullptr) return;
-                globalHead = batch->nextBatch;
-                globalCount -= batch->count;
+                g.head = batch->nextBatch;
+                g.count -= batch->count;
             }
             // A whole batch is adopted by relinking one pointer: the other blocks are not touched (they were freed by
             // other threads, so their cache lines belong to other cores).
@@ -161,12 +164,13 @@ namespace YarnBall::detail {
          * @return @c false when the pool is full and the caller must give the blocks back to the allocator.
          */
         static bool pushBatch(Node *head, std::size_t count) noexcept {
-            std::lock_guard<std::mutex> lk(globalMu);
-            if (globalCount + count > kMaxGlobal) return false;
-            head->nextBatch = globalHead;
+            Shared &g = shared();
+            std::lock_guard<std::mutex> lk(g.mu);
+            if (g.count + count > kMaxGlobal) return false;
+            head->nextBatch = g.head;
             head->count = count;
-            globalHead = head;
-            globalCount += count;
+            g.head = head;
+            g.count += count;
             return true;
         }
 
@@ -230,12 +234,24 @@ namespace YarnBall::detail {
         static thread_local bool tlsDead;
 
         /**
-         * @brief Shared pool. Protected by @c globalMu; touched only on
-         *        batch transfers, not per allocation.
+         * @brief Shared pool. Protected by @c mu; touched only on batch
+         *        transfers, not per allocation.
          */
-        static Node *globalHead;
-        static std::size_t globalCount;
-        static std::mutex globalMu;
+        struct Shared {
+            Node *head = nullptr;
+            std::size_t count = 0;
+            std::mutex mu;
+        };
+
+        /**
+         * @brief The shared pool is built on first use and never destroyed: a block can be freed after static destruction
+         *        has begun (a detached coroutine finishing during exit, a Task that never started held by a static), and
+         *        a destroyed mutex would throw out of a noexcept function. The leak is one small object per slot size.
+         */
+        static Shared &shared() {
+            static Shared *const s = new Shared;
+            return *s;
+        }
     };
 
     template<std::size_t SlotSize, std::size_t Batch>
@@ -247,16 +263,6 @@ namespace YarnBall::detail {
 
     template<std::size_t SlotSize, std::size_t Batch>
     thread_local bool SmallObjectPool<SlotSize, Batch>::tlsDead = false;
-
-    template<std::size_t SlotSize, std::size_t Batch>
-    typename SmallObjectPool<SlotSize, Batch>::Node *
-        SmallObjectPool<SlotSize, Batch>::globalHead = nullptr;
-
-    template<std::size_t SlotSize, std::size_t Batch>
-    std::size_t SmallObjectPool<SlotSize, Batch>::globalCount = 0;
-
-    template<std::size_t SlotSize, std::size_t Batch>
-    std::mutex SmallObjectPool<SlotSize, Batch>::globalMu;
 
 
     /**
@@ -271,6 +277,23 @@ namespace YarnBall::detail {
         return n;
     }
 
+    // Under AddressSanitizer a recycled block would hide a use-after-free, which is exactly what the sanitizer is run to
+    // find, so pooled allocations (frames and the internal ITask wrappers alike) then go straight to the allocator (as they
+    // do with YARN_NO_FRAME_POOL).
+#if defined(YARN_NO_FRAME_POOL) || defined(__SANITIZE_ADDRESS__)
+#  define YARN_FRAME_POOL_DISABLED 1
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define YARN_FRAME_POOL_DISABLED 1
+#  endif
+#endif
+
+    // The pooled and the unpooled paths are interchangeable on purpose. The switch above is decided per translation
+    // unit, while frameAlloc/frameFree and the class-level operators are inline and may be merged across units built
+    // differently, so a block can be allocated by one path and freed by the other. Both therefore take blocks of the
+    // pool's full slot size from malloc and release them with free: a pooled free of an unpooled block (or the reverse)
+    // is then still valid, whichever unit's copy of the code the linker kept.
+
     /**
      * @brief Allocate / deallocate via the pool sized for the given type.
      *        Used by class-level @c operator @c new / @c delete overloads:
@@ -284,12 +307,23 @@ namespace YarnBall::detail {
     inline void *poolAlloc() {
         static_assert(alignof(T) <= alignof(std::max_align_t),
                       "SmallObjectPool does not support over-aligned types");
-        return SmallObjectPool<poolSlotSize<sizeof(T), alignof(T)>()>::allocate();
+        constexpr std::size_t slot = poolSlotSize<sizeof(T), alignof(T)>();
+#ifdef YARN_FRAME_POOL_DISABLED
+        void *p = std::malloc(slot);
+        if (!p) throw std::bad_alloc();
+        return p;
+#else
+        return SmallObjectPool<slot>::allocate();
+#endif
     }
 
     template<typename T>
     inline void poolFree(void *p) noexcept {
+#ifdef YARN_FRAME_POOL_DISABLED
+        std::free(p);
+#else
         SmallObjectPool<poolSlotSize<sizeof(T), alignof(T)>()>::deallocate(p);
+#endif
     }
 
     // ---- Coroutine frames ----------------------------------------------------------------------------------------
@@ -299,15 +333,20 @@ namespace YarnBall::detail {
     template<std::size_t Slot>
     using FramePool = SmallObjectPool<Slot, 64>;
 
-    // Under AddressSanitizer a recycled frame would hide a use-after-free of the frame, which is exactly what the
-    // sanitizer is run to find, so frames then go straight to the allocator (as they do with YARN_NO_FRAME_POOL).
-#if defined(YARN_NO_FRAME_POOL) || defined(__SANITIZE_ADDRESS__)
-#  define YARN_FRAME_POOL_DISABLED 1
-#elif defined(__has_feature)
-#  if __has_feature(address_sanitizer)
-#    define YARN_FRAME_POOL_DISABLED 1
-#  endif
-#endif
+    /// malloc that reports failure the way operator new does.
+    inline void *frameMalloc(std::size_t n) {
+        void *p = std::malloc(n);
+        if (!p) throw std::bad_alloc();
+        return p;
+    }
+
+    /// The size class a frame of @p n bytes is served from (the pool's slot size), or @p n itself above the pooled range.
+    inline std::size_t frameSlotSize(std::size_t n) noexcept {
+        for (std::size_t slot : {64, 96, 128, 192, 256, 384, 512, 768, 1024}) {
+            if (n <= slot) return slot;
+        }
+        return n;
+    }
 
     /**
      * @brief Allocate the frame of a Task coroutine. Frames up to 1 KiB come from the per-size thread-cached pools
@@ -316,7 +355,7 @@ namespace YarnBall::detail {
      */
     inline void *frameAlloc(std::size_t n) {
 #ifdef YARN_FRAME_POOL_DISABLED
-        return ::operator new(n);
+        return frameMalloc(frameSlotSize(n));
 #else
         if (n <= 64) return FramePool<64>::allocate();
         if (n <= 96) return FramePool<96>::allocate();
@@ -327,13 +366,13 @@ namespace YarnBall::detail {
         if (n <= 512) return FramePool<512>::allocate();
         if (n <= 768) return FramePool<768>::allocate();
         if (n <= 1024) return FramePool<1024>::allocate();
-        return ::operator new(n);
+        return frameMalloc(n);
 #endif
     }
 
     inline void frameFree(void *p, std::size_t n) noexcept {
 #ifdef YARN_FRAME_POOL_DISABLED
-        ::operator delete(p);
+        std::free(p);
         (void) n;
 #else
         if (n <= 64) return FramePool<64>::deallocate(p);
@@ -345,7 +384,7 @@ namespace YarnBall::detail {
         if (n <= 512) return FramePool<512>::deallocate(p);
         if (n <= 768) return FramePool<768>::deallocate(p);
         if (n <= 1024) return FramePool<1024>::deallocate(p);
-        ::operator delete(p);
+        std::free(p);
 #endif
     }
 

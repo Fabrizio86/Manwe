@@ -6,13 +6,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 include_directories(${LIB_PATH}/Yarn/includes)
 
-# POSIX: keep -pthread + -fPIC for GCC. Do NOT add -std=c++2a -- CMake's
-# CMAKE_CXX_STANDARD=23 already injects the correct flag, and an explicit
-# -std=c++2a (= C++20) would silently downgrade the standard, breaking
-# AppleClang's libc++ exposure of <stop_token> et al.
-if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-    SET(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pthread -fPIC")
-endif ()
+# Do NOT add -std=c++2a -- CMake's CMAKE_CXX_STANDARD=23 already injects the
+# correct flag, and an explicit -std=c++2a (= C++20) would silently downgrade
+# the standard, breaking AppleClang's libc++ exposure of <stop_token> et al.
+# -pthread comes from Threads::Threads below; -fPIC from CMAKE_POSITION_INDEPENDENT_CODE.
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 
 # MSVC: keep std::min/max from being macroised by Windows headers, allow
@@ -120,5 +118,9 @@ if (YARN_USE_IO_URING OR YARN_IO_URING_SQPOLL)
     if (YARN_IO_URING_SQPOLL)
         target_compile_definitions(Yarn PUBLIC YARN_IO_URING_SQPOLL)
     endif ()
-    target_link_libraries(Yarn PUBLIC ${LIBURING_LIBRARY})
+    # The installed package names the library through Manwe::UringDeps, which its
+    # ManweConfig.cmake locates on the consumer's machine instead of exporting this path.
+    target_link_libraries(Yarn PUBLIC
+            $<BUILD_INTERFACE:${LIBURING_LIBRARY}>
+            $<INSTALL_INTERFACE:Manwe::UringDeps>)
 endif ()

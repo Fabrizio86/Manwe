@@ -47,8 +47,11 @@ namespace Soccer {
         /**
          * @brief Take ownership of an already-connected, non-blocking fd.
          *        Used by @c TcpListener::accept and @c tcpConnect.
+         *
+         * @throws std::bad_alloc when the shared state of the socket slot cannot be
+         *         allocated; @p fd is closed first, so nothing leaks.
          */
-        explicit TcpStream(int fd) noexcept : sock(fd) {
+        explicit TcpStream(int fd) : sock(fd) {
             if (fd >= 0) {
                 detail::suppressSigpipe(fd);
                 detail::setNoDelay(fd);
@@ -58,13 +61,14 @@ namespace Soccer {
         TcpStream(const TcpStream &) = delete;
         TcpStream &operator=(const TcpStream &) = delete;
 
-        TcpStream(TcpStream &&other) noexcept : sock(std::move(other.sock)) {
+        /// Not @c noexcept: the new stream allocates its slot state (@c std::bad_alloc, @p other untouched).
+        TcpStream(TcpStream &&other) : sock(std::move(other.sock)) {
         }
 
         TcpStream &operator=(TcpStream &&other) noexcept {
             if (this != &other) {
                 this->close();
-                this->sock.reset(other.sock.take());
+                this->sock.adopt(other.sock);
             }
             return *this;
         }
@@ -106,7 +110,20 @@ namespace Soccer {
         YarnBall::Task<std::size_t> write(std::span<const std::byte> buf);
 
         /**
+         * @brief Half-close: send FIN after the data already written, keep reading. The peer
+         *        sees EOF on its read side and can still answer; this stream can still
+         *        @c read until the peer closes its own side. A no-op on a closed stream.
+         *        Safe to call from any thread, like @c close().
+         */
+        void shutdownWrite() noexcept;
+
+        /**
          * @brief Close the socket. Idempotent.
+         *
+         * @note Closing a TCP socket that still has unread received data makes the kernel
+         *       answer with a RST instead of a FIN, and the peer may lose data it has not
+         *       read yet. To end a conversation cleanly, @ref shutdownWrite, read until EOF,
+         *       then @c close().
          */
         void close() noexcept;
 
@@ -136,7 +153,9 @@ namespace Soccer {
      *        shutting it down would not wake it on every platform.
      *
      * @throws SocketException on resolution / socket / connect failures, and
-     *         with a message containing "timed out" when @p timeout elapses.
+     *         with a message containing "timed out" when @p timeout elapses. When
+     *         every address failed, the most recent real error (refused, unreachable,
+     *         ...) is the one reported, even if a later address merely timed out.
      */
     YarnBall::Task<TcpStream> tcpConnect(std::string host, std::uint16_t port,
                                          std::chrono::milliseconds timeout = std::chrono::milliseconds{0});

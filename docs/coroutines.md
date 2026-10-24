@@ -300,9 +300,14 @@ auto r = co_await whenAny(std::move(probes));
 std::cout << "fastest mirror: " << r.index << " -> " << r.value;
 ```
 
-The losers keep running on the Yarn pool until their own completion
-(C++ coroutines have no forced cancellation). Pair with a `stop_token`
-if you want them actively shortened.
+Every branch runs in a cancellation scope that is stopped when one wins:
+a loser parked in a cancellable await (I/O, lock, channel, sleep) is woken
+with `CancelledException` and unwinds, and its result is discarded. A loser
+doing plain computation (or parked in a foreign awaitable) cannot be
+interrupted and runs to its natural end. Losers are not joined by default:
+`whenAny` returns as soon as the winner is known, so a loser may still be
+unwinding. Pass `joinLosers` (`whenAny(tasks, joinLosers)`) to resume the
+caller only after every loser has finished.
 
 ### `withTimeout(task, duration)` — race against a clock
 

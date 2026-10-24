@@ -106,10 +106,8 @@ namespace Soccer {
         // rather than using a descriptor number that is about to be reused.
         const int fd = this->sock.take();
         if (fd >= 0) {
-#ifndef _WIN32
             // Wake any coroutine still parked on this fd before it is closed (and the number reused).
             (void) YarnBall::Reactor::instance()->cancelFd(fd);
-#endif
             this->sock.retire(fd);
         }
     }

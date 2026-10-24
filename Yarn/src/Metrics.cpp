@@ -181,8 +181,11 @@ namespace YarnBall::metrics {
             throwNameCollision(name);
         }
         this->checkSuffixCollisionLocked(name, /*isHistogram=*/false);
+        // Make room in the scrape order first: a throw after the emplace would leave a metric that is never scraped.
+        std::string order = name;
+        this->registrationOrder.reserve(this->registrationOrder.size() + 1);
         auto [ins, _] = this->counters.emplace(name, std::make_unique<Counter>(help));
-        this->registrationOrder.push_back(name);
+        this->registrationOrder.push_back(std::move(order));
         return *ins->second;
     }
 
@@ -195,8 +198,11 @@ namespace YarnBall::metrics {
             throwNameCollision(name);
         }
         this->checkSuffixCollisionLocked(name, /*isHistogram=*/false);
+        // Make room in the scrape order first: a throw after the emplace would leave a metric that is never scraped.
+        std::string order = name;
+        this->registrationOrder.reserve(this->registrationOrder.size() + 1);
         auto [ins, _] = this->gauges.emplace(name, std::make_unique<Gauge>(help));
-        this->registrationOrder.push_back(name);
+        this->registrationOrder.push_back(std::move(order));
         return *ins->second;
     }
 
@@ -218,9 +224,12 @@ namespace YarnBall::metrics {
             throwNameCollision(name);
         }
         this->checkSuffixCollisionLocked(name, /*isHistogram=*/true);
+        // Make room in the scrape order first: a throw after the emplace would leave a metric that is never scraped.
+        std::string order = name;
+        this->registrationOrder.reserve(this->registrationOrder.size() + 1);
         auto [ins, _] = this->histograms.emplace(
             name, std::make_unique<Histogram>(std::move(buckets), help));
-        this->registrationOrder.push_back(name);
+        this->registrationOrder.push_back(std::move(order));
         return *ins->second;
     }
 

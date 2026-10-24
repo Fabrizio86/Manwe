@@ -75,6 +75,29 @@ namespace {
         return true;
     }
 
+    /// Runs @p t to completion and raises @p done, so a test can wait for a stopped server to
+    /// have returned instead of sleeping and hoping.
+    YarnBall::Task<void> trackServe(YarnBall::Task<void> t, std::shared_ptr<std::atomic<bool>> done) {
+        try {
+            co_await std::move(t);
+        } catch (...) {
+        }
+        done->store(true);
+        co_return;
+    }
+
+    std::shared_ptr<std::atomic<bool>> spawnTracked(YarnBall::Task<void> t) {
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        YarnBall::coSpawn(trackServe(std::move(t), done));
+        return done;
+    }
+
+    /// Stop a server started with spawnTracked and wait until its serve loop has returned.
+    void stopAndWait(std::stop_source &src, const std::shared_ptr<std::atomic<bool>> &done) {
+        src.request_stop();
+        waitUntil([&] { return done->load(); }, 3s);
+    }
+
 } // namespace
 
 
@@ -154,7 +177,7 @@ TEST(limits_http_server_header_timeout_cuts_off_slowloris) {
     Soccer::HttpServer server("127.0.0.1", 0, o);
     const std::uint16_t port = server.localAddress().port();
     std::stop_source src;
-    YarnBall::coSpawn(server.serve(src.get_token()));
+    auto served = spawnTracked(server.serve(src.get_token()));
 
     const auto start = std::chrono::steady_clock::now();
     // A request head that never finishes.
@@ -164,8 +187,7 @@ TEST(limits_http_server_header_timeout_cuts_off_slowloris) {
     EXPECT_TRUE(took >= 150ms);
     EXPECT_TRUE(took < 4s);
 
-    src.request_stop();
-    std::this_thread::sleep_for(50ms);
+    stopAndWait(src, served);
 }
 
 TEST(limits_http_server_rejects_oversize_headers_and_bodies) {
@@ -180,7 +202,7 @@ TEST(limits_http_server_rejects_oversize_headers_and_bodies) {
     });
     const std::uint16_t port = server.localAddress().port();
     std::stop_source src;
-    YarnBall::coSpawn(server.serve(src.get_token()));
+    auto served = spawnTracked(server.serve(src.get_token()));
 
     // Within limits.
     auto ok = exchange(port, "POST /p HTTP/1.1\r\nHost: x\r\nContent-Length: 4\r\n\r\nabcd");
@@ -194,8 +216,7 @@ TEST(limits_http_server_rejects_oversize_headers_and_bodies) {
     auto many = exchange(port, "POST /p HTTP/1.1\r\nA: 1\r\nB: 2\r\nC: 3\r\n\r\n");
     EXPECT_TRUE(many.rfind("HTTP/1.1 431", 0) == 0);
 
-    src.request_stop();
-    std::this_thread::sleep_for(50ms);
+    stopAndWait(src, served);
 }
 
 TEST(limits_http_server_connection_cap_answers_503) {
@@ -209,22 +230,28 @@ TEST(limits_http_server_connection_cap_answers_503) {
     });
     const std::uint16_t port = server.localAddress().port();
     std::stop_source src;
-    YarnBall::coSpawn(server.serve(src.get_token()));
+    auto served = spawnTracked(server.serve(src.get_token()));
 
     // First connection occupies the only slot and says nothing.
     auto holder = YarnBall::syncWait(Soccer::tcpConnect("127.0.0.1", port));
-    std::this_thread::sleep_for(150ms);
 
-    auto refused = exchange(port, "GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
-    EXPECT_TRUE(refused.rfind("HTTP/1.1 503", 0) == 0);
+    // Until the server has accepted the holder the slot is free and a probe is served (and
+    // gives its slot back); the first refusal means the holder has it.
+    std::string refused;
+    EXPECT_TRUE(waitUntil([&] {
+        refused = exchange(port, "GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+        return refused.rfind("HTTP/1.1 503", 0) == 0;
+    }, 5s));
 
     holder.close();
-    std::this_thread::sleep_for(150ms);
-    auto served = exchange(port, "GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
-    EXPECT_TRUE(served.rfind("HTTP/1.1 200", 0) == 0);
+    // The slot comes back once the server notices the close.
+    std::string answered;
+    EXPECT_TRUE(waitUntil([&] {
+        answered = exchange(port, "GET /x HTTP/1.1\r\nHost: x\r\n\r\n");
+        return answered.rfind("HTTP/1.1 200", 0) == 0;
+    }, 5s));
 
-    src.request_stop();
-    std::this_thread::sleep_for(50ms);
+    stopAndWait(src, served);
 }
 
 
@@ -260,8 +287,13 @@ TEST(limits_http_pool_acquire_live_skips_connections_the_peer_closed) {
     YarnBall::coSpawn(acceptAndDrop(std::move(listener), 1));
 
     Soccer::HttpConnectionPool pool;
-    pool.release("127.0.0.1", port, YarnBall::syncWait(Soccer::tcpConnect("127.0.0.1", port)));
-    std::this_thread::sleep_for(150ms); // let the FIN arrive
+    auto idle = YarnBall::syncWait(Soccer::tcpConnect("127.0.0.1", port));
+    // Wait for the FIN itself (a peek that reads end-of-file) instead of guessing how long it takes.
+    EXPECT_TRUE(waitUntil([&] {
+        char c;
+        return ::recv(idle.fd(), &c, 1, MSG_PEEK) == 0;
+    }, 3s));
+    pool.release("127.0.0.1", port, std::move(idle));
     EXPECT_FALSE(pool.acquireLive("127.0.0.1", port).has_value());
     EXPECT_EQ(pool.idleCount("127.0.0.1", port), static_cast<std::size_t>(0));
 }
@@ -540,7 +572,7 @@ TEST(limits_h2_close_fails_pending_requests_and_stops_the_driver) {
         });
     const std::uint16_t port = server.localAddress().port();
     std::stop_source src;
-    YarnBall::coSpawn(server.serve(src.get_token()));
+    auto served = spawnTracked(server.serve(src.get_token()));
 
     auto conn = std::make_shared<Soccer::Http2Connection>(
         YarnBall::syncWait(Soccer::Http2Connection::connectPlain("127.0.0.1", port)));
@@ -555,8 +587,7 @@ TEST(limits_h2_close_fails_pending_requests_and_stops_the_driver) {
     // And the server noticed: the handler's cancel token fired.
     EXPECT_TRUE(waitUntil([&] { return cancelled->load(); }, 3s));
 
-    src.request_stop();
-    std::this_thread::sleep_for(50ms);
+    stopAndWait(src, served);
 }
 
 namespace {
@@ -647,6 +678,7 @@ namespace {
     struct H2Fixture {
         std::unique_ptr<Soccer::Http2Server> server;
         std::stop_source stop;
+        std::shared_ptr<std::atomic<bool>> served;
         std::uint16_t port = 0;
         explicit H2Fixture(Soccer::Http2ServerOptions o) {
             server = std::make_unique<Soccer::Http2Server>("127.0.0.1", 0, o);
@@ -654,11 +686,10 @@ namespace {
                 co_return Soccer::HttpResponse{};
             });
             port = server->localAddress().port();
-            YarnBall::coSpawn(server->serve(stop.get_token()));
+            served = spawnTracked(server->serve(stop.get_token()));
         }
         ~H2Fixture() {
-            stop.request_stop();
-            std::this_thread::sleep_for(50ms);
+            stopAndWait(stop, served);
         }
     };
 }
@@ -739,10 +770,9 @@ TEST(limits_h2_mixed_case_header_names_are_folded_to_lowercase) {
     });
     const std::uint16_t port = server.localAddress().port();
     std::stop_source src;
-    YarnBall::coSpawn(server.serve(src.get_token()));
+    auto served = spawnTracked(server.serve(src.get_token()));
     EXPECT_EQ(YarnBall::syncWait(YarnBall::withTimeout(h2MixedCaseHeaders(port), 5s)), std::string("1/hello"));
-    src.request_stop();
-    std::this_thread::sleep_for(50ms);
+    stopAndWait(src, served);
 }
 
 namespace {
@@ -764,24 +794,25 @@ TEST(limits_h2_server_enforces_header_count_and_still_serves_normal_requests) {
     });
     const std::uint16_t port = server.localAddress().port();
     std::stop_source src;
-    YarnBall::coSpawn(server.serve(src.get_token()));
+    auto served = spawnTracked(server.serve(src.get_token()));
 
     EXPECT_EQ(YarnBall::syncWait(h2StatusOf(port, "/ok")), 200);
 
     // Five extra headers exceed the cap: the stream is reset, the request fails.
-    bool failed = false;
+    // It must fail because the server reset the stream (ENHANCE_YOUR_CALM), not because
+    // the request timed out or the connection was lost.
+    std::string failure;
     try {
         auto conn = YarnBall::syncWait(Soccer::Http2Connection::connectPlain("127.0.0.1", port));
         std::vector<Soccer::HttpHeader> hs;
         for (int i = 0; i < 6; ++i) hs.push_back({"x-h" + std::to_string(i), "v"});
         (void) YarnBall::syncWait(YarnBall::withTimeout(conn.request("GET", "/ok", hs), 5s));
-    } catch (const std::exception &) {
-        failed = true;
+    } catch (const std::runtime_error &e) {
+        failure = e.what();
     }
-    EXPECT_TRUE(failed);
+    EXPECT_TRUE(failure.find("HTTP/2 stream error") != std::string::npos);
 
-    src.request_stop();
-    std::this_thread::sleep_for(50ms);
+    stopAndWait(src, served);
 }
 #endif
 
@@ -1087,20 +1118,20 @@ namespace {
     struct WsServeFixture {
         std::shared_ptr<WsServeState> state = std::make_shared<WsServeState>();
         std::stop_source stop;
+        std::shared_ptr<std::atomic<bool>> served;
         std::uint16_t port = 0;
         explicit WsServeFixture(Soccer::WsOptions o) {
             auto listener = Soccer::TcpListener::bind("127.0.0.1", 0);
             port = listener.localAddress().port();
             auto st = state;
-            YarnBall::coSpawn(Soccer::wsServe(
+            served = spawnTracked(Soccer::wsServe(
                 std::move(listener),
                 [st](Soccer::WsConnection ws) -> YarnBall::Task<void> { return wsHold(st, std::move(ws)); },
                 std::move(o), stop.get_token()));
         }
         ~WsServeFixture() {
             state->release = true;
-            stop.request_stop();
-            std::this_thread::sleep_for(50ms);
+            stopAndWait(stop, served);
         }
     };
 
@@ -1362,15 +1393,14 @@ TEST(limits_h2_server_trailers_reach_the_client_as_trailers) {
     });
     const std::uint16_t port = server.localAddress().port();
     std::stop_source src;
-    YarnBall::coSpawn(server.serve(src.get_token()));
+    auto served = spawnTracked(server.serve(src.get_token()));
 
     auto conn = YarnBall::syncWait(Soccer::Http2Connection::connectPlain("127.0.0.1", port));
     const auto r = YarnBall::syncWait(YarnBall::withTimeout(conn.request("GET", "/t"), 5s));
     EXPECT_EQ(r.body, std::string("payload"));
     EXPECT_TRUE(hasHeader(r.trailers, "x-checksum"));
     EXPECT_FALSE(hasHeader(r.headers, "x-checksum"));
-    src.request_stop();
-    std::this_thread::sleep_for(50ms);
+    stopAndWait(src, served);
 }
 
 
@@ -1382,6 +1412,7 @@ namespace {
     struct H2CountingServer {
         std::unique_ptr<Soccer::Http2Server> server;
         std::stop_source stop;
+        std::shared_ptr<std::atomic<bool>> served;
         std::shared_ptr<std::atomic<int>> calls = std::make_shared<std::atomic<int>>(0);
         std::uint16_t port = 0;
         explicit H2CountingServer(Soccer::Http2ServerOptions o) {
@@ -1392,11 +1423,10 @@ namespace {
                 co_return Soccer::HttpResponse{};
             });
             port = server->localAddress().port();
-            YarnBall::coSpawn(server->serve(stop.get_token()));
+            served = spawnTracked(server->serve(stop.get_token()));
         }
         ~H2CountingServer() {
-            stop.request_stop();
-            std::this_thread::sleep_for(50ms);
+            stopAndWait(stop, served);
         }
     };
 }

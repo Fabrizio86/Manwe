@@ -60,12 +60,36 @@ namespace {
         return true;
     }
 
+    /// Runs @p t to completion and raises @p done, so a test can wait for a stopped server to
+    /// have returned instead of sleeping and hoping.
+    YarnBall::Task<void> trackServe(YarnBall::Task<void> t, std::shared_ptr<std::atomic<bool>> done) {
+        try {
+            co_await std::move(t);
+        } catch (...) {
+        }
+        done->store(true);
+        co_return;
+    }
+
+    std::shared_ptr<std::atomic<bool>> spawnTracked(YarnBall::Task<void> t) {
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        YarnBall::coSpawn(trackServe(std::move(t), done));
+        return done;
+    }
+
+    /// Stop a server started with spawnTracked and wait until its serve loop has returned.
+    void stopAndWait(std::stop_source &src, const std::shared_ptr<std::atomic<bool>> &done) {
+        src.request_stop();
+        auditWaitUntil([&] { return done->load(); }, 3s);
+    }
+
     bool startsWith(const std::string &s, const char *prefix) { return s.rfind(prefix, 0) == 0; }
 
     /// A running HttpServer with a "/ok" route (GET and POST) and a "/boom" route that throws.
     struct HttpFixture {
         std::unique_ptr<Soccer::HttpServer> server;
         std::stop_source stop;
+        std::shared_ptr<std::atomic<bool>> served;
         std::uint16_t port{0};
         std::shared_ptr<std::atomic<int>> handled = std::make_shared<std::atomic<int>>(0);
 
@@ -90,12 +114,11 @@ namespace {
                 r.headers.push_back({"X-Test", "a\r\nInjected: yes"});
                 co_return r;
             });
-            YarnBall::coSpawn(server->serve(stop.get_token()));
+            served = spawnTracked(server->serve(stop.get_token()));
         }
 
         ~HttpFixture() {
-            stop.request_stop();
-            std::this_thread::sleep_for(30ms);
+            stopAndWait(stop, served);
         }
     };
 
@@ -107,6 +130,9 @@ namespace {
         std::shared_ptr<std::mutex> mu = std::make_shared<std::mutex>();
         std::shared_ptr<std::string> requestHead = std::make_shared<std::string>();
         std::shared_ptr<std::atomic<bool>> release = std::make_shared<std::atomic<bool>>(false);
+        /// Raises `release` when the last copy of this MockHttp goes away, so a test that fails
+        /// an assertion (and unwinds) cannot leave a held connection and its coroutine spinning.
+        std::shared_ptr<void> releaseOnExit;
     };
 
     YarnBall::Task<void> mockHttpOnce(Soccer::TcpListener l, std::string reply, bool hold,
@@ -141,6 +167,7 @@ namespace {
         auto l = Soccer::TcpListener::bind("127.0.0.1", 0);
         MockHttp m;
         m.port = l.localAddress().port();
+        m.releaseOnExit = std::shared_ptr<void>(nullptr, [r = m.release](void *) { r->store(true); });
         YarnBall::coSpawn(mockHttpOnce(std::move(l), std::move(reply), hold, m.mu, m.requestHead, m.release));
         return m;
     }
@@ -266,7 +293,7 @@ TEST(audit_http_server_second_serve_throws_and_default_connection_cap_is_finite)
     Soccer::HttpServer server("127.0.0.1", 0);
     EXPECT_TRUE(Soccer::HttpServerOptions{}.maxConnections > 0);
     std::stop_source src;
-    YarnBall::coSpawn(server.serve(src.get_token()));
+    auto served = spawnTracked(server.serve(src.get_token()));
     bool threw = false;
     try {
         (void) server.serve(src.get_token());
@@ -274,8 +301,7 @@ TEST(audit_http_server_second_serve_throws_and_default_connection_cap_is_finite)
         threw = true;
     }
     EXPECT_TRUE(threw);
-    src.request_stop();
-    std::this_thread::sleep_for(30ms);
+    stopAndWait(src, served);
 }
 
 
@@ -352,15 +378,23 @@ TEST(audit_http_client_response_body_timeout_fires) {
     const auto oldHeader = Soccer::HttpClient::responseHeaderTimeout();
     const auto oldBody = Soccer::HttpClient::responseBodyTimeout();
     Soccer::HttpClient::setResponseTimeouts(5s, 300ms);
-    bool threw = false;
+    // The body deadline must be what ends it: a timeout error, and well before the header limit.
+    const auto start = std::chrono::steady_clock::now();
+    bool timedOut = false;
+    std::string other;
     try {
         (void) clientGet(m.port, "/");
-    } catch (const std::exception &) {
-        threw = true;
+    } catch (const Soccer::SocketException &e) {
+        timedOut = std::string(e.what()).find("timed out") != std::string::npos;
+        if (!timedOut) other = e.what();
+    } catch (const std::exception &e) {
+        other = e.what();
     }
     Soccer::HttpClient::setResponseTimeouts(oldHeader, oldBody);
     m.release->store(true);
-    EXPECT_TRUE(threw);
+    EXPECT_TRUE(timedOut);
+    EXPECT_EQ(other, std::string());
+    EXPECT_TRUE(std::chrono::steady_clock::now() - start < 4s);
 }
 
 TEST(audit_http_client_refuses_injection_in_target_host_and_header_names) {
@@ -412,13 +446,19 @@ TEST(audit_http_connection_pool_drops_empty_host_entries) {
     };
     YarnBall::coSpawn(holder(std::move(listener), stop));
     auto s = YarnBall::syncWait(Soccer::tcpConnect("127.0.0.1", port));
+    // Raised however the test ends, so the holder coroutine never outlives it.
+    const std::shared_ptr<void> stopOnExit(nullptr, [stop](void *) { stop->store(true); });
     pool.release("127.0.0.1", port, std::move(s));
     EXPECT_EQ(pool.idleCount("127.0.0.1", port), static_cast<std::size_t>(1));
+    EXPECT_EQ(pool.hostCount(), static_cast<std::size_t>(1));
     auto taken = pool.acquire("127.0.0.1", port);
     EXPECT_TRUE(taken.has_value());
     EXPECT_EQ(pool.idleCount("127.0.0.1", port), static_cast<std::size_t>(0));
+    // idleCount reads 0 for a missing host and for an emptied one alike; the table itself
+    // must have dropped the entry (a host with nothing idle keeps none).
+    EXPECT_EQ(pool.hostCount(), static_cast<std::size_t>(0));
     EXPECT_FALSE(pool.acquire("127.0.0.1", port).has_value());
-    stop->store(true);
+    EXPECT_EQ(pool.hostCount(), static_cast<std::size_t>(0));
 }
 
 
@@ -437,6 +477,7 @@ namespace {
     struct WsFixture {
         std::uint16_t port{0};
         std::stop_source stop;
+        std::shared_ptr<std::atomic<bool>> served;
         std::shared_ptr<std::mutex> mu = std::make_shared<std::mutex>();
         std::shared_ptr<Soccer::WsHandshakeInfo> seen = std::make_shared<Soccer::WsHandshakeInfo>();
         std::shared_ptr<std::atomic<bool>> connected = std::make_shared<std::atomic<bool>>(false);
@@ -464,12 +505,11 @@ namespace {
                     co_return;
                 };
             }
-            YarnBall::coSpawn(Soccer::wsServe(std::move(l), std::move(handler), std::move(opts), stop.get_token()));
+            served = spawnTracked(Soccer::wsServe(std::move(l), std::move(handler), std::move(opts), stop.get_token()));
         }
 
         ~WsFixture() {
-            stop.request_stop();
-            std::this_thread::sleep_for(30ms);
+            stopAndWait(stop, served);
         }
     };
 
@@ -839,6 +879,26 @@ TEST(audit_ws_defaults_are_finite) {
     EXPECT_TRUE(o.maxConnections > 0);
     EXPECT_TRUE(o.idleTimeout.count() > 0);
     EXPECT_FALSE(o.strictOrigin); // documented: default stays backwards compatible
+
+    // The idle limit is enforced, not just declared: a client that upgrades and then says
+    // nothing is dropped by the server once it passes.
+    o.idleTimeout = 300ms;
+    WsFixture f(o);
+    auto raw = YarnBall::syncWait(YarnBall::withTimeout(rawWsConnect(f.port, wsRequest()), 8s));
+    EXPECT_TRUE(startsWith(raw.head, "HTTP/1.1 101"));
+    const auto start = std::chrono::steady_clock::now();
+    std::array<std::byte, 64> buf{};
+    std::size_t n = 1;
+    try {
+        n = YarnBall::syncWait(YarnBall::withTimeout(raw.stream.read(buf), 5s));
+    } catch (const Soccer::SocketException &) {
+        n = 0;
+    }
+    // Either a Close frame or plain EOF, but only after the limit and well before the test's.
+    (void) n;
+    const auto took = std::chrono::steady_clock::now() - start;
+    EXPECT_TRUE(took >= 200ms);
+    EXPECT_TRUE(took < 4s);
 }
 
 
@@ -852,6 +912,7 @@ namespace {
     struct H1Fixture2 {
         std::unique_ptr<Soccer::HttpServer> server;
         std::stop_source stop;
+        std::shared_ptr<std::atomic<bool>> served;
         std::uint16_t port{0};
 
         H1Fixture2() {
@@ -893,12 +954,11 @@ namespace {
                 r.body = req.body;
                 co_return r;
             });
-            YarnBall::coSpawn(server->serve(stop.get_token()));
+            served = spawnTracked(server->serve(stop.get_token()));
         }
 
         ~H1Fixture2() {
-            stop.request_stop();
-            std::this_thread::sleep_for(30ms);
+            stopAndWait(stop, served);
         }
     };
 
@@ -1110,6 +1170,7 @@ namespace {
     struct H2Fixture {
         std::unique_ptr<Soccer::Http2Server> server;
         std::stop_source stop;
+        std::shared_ptr<std::atomic<bool>> served;
         std::uint16_t port{0};
 
         explicit H2Fixture(const std::function<void(Soccer::Http2Server &)> &setup,
@@ -1117,12 +1178,11 @@ namespace {
             server = std::make_unique<Soccer::Http2Server>("127.0.0.1", 0, o);
             port = server->localAddress().port();
             setup(*server);
-            YarnBall::coSpawn(server->serve(stop.get_token()));
+            served = spawnTracked(server->serve(stop.get_token()));
         }
 
         ~H2Fixture() {
-            stop.request_stop();
-            std::this_thread::sleep_for(30ms);
+            stopAndWait(stop, served);
         }
     };
 
@@ -1208,7 +1268,7 @@ TEST(audit_h2_server_route_snapshot_and_single_serve) {
         co_return r;
     });
     std::stop_source src;
-    YarnBall::coSpawn(server.serve(src.get_token()));
+    auto served = spawnTracked(server.serve(src.get_token()));
     // Registered after serve(): the running server works from its snapshot and never sees it.
     server.route("GET", "/late", [](Soccer::HttpRequest) -> YarnBall::Task<Soccer::HttpResponse> {
         Soccer::HttpResponse r;
@@ -1224,8 +1284,7 @@ TEST(audit_h2_server_route_snapshot_and_single_serve) {
         threw = true;
     }
     EXPECT_TRUE(threw);
-    src.request_stop();
-    std::this_thread::sleep_for(30ms);
+    stopAndWait(src, served);
     EXPECT_TRUE(Soccer::Http2ServerOptions{}.maxConnections > 0);
     EXPECT_TRUE(Soccer::Http2ServerOptions{}.idleTimeout.count() > 0);
 }
@@ -1301,7 +1360,33 @@ TEST(audit_h2_client_close_with_queued_and_inflight_requests_is_safe) {
     EXPECT_TRUE(auditWaitUntil([&] { return done->load() == 4; }, 5s));
 }
 
+namespace {
+    /// Plain listeners that never accept: an h2c connect to one completes in the kernel and the
+    /// connection stays open, which is all the pool needs to count it as live.
+    YarnBall::Task<std::size_t> h2PoolFill(Soccer::Http2ConnectionPool &pool,
+                                           const std::vector<std::uint16_t> &ports,
+                                           std::vector<std::shared_ptr<Soccer::Http2Connection>> &got) {
+        for (const auto p : ports) got.push_back(co_await pool.acquirePlain("127.0.0.1", p));
+        co_return pool.size();
+    }
+}
+
 TEST(audit_h2_connection_pool_stays_bounded) {
+    constexpr std::size_t kCap = 3;
+    Soccer::Http2ConnectionPool pool(kCap);
+    std::vector<Soccer::TcpListener> listeners;
+    std::vector<std::uint16_t> ports;
+    for (int i = 0; i < 6; ++i) {
+        listeners.push_back(Soccer::TcpListener::bind("127.0.0.1", 0));
+        ports.push_back(listeners.back().localAddress().port());
+    }
+    std::vector<std::shared_ptr<Soccer::Http2Connection>> got;
+    const std::size_t size = YarnBall::syncWait(YarnBall::withTimeout(h2PoolFill(pool, ports, got), 10s));
+    // Six live hosts, room for three: the rest are handed back uncached.
+    EXPECT_EQ(got.size(), static_cast<std::size_t>(6));
+    EXPECT_EQ(size, kCap);
+    EXPECT_EQ(pool.size(), kCap);
+    for (const auto &c : got) EXPECT_TRUE(static_cast<bool>(c));
     EXPECT_TRUE(Soccer::Http2ConnectionPool::kMaxEntries > 0);
 }
 

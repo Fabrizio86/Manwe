@@ -13,6 +13,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <string>
 #include <thread>
 
 #include <fcntl.h>
@@ -172,6 +173,32 @@ TEST(audit_embedded_serial_port_close_racing_a_wake_never_closes_an_unrelated_de
         ::close(other);
         ::tcflush(pty.master, TCIOFLUSH);
     }
+}
+
+TEST(audit_embedded_serial_port_accepts_the_standard_low_baud_rates) {
+    // A pseudo-terminal may refuse to take the speed (the open then fails on the read-back check), but it must never
+    // be reported as an unsupported rate: that message means the rate has no termios constant mapped.
+    for (const int rate : {50, 75, 110, 134, 150, 200, 300, 600}) {
+        Pty pty;
+        (void) ::ioctl(pty.slave, TIOCNXCL);
+        Embedded::SerialConfig cfg;
+        cfg.baudRate = rate;
+        try {
+            auto port = Embedded::SerialPort::open(pty.name, cfg);
+        } catch (const Embedded::SerialPortError &e) {
+            EXPECT_TRUE(std::string(e.what()).find("unsupported baud") == std::string::npos);
+        }
+    }
+    Pty pty;
+    Embedded::SerialConfig bad;
+    bad.baudRate = 12345;
+    bool threw = false;
+    try {
+        auto port = Embedded::SerialPort::open(pty.name, bad);
+    } catch (const Embedded::SerialPortError &e) {
+        threw = std::string(e.what()).find("unsupported baud") != std::string::npos;
+    }
+    EXPECT_TRUE(threw);
 }
 
 #endif // !_WIN32

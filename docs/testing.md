@@ -144,8 +144,8 @@ for i in $(seq 1 10); do ./bin/YarnTests 2>&1 | tail -1; done
 
 ### What "passing" means
 
-**157 cases declared, 155 enabled on macOS/Linux with TLS+nghttp2.**
-The other two are platform-conditional: `http2_stub_throws_not_implemented`
+**Every case is enabled on the macOS/Linux reference build with TLS+nghttp2.**
+A few cases are platform-conditional: `http2_stub_throws_not_implemented`
 runs only on builds without nghttp2, and `soccer_overlapped_tcp_round_trip`
 runs only on Windows. Coverage:
 
@@ -213,5 +213,5 @@ runs only on Windows. Coverage:
   promise-carrier propagation to descendants, thread-local Scope
   install/restore.
 
-Every commit should keep all enabled cases green (155 on the
-macOS/Linux+TLS+nghttp2 reference build).
+Every commit should keep all enabled cases green on the
+macOS/Linux+TLS+nghttp2 reference build.

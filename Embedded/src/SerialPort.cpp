@@ -57,27 +57,86 @@ namespace Embedded {
          * @brief Map an integer baud rate to the corresponding termios
          *        @c B* constant. Returns @c 0 (B0) if the rate is not
          *        supported on this platform. Hardware drivers vary in
-         *        which rates they expose; the common range below is
-         *        accepted on both macOS and Linux.
+         *        which rates they expose; every standard POSIX
+         *        @c B* constant the platform defines is accepted (the
+         *        rates from 1200 to 230400 everywhere, the rest where
+         *        <termios.h> provides them).
          */
         speed_t mapBaud(int baudRate) {
             switch (baudRate) {
-                case 1200:   return B1200;
-                case 1800:   return B1800;
-                case 2400:   return B2400;
-                case 4800:   return B4800;
-                case 9600:   return B9600;
-                case 19200:  return B19200;
-                case 38400:  return B38400;
-                case 57600:  return B57600;
-                case 115200: return B115200;
-                case 230400: return B230400;
+#define SERIAL_BAUD_CASE(rate) \
+                case rate: return B##rate;
+#ifdef B50
+                SERIAL_BAUD_CASE(50)
+#endif
+#ifdef B75
+                SERIAL_BAUD_CASE(75)
+#endif
+#ifdef B110
+                SERIAL_BAUD_CASE(110)
+#endif
+#ifdef B134
+                SERIAL_BAUD_CASE(134)
+#endif
+#ifdef B150
+                SERIAL_BAUD_CASE(150)
+#endif
+#ifdef B200
+                SERIAL_BAUD_CASE(200)
+#endif
+#ifdef B300
+                SERIAL_BAUD_CASE(300)
+#endif
+#ifdef B600
+                SERIAL_BAUD_CASE(600)
+#endif
+                SERIAL_BAUD_CASE(1200)
+                SERIAL_BAUD_CASE(1800)
+                SERIAL_BAUD_CASE(2400)
+                SERIAL_BAUD_CASE(4800)
+                SERIAL_BAUD_CASE(9600)
+                SERIAL_BAUD_CASE(19200)
+                SERIAL_BAUD_CASE(38400)
+                SERIAL_BAUD_CASE(57600)
+                SERIAL_BAUD_CASE(115200)
+                SERIAL_BAUD_CASE(230400)
 #ifdef B460800
-                case 460800: return B460800;
+                SERIAL_BAUD_CASE(460800)
+#endif
+#ifdef B500000
+                SERIAL_BAUD_CASE(500000)
+#endif
+#ifdef B576000
+                SERIAL_BAUD_CASE(576000)
 #endif
 #ifdef B921600
-                case 921600: return B921600;
+                SERIAL_BAUD_CASE(921600)
 #endif
+#ifdef B1000000
+                SERIAL_BAUD_CASE(1000000)
+#endif
+#ifdef B1152000
+                SERIAL_BAUD_CASE(1152000)
+#endif
+#ifdef B1500000
+                SERIAL_BAUD_CASE(1500000)
+#endif
+#ifdef B2000000
+                SERIAL_BAUD_CASE(2000000)
+#endif
+#ifdef B2500000
+                SERIAL_BAUD_CASE(2500000)
+#endif
+#ifdef B3000000
+                SERIAL_BAUD_CASE(3000000)
+#endif
+#ifdef B3500000
+                SERIAL_BAUD_CASE(3500000)
+#endif
+#ifdef B4000000
+                SERIAL_BAUD_CASE(4000000)
+#endif
+#undef SERIAL_BAUD_CASE
                 default: return B0;
             }
         }

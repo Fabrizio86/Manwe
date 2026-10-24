@@ -136,8 +136,13 @@ namespace YarnBall {
             void expire() noexcept {
                 if (this->finished.exchange(true, std::memory_order_acq_rel)) return;
                 this->stop.request_stop();
+                // A dead event loop fires every timer at once (see Reactor::registerTimer): that is not a timeout, and
+                // sleepFor reports it as ReactorError too.
+                const std::exception_ptr outcome = Reactor::instance()->isDead()
+                    ? std::make_exception_ptr(ReactorError{})
+                    : std::make_exception_ptr(TimeoutException());
                 if (!this->join) {
-                    this->exception = std::make_exception_ptr(TimeoutException());
+                    this->exception = outcome;
                     this->publishAndWake();
                     return;
                 }
@@ -145,7 +150,7 @@ namespace YarnBall {
                 std::coroutine_handle<> w;
                 {
                     std::lock_guard<std::mutex> lk(this->mu);
-                    this->exception = std::make_exception_ptr(TimeoutException());
+                    this->exception = outcome;
                     this->timeoutRecorded = true;
                     if (this->runnerDone) {
                         this->published = true;
@@ -176,6 +181,10 @@ namespace YarnBall {
                     this->exception = std::move(ex);
                     std::lock_guard<std::mutex> lk(this->mu);
                     this->published = true;
+                } else if (this->join) {
+                    // The timer won before the spawn failed and expire() is waiting for the runner, which will never
+                    // run: report it gone so the recorded outcome is published.
+                    this->runnerFinishedLate();
                 }
                 this->cancelTimer();
             }
@@ -240,9 +249,8 @@ namespace YarnBall {
             } catch (...) {
                 error = std::current_exception();
             }
-            if (state->finished.exchange(true, std::memory_order_acq_rel)) {
-                if (state->join) state->runnerFinishedLate();
-            } else {
+            const bool won = !state->finished.exchange(true, std::memory_order_acq_rel);
+            if (won) {
                 state->cancelTimer();
                 if (error) {
                     state->exception = error;
@@ -253,7 +261,15 @@ namespace YarnBall {
                         state->exception = std::current_exception();
                     }
                 }
+            }
+            // What this runner still holds dies before the caller can be resumed (a joined timeout promises the task is
+            // gone, its result included, when withTimeout returns).
+            value.reset();
+            error = nullptr;
+            if (won) {
                 state->publishAndWake();
+            } else if (state->join) {
+                state->runnerFinishedLate();
             }
             co_return;
         }
@@ -281,6 +297,8 @@ namespace YarnBall {
             }
 
             void fire() noexcept {
+                // A dead event loop fires every timer at once (see Reactor::registerTimer): that is not a deadline.
+                if (Reactor::instance()->isDead()) return;
                 if (!this->cancelled.load(std::memory_order_seq_cst)) this->src.request_stop();
             }
 
@@ -315,7 +333,7 @@ namespace YarnBall {
                 // The timer goes in first: a task that finishes at once then finds it to take back.
                 auto timer = makeTimerCb(state, &expireTimeout, state.get());
                 state->timer = timer.h;
-                Reactor::instance()->registerTimer(std::chrono::duration_cast<std::chrono::nanoseconds>(duration), timer.h);
+                Reactor::instance()->registerTimer(detail::toNanos(duration), timer.h);
                 coSpawn(timeoutRunner<T>(state, std::move(task), traceCtx));
             } catch (...) {
                 state->failSpawn(std::current_exception());
@@ -393,8 +411,14 @@ namespace YarnBall {
      * @p duration even if the returned token is dropped at once, so for
      * long durations that are usually abandoned early, pass @p cancel.)
      *
-     * @note Needs a running Yarn pool and Reactor; throws @c std::bad_alloc if
-     *       the timer cannot be allocated.
+     * @note Needs a running Yarn pool and Reactor. Throws @c std::bad_alloc if
+     *       the timer's own frame cannot be allocated. If the Reactor's loop
+     *       is dead (@ref Reactor::isDead), registering the timer fires it at
+     *       once and the token is left unsignalled rather than reporting a
+     *       deadline that did not elapse (so on a dead loop a deadline never
+     *       passes). If instead its timer table cannot grow (out of memory),
+     *       that same immediate fire does signal the token early. A
+     *       @p duration beyond the nanosecond range saturates.
      */
     template<typename Rep, typename Period>
     std::stop_token deadlineToken(std::chrono::duration<Rep, Period> duration,
@@ -407,7 +431,7 @@ namespace YarnBall {
             core->withdraw.emplace(std::move(cancel),
                                    detail::CancelThunk{&detail::DeadlineCore::onWithdraw, core.get()});
         }
-        Reactor::instance()->registerTimer(std::chrono::duration_cast<std::chrono::nanoseconds>(duration), timer.h);
+        Reactor::instance()->registerTimer(detail::toNanos(duration), timer.h);
         // A withdrawal that landed before the timer was registered found nothing to take back: redo it now.
         if (core->cancelled.load(std::memory_order_seq_cst)) core->cancelTimer();
         return token;

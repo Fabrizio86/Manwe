@@ -80,12 +80,12 @@ namespace Soccer {
 
             void add(std::shared_ptr<DeadlineGuard> g, int fd,
                      std::chrono::steady_clock::time_point when,
-                     SocketSlot::Watch watch = {}) {
+                     SocketSlot::Watch watch = {}, bool viaWatch = false) {
                 bool spawn = false;
                 const DeadlineGuard *mine = g.get();
                 {
                     std::lock_guard<std::mutex> lk(this->mu);
-                    this->entries.push_back(Entry{std::move(g), fd, when, std::move(watch)});
+                    this->entries.push_back(Entry{std::move(g), fd, when, std::move(watch), viaWatch});
                     if (!this->running) {
                         this->running = true;
                         spawn = true;
@@ -113,7 +113,8 @@ namespace Soccer {
                 std::shared_ptr<DeadlineGuard> g;
                 int fd;
                 std::chrono::steady_clock::time_point when;
-                SocketSlot::Watch watch; ///< empty for a raw fd
+                SocketSlot::Watch watch; ///< the owner's slot, for an entry armed through a stream
+                bool viaWatch;           ///< armed through @ref watch: the raw fd is never touched directly
             };
 
             static YarnBall::Task<void> sweepLoop() {
@@ -136,12 +137,20 @@ namespace Soccer {
                         std::lock_guard<std::mutex> gl(e.g->mu);
                         if (e.g->over) {
                             drop = true;
+                        } else if (e.viaWatch && !e.watch) {
+                            // The stream that owned the slot is gone (destroyed, or moved from and then destroyed): its
+                            // descriptor was closed, and the number may belong to another connection by now.
+                            drop = true;
                         } else if (e.when <= now) {
-                            e.g->fired.store(true, std::memory_order_release);
-                            // Wakes the parked wait; the operation then fails. Through the slot when we
-                            // have one, so a descriptor the owner already closed is left alone.
-                            if (e.watch) (void) e.watch.shutdownIf(e.fd);
-                            else shutdownSocket(e.fd);
+                            // Wakes the parked wait; the operation then fails. An entry armed through a stream acts
+                            // only via its slot, which shuts the descriptor down while the slot still owns it and
+                            // leaves a closed or replaced one alone; it never falls back to the raw number.
+                            if (e.viaWatch) {
+                                if (e.watch.shutdownIf(e.fd)) e.g->fired.store(true, std::memory_order_release);
+                            } else {
+                                e.g->fired.store(true, std::memory_order_release);
+                                shutdownSocket(e.fd);
+                            }
                             drop = true;
                         }
                     }
@@ -214,7 +223,7 @@ namespace Soccer {
             this->guard = std::make_shared<detail::DeadlineGuard>();
             try {
                 detail::DeadlineSweeper::instance().add(
-                    this->guard, fd, std::chrono::steady_clock::now() + limit);
+                    this->guard, fd, detail::deadlineAfter(limit));
             } catch (...) {
                 this->guard.reset(); // nothing armed
                 throw;
@@ -229,7 +238,7 @@ namespace Soccer {
             this->guard = std::make_shared<detail::DeadlineGuard>();
             try {
                 detail::DeadlineSweeper::instance().add(
-                    this->guard, fd, std::chrono::steady_clock::now() + limit, s.slot().watch());
+                    this->guard, fd, detail::deadlineAfter(limit), s.slot().watch(), true);
             } catch (...) {
                 this->guard.reset();
                 throw;

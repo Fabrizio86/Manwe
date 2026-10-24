@@ -323,7 +323,7 @@ namespace Soccer {
          *
          * Standard codes: 1000 normal, 1001 going away, 1002 protocol
          * error, 1003 unsupported data, 1008 policy violation,
-         * 1011 internal error.
+         * 1011 internal error, 1012 service restart, 1013 try again later.
          */
         YarnBall::Task<void> close(std::uint16_t code = 1000,
                                     std::string_view reason = "");

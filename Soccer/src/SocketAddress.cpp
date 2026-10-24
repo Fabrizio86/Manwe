@@ -77,10 +77,14 @@ namespace Soccer {
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = 0; // caller picks the protocol
         hints.ai_flags = AI_ADDRCONFIG;
+        // An empty host is the null node: the wildcard address (what bind expects), the same on every
+        // libc, instead of whatever "" happens to mean to this one.
+        const char *node = host.empty() ? nullptr : host.c_str();
+        if (host.empty()) hints.ai_flags |= AI_PASSIVE;
 
         const std::string port_str = std::to_string(port);
         addrinfo *results = nullptr;
-        int rc = ::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &results);
+        int rc = ::getaddrinfo(node, port_str.c_str(), &hints, &results);
         if ((rc != 0 || results == nullptr) && addrConfigMayHaveHiddenIt(host, rc)) {
             // AI_ADDRCONFIG hides every family the host has no non-loopback
             // address for, which makes even "localhost" unresolvable on a machine
@@ -89,8 +93,8 @@ namespace Soccer {
             // literal) and only for the errors it causes: any other failure, a name
             // that simply does not exist, would just pay for a second full lookup.
             if (results) { ::freeaddrinfo(results); results = nullptr; }
-            hints.ai_flags = 0;
-            rc = ::getaddrinfo(host.c_str(), port_str.c_str(), &hints, &results);
+            hints.ai_flags = host.empty() ? AI_PASSIVE : 0;
+            rc = ::getaddrinfo(node, port_str.c_str(), &hints, &results);
         }
         if (rc != 0 || results == nullptr) {
             // gai_strerror exists on both POSIX and Windows (via ws2tcpip.h);
@@ -155,9 +159,15 @@ namespace Soccer {
                                          : 0;
             const std::size_t room = std::min<std::size_t>(have, sizeof(un->sun_path));
             if (room == 0) return "";                              // unnamed (e.g. an unbound client)
+#if defined(__linux__)
             if (un->sun_path[0] == '\0') {                         // Linux abstract namespace
                 return "@" + std::string(un->sun_path + 1, room - 1);
             }
+#else
+            // No abstract namespace here: a leading NUL is an empty path, i.e. an unnamed peer (macOS
+            // reports an unbound client as a full-size sockaddr_un with a zeroed sun_path).
+            if (un->sun_path[0] == '\0') return "";
+#endif
             return std::string(un->sun_path, ::strnlen(un->sun_path, room));
         }
         return "<unknown>";

@@ -11,10 +11,12 @@
 //     ./http2_get <host> <port> <path>         # h2c GET path
 //     ./http2_get tls <host> <port> <path>     # h2 over TLS
 //
-// Requires Soccer built with nghttp2 (SOCCER_HAS_HTTP2). Run with
-// no nghttp2 and you get a clean Http2NotImplemented at startup.
+// Requires Soccer built with nghttp2 (SOCCER_HAS_HTTP2); without it the
+// program prints a message and exits with status 1. Both modes print the
+// status, the headers and the first 1 KiB of the body.
 //
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
@@ -29,6 +31,13 @@
 namespace {
 
 #ifdef SOCCER_HAS_HTTP2
+    /// Print at most the first 1 KiB of @p body, noting how much was left out.
+    void printBody(const std::string &body) {
+        constexpr std::size_t limit = 1024;
+        std::cout << "\n" << body.substr(0, limit) << "\n";
+        if (body.size() > limit) std::cout << "... (" << (body.size() - limit) << " more bytes not shown)\n";
+    }
+
     YarnBall::Task<int> doH2c(std::string host, std::uint16_t port, std::string path) {
         try {
             auto conn = co_await Soccer::Http2Connection::connectPlain(host, port);
@@ -37,7 +46,7 @@ namespace {
             for (const auto &h : resp.headers) {
                 std::cout << h.name << ": " << h.value << "\n";
             }
-            std::cout << "\n" << resp.body << "\n";
+            printBody(resp.body);
             co_return 0;
         } catch (const std::exception &e) {
             std::cerr << "http2_get error: " << e.what() << "\n";
@@ -67,7 +76,7 @@ namespace {
             for (const auto &h : resp.headers) {
                 std::cout << h.name << ": " << h.value << "\n";
             }
-            std::cout << "\n" << resp.body.substr(0, 1024) << "\n";
+            printBody(resp.body);
             co_return 0;
         } catch (const std::exception &e) {
             std::cerr << "http2_get error: " << e.what() << "\n";
