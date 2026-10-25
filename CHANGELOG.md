@@ -6,6 +6,8 @@ to [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-10-25
+
 ### Changed
 - **`Telegraph::Signal::emit` / `emitAsync` no longer copy the handler list.** The list is
   copy-on-write behind a `shared_ptr`, so an emission only copies one pointer under the lock
