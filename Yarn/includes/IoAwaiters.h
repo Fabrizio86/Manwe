@@ -54,11 +54,12 @@ namespace YarnBall::io {
             bool await_ready() const noexcept { return false; }
 
             template<typename Promise>
-            bool await_suspend(std::coroutine_handle<Promise> h) noexcept {
+            bool await_suspend(std::coroutine_handle<Promise> h) {
                 YarnBall::detail::TaskPromiseCore *core = YarnBall::detail::CancelBinding::ambient(h);
                 if (!core) {
-                    this->armed = true;
+                    // The proxy frame is allocated here; a failure surfaces at the co_await with nothing registered.
                     this->handle = this->proxy.publish(h);
+                    this->armed = true;
                     this->registerWait(this->handle);
                     return true;
                 }

@@ -26,7 +26,7 @@ set(EMBEDDED_HEADERS
         includes/FdSlot.h
 )
 
-add_library(Embedded ${EMBEDDED_SOURCES} ${EMBEDDED_HEADERS})
+add_library(Embedded STATIC ${EMBEDDED_SOURCES} ${EMBEDDED_HEADERS})
 
 target_include_directories(Embedded PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/includes>

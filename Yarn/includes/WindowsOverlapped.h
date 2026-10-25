@@ -52,9 +52,10 @@ namespace YarnBall {
         DWORD bytes = 0;
 
         /**
-         * @brief Win32 error from the completion (0 on success, otherwise
-         *        the value the kernel placed in @c Internal converted via
-         *        @c HRESULT_FROM_NT). The awaiter inspects this on resume.
+         * @brief Error from the completion (0 on success). Win32 socket errors
+         *        are mapped to their Winsock codes (ERROR_NETNAME_DELETED
+         *        becomes WSAECONNRESET, ...), so it reads like the code of the
+         *        readiness path. The awaiter inspects this on resume.
          */
         int err = 0;
 

@@ -216,8 +216,15 @@ namespace Soccer {
             pfd.events = POLLOUT;
             return ::poll(&pfd, 1, 0) > 0 || ::poll(&pfd, 1, 1) > 0;
 #else
-            (void) fd;
-            return false;
+            // A refused connect shows up in the except set, and on older Windows not in a readiness poll at all.
+            fd_set wr, ex;
+            FD_ZERO(&wr);
+            FD_ZERO(&ex);
+            const SOCKET sk = detail::toSocket(fd);
+            FD_SET(sk, &wr);
+            FD_SET(sk, &ex);
+            timeval tv{0, 1000};
+            return ::select(0, nullptr, &wr, &ex, &tv) > 0;
 #endif
         }
 
@@ -256,11 +263,30 @@ namespace Soccer {
                 // EINPROGRESS / WSAEWOULDBLOCK: wait for writability, then
                 // check SO_ERROR to see whether the handshake completed.
                 if (!connectSettled(fd)) {
+#ifdef _WIN32
+                    // Waited in slices, each ending in a look at the except set (see connectSettled), so a
+                    // failed connect that the readiness poll never reports does not park this forever.
+                    const auto until = std::chrono::steady_clock::now() + (limit.count() > 0 ? limit : std::chrono::hours{24 * 365});
+                    while (!connectSettled(fd)) {
+                        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                until - std::chrono::steady_clock::now());
+                        if (left.count() <= 0) throw YarnBall::TimeoutException("connect timed out");
+                        bool expired = false;
+                        try {
+                            co_await YarnBall::withTimeout(waitConnectWritable(fd),
+                                                           std::min(left, std::chrono::milliseconds{200}));
+                        } catch (const YarnBall::TimeoutException &) {
+                            expired = true;
+                        }
+                        if (!expired) break;
+                    }
+#else
                     if (limit.count() > 0) {
                         co_await YarnBall::withTimeout(waitConnectWritable(fd), limit);
                     } else {
                         co_await YarnBall::io::waitWritable(fd);
                     }
+#endif
                 }
                 int sockerr = 0;
                 socklen_t errlen = sizeof(sockerr);

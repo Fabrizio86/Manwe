@@ -11,23 +11,36 @@
 #include <mutex>
 #include <new>
 
+#ifdef _WIN32
+#  include <malloc.h>
+#endif
+
 namespace YarnBall::detail {
 
     // GCC never calls an aligned operator new for a coroutine frame: it always asks the plain one, so a frame holding an
     // over-aligned local across a suspension would be only 16-byte aligned. Frames are therefore given cache-line (64
     // byte) alignment on GCC, which covers alignas(64) and below; Clang requests the exact alignment itself.
-#if defined(__GNUC__) && !defined(__clang__) && !defined(_WIN32)
+#if defined(__GNUC__) && !defined(__clang__)
 #  define YARN_FRAME_ALIGN64 1
 #else
 #  define YARN_FRAME_ALIGN64 0
 #endif
 
-    /// A block of at least @p n bytes aligned to 64, released with @c std::free (POSIX @c aligned_alloc).
+    /// A block of at least @p n bytes aligned to 64, released with @ref alignedFree (POSIX @c aligned_alloc, or
+    /// @c _aligned_malloc on Windows, which @c std::free must not be given).
     inline void *alignedBlock(std::size_t n) {
 #if defined(_WIN32)
-        return std::malloc(n);
+        return ::_aligned_malloc(n, 64);
 #else
         return std::aligned_alloc(64, (n + 63) / 64 * 64);
+#endif
+    }
+
+    inline void alignedFree(void *p) noexcept {
+#if defined(_WIN32)
+        ::_aligned_free(p);
+#else
+        std::free(p);
 #endif
     }
 
@@ -100,7 +113,7 @@ namespace YarnBall::detail {
                 if (tlsDead) {
                     node->next = nullptr;
                     if (pushBatch(node, 1)) return;
-                    std::free(node);
+                    releaseBlock(node);
                     return;
                 }
                 armThreadExit();
@@ -145,13 +158,18 @@ namespace YarnBall::detail {
          */
         static constexpr std::size_t kMaxGlobal = 8192;
 
+        static void releaseBlock(void *p) noexcept {
+            if (Aligned) alignedFree(p);
+            else std::free(p);
+        }
+
         /**
          * @brief Free a detached chain of blocks back to the allocator.
          */
         static void freeChain(Node *head) noexcept {
             while (head) {
                 Node *next = head->next;
-                std::free(head);
+                releaseBlock(head);
                 head = next;
             }
         }
@@ -391,7 +409,8 @@ namespace YarnBall::detail {
 
     inline void frameFree(void *p, std::size_t n) noexcept {
 #ifdef YARN_FRAME_POOL_DISABLED
-        std::free(p);
+        if (YARN_FRAME_ALIGN64) alignedFree(p);
+        else std::free(p);
         (void) n;
 #else
         if (n <= 64) return FramePool<64>::deallocate(p);
@@ -403,7 +422,8 @@ namespace YarnBall::detail {
         if (n <= 512) return FramePool<512>::deallocate(p);
         if (n <= 768) return FramePool<768>::deallocate(p);
         if (n <= 1024) return FramePool<1024>::deallocate(p);
-        std::free(p);
+        if (YARN_FRAME_ALIGN64) alignedFree(p);
+        else std::free(p);
 #endif
     }
 

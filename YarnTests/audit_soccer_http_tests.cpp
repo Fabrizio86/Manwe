@@ -733,6 +733,7 @@ TEST(audit_ws_subprotocol_is_negotiated_end_to_end) {
 
 TEST(audit_ws_strict_origin_refuses_browser_origins_without_an_allow_list) {
     Soccer::WsOptions lax;
+    lax.requireSameOrigin = false;
     {
         WsFixture f(lax);
         EXPECT_TRUE(startsWith(wsHead(f.port, wsRequest("Origin: https://evil.example\r\n")).substr(0, 12), "HTTP/1.1 101"));

@@ -16,7 +16,9 @@ if (CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR AND NOT CMAKE_BUILD_TYPE AND NO
     set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif ()
 
-# Position-independent code for every library, so BUILD_SHARED_LIBS=ON links with any compiler.
+# Position-independent code, so the static libraries can be linked into a consumer's shared object.
+# Yarn, Soccer and Embedded are always STATIC (BUILD_SHARED_LIBS is ignored): Yarn holds process-wide singletons
+# (Reactor, pools), which a second copy inside a shared library would duplicate.
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # ---- Build outputs go to bin/ (tracked) ----------------------------------

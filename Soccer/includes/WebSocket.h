@@ -176,13 +176,17 @@ namespace Soccer {
         /// Server: whether a handshake with no Origin header (non-browser clients) is accepted
         /// when an allow-list or @ref originCheck is configured.
         bool allowMissingOrigin{true};
+        /// Server: with no @ref allowedOrigins and no @ref originCheck, a handshake carrying
+        /// an Origin header is accepted only if the Origin names the host (and port) the
+        /// request was sent to, so a page on another site cannot open a socket that carries
+        /// the visitor's cookies. Set to false to accept any Origin when no policy is set.
+        bool requireSameOrigin{true};
         /// Server: strict Origin mode. A handshake carrying an Origin header is refused
         /// unless @ref allowedOrigins lists it or @ref originCheck accepts it -- with
         /// neither configured, every browser Origin is refused (only non-browser clients
-        /// get in). Off by default for compatibility: with no allow-list a server accepts
-        /// any Origin, which lets a page on another site open a socket that carries the
-        /// visitor's cookies (cross-site WebSocket hijacking). Turn it on, or set an
-        /// allow-list, for any endpoint that authenticates by cookie.
+        /// get in). Off by default: with no allow-list a server accepts only an Origin that
+        /// matches its Host (see @ref requireSameOrigin). Turn it on, or set an allow-list,
+        /// for an endpoint that must refuse same-origin browser pages too.
         bool strictOrigin{false};
         /// Server: called with the parsed upgrade request after the Origin policy has
         /// passed and before the 101 is sent. It can refuse (401, 403, ...) and choose
@@ -375,7 +379,8 @@ namespace Soccer {
      *    without a reply. Backed by @ref ConnectionLimiter.
      *  - @c handshakeTimeout cuts off a peer that never completes the upgrade.
      *  - @c allowedOrigins / @c originCheck / @c allowMissingOrigin refuse a
-     *    browser Origin the server does not serve (403).
+     *    browser Origin the server does not serve (403); with none of them set,
+     *    @c requireSameOrigin refuses an Origin that does not match the Host.
      *  - @c strictOrigin and @c onHandshake add the stricter Origin mode and the
      *    per-request hook (path / cookies / Authorization, 401 / 403, subprotocol);
      *    the handler can read the same request via @ref WsConnection::handshake.

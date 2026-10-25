@@ -61,6 +61,52 @@ to [SemVer](https://semver.org/).
   block `request_stop` for up to 250 ms, and queued a stray connection, remains only on Windows.
   A listener whose accept was interrupted fails every later `accept()` (`tryAccept` is unaffected).
 
+### Changed (behaviour, Soccer HTTP)
+- **A WebSocket server with no Origin policy now accepts a browser Origin only if it matches the request's
+  Host.** With no `allowedOrigins` and no `originCheck`, a handshake carrying an `Origin` header whose host
+  (and port; the scheme's default port stands in for a missing one) differs from `Host` is refused with 403,
+  so a page on another site can no longer open a socket that carries the visitor's cookies. Requests without
+  an `Origin` header are unaffected. `WsOptions::requireSameOrigin = false` restores the old accept-anything
+  behaviour; an allow-list or `originCheck` still decides alone, and `strictOrigin` still refuses every Origin.
+- **`HttpClient` refuses a response head with a bare LF line ending.** The status line, every header line and
+  the blank line ending the head must end in CRLF, as the server side already requires.
+
+### Fixed (Soccer HTTP/2 server)
+- **`maxConcurrentStreams` counts running handlers.** A request followed at once by `RST_STREAM(CANCEL)` used to
+  free its stream slot while the handler kept running, so a client could pile up any number of handlers; a
+  reset stream now holds its slot until its handler ends, and new streams over the cap get `REFUSED_STREAM`.
+- **A connection's descriptor is closed when its driver ends**, not when the last handler lets go of the
+  connection state, so `maxConnections` bounds the descriptors held, not just the drivers.
+- **Slow readers no longer hold a connection open.** Response bytes pulled into the output count as progress
+  towards `idleTimeout` only once 16 KiB have moved; a peer that grants one byte of window at a time is cut off.
+
+### Added (Yarn)
+- **`AsyncSemaphore::acquireFor(duration)` and `AsyncNotify::notifiedFor(duration)`** return `bool` and never lose what
+  they were granted: the deadline and the grant are settled under the primitive's own lock, so a permit or notification
+  handed over at the instant the deadline passes is reported as `true`. `withTimeout` / `whenAny` around `acquire()`,
+  `notified()` or `JoinHandle::join()` can discard a result that completes as the timer wins (the permit stays taken, the
+  notification is consumed); the headers and `docs/coroutines.md` now say so and point at the timed forms.
+
+### Fixed (fourth audit pass, Yarn)
+- **Metrics:** the `Registry` is never destroyed, like the log sink; pool threads that were still recording metrics while
+  static destructors ran used freed memory. `MPMCQueue::Size()` / `empty()` read the tail before the head, so they can no
+  longer report an empty queue while an element is present.
+- **Out of memory:** `await_suspend` of `sleepFor`, `waitReadable` / `waitWritable` and `JoinHandle::join` is no longer
+  `noexcept` where it allocates, so a `std::bad_alloc` surfaces at the `co_await` instead of terminating the process. A
+  thread-local snapshot refresh that cannot park the old list keeps it (the next call retries) instead of throwing out of
+  the worker loop.
+- **Snapshot pin and refresh:** `Yarn::dispatch` holds its snapshot pin only while it walks the worker list, not across
+  the inline-execution fallback that runs user code; the parked lists are destroyed after the pin is released and the old
+  cached list after `cmu` is, so a `~Fiber` that submits work can neither re-enter the pin's vector nor lock `cmu` twice.
+- **Retired workers:** `reap()` joins the fibers it collects, so a retired worker that a cached snapshot keeps alive can no
+  longer still be draining when `~Yarn` returns.
+- **io_uring:** `cancelFd` removes each waiter's poll by its own request instead of `IORING_ASYNC_CANCEL_FD` (kernel 5.19,
+  checked only at compile time; without it the waiters were forgotten but never woken), and a kernel that refuses
+  `io_uring_setup` now says so in the exception. There is still no run-time fallback to epoll.
+- **Windows:** overlapped completions report Winsock error codes (`WSAECONNRESET` rather than `ERROR_NETNAME_DELETED`),
+  like the readiness path; `Reactor::cancelWait` documents that a registration being polled at that moment is cancelled
+  asynchronously while the call returns `false`.
+
 ### Fixed (third audit pass)
 - **Timeouts / races:** `withTimeout`, `deadlineToken`, `receiveFor` and `sendFor` saturate huge durations
   (`seconds::max()` used to overflow and fire at once); a joined `withTimeout` no longer hangs when spawning
@@ -286,6 +332,22 @@ to [SemVer](https://semver.org/).
   stuck. The new job timeout (above) turns this into a fast, visible
   CI failure instead of a multi-hour silent hang; it does not fix the
   underlying race.
+
+### Fixed (Windows and build)
+- **UDP**: on Windows `UdpSocket::bind` turns off `SIO_UDP_CONNRESET` / `SIO_UDP_NETRESET`, so `recvFrom` no longer throws
+  `WSAECONNRESET` after a send to a port nobody listens on.
+- **Overlapped I/O**: destroying an awaiter with an operation in flight waits for the kernel to release the buffer by polling
+  the record's completion state (the previous `WSAGetOverlappedResult(fWait = TRUE)` is not valid without an event). A
+  descriptor of -1 maps to `INVALID_SOCKET` instead of `0xFFFFFFFF`.
+- **`TcpListener::bind`** no longer sets `SO_EXCLUSIVEADDRUSE` on Windows (it blocked quick restarts); `bindUnix` removes a
+  stale socket file left by a crashed run, as on POSIX.
+- **`TcpStream::connect`** on Windows also watches the except set and re-checks in slices, so a refused connect no longer
+  hangs where the readiness poll does not report it.
+- Windows sockets are non-inheritable (`SetHandleInformation`), matching close-on-exec elsewhere.
+- Coroutine frames on MinGW-GCC are 64-byte aligned (`_aligned_malloc` / `_aligned_free`) like on other GCC targets.
+- Yarn, Soccer and Embedded are always static libraries, whatever `BUILD_SHARED_LIBS` says, so the Reactor and pools are
+  never duplicated; Soccer and the top-level project use the same four-variable TLS check. CI runs with read-only
+  `contents` permission. `docs/reactor.md` describes the Windows backend as implemented.
 
 ## [1.1.0] - 2026-09-04
 

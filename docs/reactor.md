@@ -26,7 +26,7 @@ I/O event or by a synthetic wake event triggered from `stop()`.
 | macOS / *BSD | `kqueue` | yes | `EVFILT_USER` |
 | Linux | `epoll` + `eventfd` | yes | write to eventfd |
 | Linux | `io_uring` + `eventfd` | opt-in via `YARN_USE_IO_URING` | write to eventfd registered via `IORING_OP_POLL_ADD` |
-| Windows | IOCP scaffold | partial (readiness throws) | `PostQueuedCompletionStatus` |
+| Windows | `WSAPoll` readiness thread + IOCP completion thread | yes | `PostQueuedCompletionStatus` |
 
 All registration calls are **one-shot**: after the event fires, the kernel
 auto-disarms it. If the same fd is awaited again, the awaiter re-registers.
@@ -47,6 +47,13 @@ awaiter shape.
 For maximum throughput, additionally pass `-DYARN_IO_URING_SQPOLL=ON` —
 the kernel polls the submission queue, removing the per-submit syscall.
 On kernels older than 5.11 this requires `CAP_SYS_NICE`.
+
+The backend is chosen at compile time and has no epoll fallback: where the
+kernel or a sandbox (seccomp, `kernel.io_uring_disabled`) refuses
+`io_uring_setup`, constructing the Reactor throws `std::runtime_error` naming
+the error, and the program has to be built without `YARN_USE_IO_URING`.
+`cancelFd` removes each waiter's poll by its own request, so it needs no
+newer kernel feature than polling itself.
 
 io_uring submission is single-threaded by design; Yarn serialises SQE
 acquisition with an internal mutex. The cost is one mutex per

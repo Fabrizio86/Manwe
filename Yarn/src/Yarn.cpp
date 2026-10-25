@@ -467,7 +467,12 @@ namespace YarnBall {
             SnapshotPin(const SnapshotPin &) = delete;
             SnapshotPin &operator=(const SnapshotPin &) = delete;
             ~SnapshotPin() {
-                if (--tlsSnapshotPins == 0 && !tlsRetiredSnapshots.empty()) tlsRetiredSnapshots.clear();
+                if (--tlsSnapshotPins == 0 && !tlsRetiredSnapshots.empty()) {
+                    // Destroying a list can run ~Fiber, which submits work and so pins (and may park a list) again: take the
+                    // lists out first so that nested pin never touches the vector being destroyed.
+                    std::vector<std::shared_ptr<const Fibers>> retired(std::move(tlsRetiredSnapshots));
+                    tlsRetiredSnapshots.clear();
+                }
             }
         };
     }
@@ -494,40 +499,43 @@ namespace YarnBall {
         // workers so the central injection queue's tail counter is not
         // contended with peer dequeues. Workers drain their inbox first
         // in their process loop.
-        const Fibers *snap = nullptr;
-        SnapshotPin pin;
-        try { snap = this->pinnedSnapshot(); } catch (...) { }
-        if (snap && !snap->empty()) {
-            const std::size_t n = snap->size();
-            // Consecutive submissions from one thread go to the same inbox for a short burst: the ring cells and the
-            // queue counters then stay in the producer's cache instead of being fetched from a different core for
-            // every task. The burst only sticks to a worker that is awake (idle peers steal from its inbox); a parked
-            // target is left at once, so a fan-out still spreads its wake-ups over the pool.
-            constexpr unsigned kInboxBurst = 8;
-            thread_local std::size_t stickyBase = 0;
-            thread_local unsigned stickyLeft = 0;
-            if (stickyLeft != 0) {
-                const Fiber *current = (*snap)[stickyBase % n].get();
-                if (!current || current->isParked()) stickyLeft = 0;
-            }
-            if (stickyLeft == 0) {
-                stickyBase = this->nextInboxIdx.fetch_add(1, std::memory_order_relaxed);
-                stickyLeft = kInboxBurst;
-            }
-            --stickyLeft;
-            const std::size_t base = stickyBase;
-            // Probe up to three workers starting at the round-robin index.
-            // With 32-slot inboxes and typical worker drain rates this is
-            // almost always enough; if every probed inbox is full we fall
-            // back to the central injection queue.
-            for (std::size_t probe = 0; probe < 3; ++probe) {
-                Fiber *target = (*snap)[(base + probe) % n].get();
-                try {
-                    if (target && target->tryPushInbox(task)) return;
-                } catch (...) {
-                    return;
+        // The pin covers the walk over the snapshot only: enqueueInjection below can run user code inline.
+        {
+            const Fibers *snap = nullptr;
+            SnapshotPin pin;
+            try { snap = this->pinnedSnapshot(); } catch (...) { }
+            if (snap && !snap->empty()) {
+                const std::size_t n = snap->size();
+                // Consecutive submissions from one thread go to the same inbox for a short burst: the ring cells and the
+                // queue counters then stay in the producer's cache instead of being fetched from a different core for
+                // every task. The burst only sticks to a worker that is awake (idle peers steal from its inbox); a parked
+                // target is left at once, so a fan-out still spreads its wake-ups over the pool.
+                constexpr unsigned kInboxBurst = 8;
+                thread_local std::size_t stickyBase = 0;
+                thread_local unsigned stickyLeft = 0;
+                if (stickyLeft != 0) {
+                    const Fiber *current = (*snap)[stickyBase % n].get();
+                    if (!current || current->isParked()) stickyLeft = 0;
                 }
-                if (probe == 0) stickyLeft = 0; // the burst's inbox is full: move on
+                if (stickyLeft == 0) {
+                    stickyBase = this->nextInboxIdx.fetch_add(1, std::memory_order_relaxed);
+                    stickyLeft = kInboxBurst;
+                }
+                --stickyLeft;
+                const std::size_t base = stickyBase;
+                // Probe up to three workers starting at the round-robin index.
+                // With 32-slot inboxes and typical worker drain rates this is
+                // almost always enough; if every probed inbox is full we fall
+                // back to the central injection queue.
+                for (std::size_t probe = 0; probe < 3; ++probe) {
+                    Fiber *target = (*snap)[(base + probe) % n].get();
+                    try {
+                        if (target && target->tryPushInbox(task)) return;
+                    } catch (...) {
+                        return;
+                    }
+                    if (probe == 0) stickyLeft = 0; // the burst's inbox is full: move on
+                }
             }
         }
 
@@ -653,10 +661,26 @@ namespace YarnBall {
 
 
     void Yarn::refreshThreadSnapshot() {
-        std::lock_guard<std::mutex> lk(this->cmu);
-        if (tlsSnapshotPins > 0 && tlsCachedSnapshot) tlsRetiredSnapshots.push_back(std::move(tlsCachedSnapshot));
-        tlsCachedSnapshot = this->fiberSnapshot;
-        tlsCachedSnapshotVersion = this->snapshotVersion.load(std::memory_order_relaxed);
+        // The list being replaced is destroyed after cmu is released: if it was the last reference to a retired Fiber,
+        // ~Fiber hands its leftover tasks to dispatch, which can take cmu again.
+        std::shared_ptr<const Fibers> replaced;
+        {
+            std::lock_guard<std::mutex> lk(this->cmu);
+            if (tlsCachedSnapshot) {
+                if (tlsSnapshotPins > 0) {
+                    try {
+                        tlsRetiredSnapshots.push_back(std::move(tlsCachedSnapshot));
+                    } catch (...) {
+                        // No room to park it: keep the (stale but valid) list, the next call refreshes again.
+                        return;
+                    }
+                } else {
+                    replaced = std::move(tlsCachedSnapshot);
+                }
+            }
+            tlsCachedSnapshot = this->fiberSnapshot;
+            tlsCachedSnapshotVersion = this->snapshotVersion.load(std::memory_order_relaxed);
+        }
     }
 
     std::shared_ptr<const Fibers> Yarn::currentSnapshot() {
@@ -679,7 +703,10 @@ namespace YarnBall {
         tlsCachedSnapshot.reset();
         tlsCachedSnapshotVersion = 0;
         // Only ever non-empty inside a pin; a thread leaving its pool loop holds none, but be explicit.
-        if (tlsSnapshotPins == 0) tlsRetiredSnapshots.clear();
+        if (tlsSnapshotPins == 0) {
+            std::vector<std::shared_ptr<const Fibers>> retired(std::move(tlsRetiredSnapshots));
+            tlsRetiredSnapshots.clear();
+        }
     }
 
     bool Yarn::wakeOneParked() {
@@ -984,6 +1011,19 @@ namespace YarnBall {
             toJoin.swap(this->graveyard);
             this->graveyardCount.store(0, std::memory_order_release);
         }
-        // Destruction here joins the worker threads on a non-worker thread.
+        // Join here instead of leaving it to ~Fiber: a worker's cached snapshot can still hold a reference, so the
+        // destructor may not run for a long time, and a retired thread still draining must be gone before ~Yarn
+        // returns. A fiber whose own thread is calling (a task run inline during its retirement) cannot join itself
+        // and goes back to the graveyard.
+        const Fiber *const self = tls_currentFiber;
+        std::vector<sFiber> mine;
+        for (auto &f : toJoin) {
+            if (f.get() == self) mine.push_back(f); else f->join();
+        }
+        if (!mine.empty()) {
+            std::lock_guard<std::mutex> lk(this->cmu);
+            for (auto &f : mine) this->graveyard.push_back(std::move(f));
+            this->graveyardCount.store(this->graveyard.size(), std::memory_order_release);
+        }
     }
 }

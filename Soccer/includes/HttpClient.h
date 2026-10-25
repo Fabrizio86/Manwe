@@ -802,7 +802,7 @@ namespace Soccer {
                         throw std::runtime_error(
                             "HttpClient: connection closed inside header block");
                     }
-                    if (line == "\r\n" || line == "\n") break;
+                    if (line == "\r\n") break;
                     if (line.back() != '\n') {
                         throw std::runtime_error("HttpClient: connection closed inside header block");
                     }
@@ -1163,10 +1163,13 @@ namespace Soccer {
             return req;
         }
 
-        /// Drop the line terminator (CRLF, or a bare LF) from a line read off the wire.
+        /// Drop the CRLF from a line read off the wire; a line ended by a bare LF is refused
+        /// (a proxy in front may read it as two lines).
         static std::string stripLineEnd(std::string line) {
-            if (!line.empty() && line.back() == '\n') line.pop_back();
-            if (!line.empty() && line.back() == '\r') line.pop_back();
+            if (line.size() < 2 || line[line.size() - 2] != '\r' || line.back() != '\n') {
+                throw std::runtime_error("HttpClient: line not terminated by CRLF");
+            }
+            line.resize(line.size() - 2);
             return line;
         }
 

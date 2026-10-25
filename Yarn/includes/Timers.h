@@ -64,11 +64,12 @@ namespace YarnBall {
          *        instead of letting it sleep out the full duration.
          */
         template<typename Promise>
-        bool await_suspend(std::coroutine_handle<Promise> h) noexcept {
+        bool await_suspend(std::coroutine_handle<Promise> h) {
             detail::TaskPromiseCore *core = detail::CancelBinding::ambient(h);
             if (!core) {
-                this->armed = true;
+                // The proxy frame is allocated here; a failure surfaces at the co_await with nothing registered.
                 this->handle = this->proxy.publish(h);
+                this->armed = true;
                 Reactor::instance()->registerTimer(this->duration, this->handle);
                 return true;
             }

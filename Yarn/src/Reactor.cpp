@@ -11,6 +11,7 @@
 #include <cstring>
 #include <memory>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 #include "Coroutines.h"
@@ -444,7 +445,10 @@ namespace YarnBall {
         if (r < 0) {
             delete this->ring;
             this->ring = nullptr;
-            throw std::runtime_error("Reactor: io_uring_queue_init_params failed");
+            // There is no epoll fallback inside this backend (the Reactor's layout is chosen at compile time): a kernel or
+            // sandbox that disables io_uring needs a build without YARN_USE_IO_URING.
+            throw std::runtime_error(std::string("Reactor: io_uring_queue_init_params failed (") + std::strerror(-r)
+                                     + "); io_uring is unavailable here, build without YARN_USE_IO_URING to use epoll");
         }
 
         this->wakefd = ::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
@@ -695,33 +699,28 @@ namespace YarnBall {
     }
 
     std::size_t Reactor::cancelFd(SocketHandle fd) noexcept {
-#  if defined(IORING_ASYNC_CANCEL_FD)
+        // One poll removal per waiter rather than a single cancel-by-fd request: IORING_ASYNC_CANCEL_FD needs kernel
+        // 5.19 and is only known at compile time, while a poll removal works wherever io_uring polls do. The entries stay
+        // in pollFds; each cancelled poll completes with -ECANCELED and the loop erases it and resumes its handle.
         std::lock_guard<std::mutex> lk(this->sqMu);
-        std::size_t n = 0;
-        for (const auto &kv : this->pollFds) {
-            if (kv.second == fd) ++n;
-        }
-        if (n == 0) return 0;
-        // Get the SQE before forgetting the entries: without one nothing was cancelled, and a retry must still find
-        // them.
-        io_uring_sqe *sqe = this->getSqeLocked();
-        if (!sqe) return 0;
-        for (auto it = this->pollFds.begin(); it != this->pollFds.end();) {
-            if (it->second == fd) {
-                it = this->pollFds.erase(it);
-            } else {
-                ++it;
+        std::vector<void *> keys;
+        try {
+            for (const auto &kv : this->pollFds) {
+                if (kv.second == fd) keys.push_back(kv.first);
             }
+        } catch (...) {
+            return 0;
         }
-        // Each cancelled poll completes with -ECANCELED and the loop resumes its handle as for any completion.
-        ::io_uring_prep_cancel_fd(sqe, fd, IORING_ASYNC_CANCEL_ALL);
-        ::io_uring_sqe_set_data(sqe, reinterpret_cast<void *>(kRemovalTag));
-        if (submitRetry(this->ring) < 0) this->pokeLoop();
+        std::size_t n = 0;
+        for (void *key : keys) {
+            io_uring_sqe *sqe = this->getSqeLocked();
+            if (!sqe) break;
+            ::io_uring_prep_poll_remove(sqe, reinterpret_cast<std::uintptr_t>(key));
+            ::io_uring_sqe_set_data(sqe, reinterpret_cast<void *>(kRemovalTag));
+            ++n;
+        }
+        if (n != 0 && submitRetry(this->ring) < 0) this->pokeLoop();
         return n;
-#  else
-        (void) fd;
-        return 0;
-#  endif
     }
 
     void Reactor::abandonWaiters(const char *what, int err) noexcept {
@@ -1384,6 +1383,27 @@ namespace YarnBall {
         }
     }
 
+    namespace {
+        /**
+         * @brief The Winsock code for the Win32 error an overlapped socket operation completed with, so errorCode()
+         *        reads the same on this path as on the readiness path (WSAECONNRESET, not ERROR_NETNAME_DELETED).
+         *        Codes without a Winsock counterpart are returned unchanged.
+         */
+        int toWinsockError(DWORD e) noexcept {
+            switch (e) {
+                case ERROR_NETNAME_DELETED: return WSAECONNRESET;
+                case ERROR_PORT_UNREACHABLE: return WSAECONNRESET;
+                case ERROR_CONNECTION_ABORTED: return WSAECONNABORTED;
+                case ERROR_CONNECTION_REFUSED: return WSAECONNREFUSED;
+                case ERROR_NETWORK_UNREACHABLE: return WSAENETUNREACH;
+                case ERROR_HOST_UNREACHABLE: return WSAEHOSTUNREACH;
+                case ERROR_SEM_TIMEOUT: return WSAETIMEDOUT;
+                case ERROR_MORE_DATA: return WSAEMSGSIZE;
+                default: return static_cast<int>(e);
+            }
+        }
+    }
+
     Reactor::Reactor() {
         ensureWsaStarted();
 
@@ -1431,7 +1451,7 @@ namespace YarnBall {
                 }
                 auto *c = static_cast<OverlappedCompletion *>(ov);
                 c->bytes = bytes;
-                c->err = ok ? 0 : static_cast<int>(::GetLastError());
+                c->err = ok ? 0 : toWinsockError(::GetLastError());
                 if (c->handle) this->schedule(c->handle);
             }
         });

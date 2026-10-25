@@ -31,6 +31,7 @@
 
 #include "Cancellation.h"
 #include "Coroutines.h"
+#include "NetUtil.h"
 #include "PlatformNet.h"
 #include "Reactor.h"
 #include "SocketAddress.h"
@@ -57,8 +58,8 @@ namespace Soccer {
          *    @c CancelIoEx; the operation then completes as aborted and the awaiter
          *    throws @c CancelledException;
          *  - an awaiter destroyed while the operation is still in flight cancels
-         *    it, waits for the kernel to finish with the caller's buffer, and
-         *    LEAKS the (small) record: the completion thread may still dequeue
+         *    it, waits (polling the record's completion state) for the kernel to finish
+         *    with the caller's buffer, and LEAKS the (small) record: the completion thread may still dequeue
          *    its packet and touch it, so freeing it would be a use-after-free.
          *    The proxy makes that late resume a no-op.
          */
@@ -73,9 +74,12 @@ namespace Soccer {
                     // Frame destroyed with the operation outstanding.
                     (void) this->proxy.kill();
                     (void) ::CancelIoEx(this->socketHandle(), this->oc);
-                    DWORD ignored = 0;
-                    DWORD flags = 0;
-                    (void) ::WSAGetOverlappedResult(this->sock(), this->oc, &ignored, TRUE, &flags);
+                    // The kernel is done with the buffer once the record leaves the pending state. Polled rather
+                    // than waited on: a blocking WSAGetOverlappedResult needs an event in the record, which an
+                    // IOCP-driven operation does not have.
+                    for (unsigned spins = 0; !HasOverlappedIoCompleted(this->oc); ++spins) {
+                        ::Sleep(spins < 16 ? 0 : 1);
+                    }
                     this->oc = nullptr; // leaked on purpose, see above
                 }
                 this->proxy.drop();
@@ -92,7 +96,7 @@ namespace Soccer {
             }
 
             YarnBall::OverlappedCompletion *ocPtr() const noexcept { return this->oc; }
-            SOCKET sock() const noexcept { return static_cast<SOCKET>(static_cast<unsigned>(this->fd)); }
+            SOCKET sock() const noexcept { return toSocket(this->fd); }
             HANDLE socketHandle() const noexcept { return reinterpret_cast<HANDLE>(this->sock()); }
 
             /// @p issue starts the WSA call and returns its result code (0 or SOCKET_ERROR).

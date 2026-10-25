@@ -104,7 +104,7 @@ if (WIN32)
     list(APPEND SOCCER_HEADERS includes/Overlapped.h)
 endif ()
 
-if (LIBTLS_INCLUDE_DIR AND LIBTLS_LIBRARY)
+if (LIBTLS_INCLUDE_DIR AND LIBTLS_LIBRARY AND LIBSSL_LIBRARY AND LIBCRYPTO_LIBRARY)
     list(APPEND SOCCER_SOURCES src/TlsStream.cpp src/TlsListener.cpp)
     list(APPEND SOCCER_HEADERS includes/TlsStream.h includes/TlsListener.h)
     include_directories(${LIBTLS_INCLUDE_DIR})
@@ -115,7 +115,7 @@ if (SOCCER_USE_NGHTTP2)
     include_directories(${LIBNGHTTP2_INCLUDE_DIR})
 endif ()
 
-add_library(Soccer ${SOCCER_SOURCES} ${SOCCER_HEADERS})
+add_library(Soccer STATIC ${SOCCER_SOURCES} ${SOCCER_HEADERS})
 
 target_include_directories(Soccer PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/includes>
@@ -131,7 +131,7 @@ target_link_libraries(Soccer PUBLIC Yarn)
 # (keg-only prefixes included), which is what keeps the package relocatable. The same goes for
 # the include directories: Soccer's public headers only forward-declare the
 # libtls / nghttp2 types, so those directories stay private to this target.
-if (LIBTLS_INCLUDE_DIR AND LIBTLS_LIBRARY)
+if (LIBTLS_INCLUDE_DIR AND LIBTLS_LIBRARY AND LIBSSL_LIBRARY AND LIBCRYPTO_LIBRARY)
     target_link_libraries(Soccer PUBLIC
             $<BUILD_INTERFACE:${LIBTLS_LIBRARY}>
             $<BUILD_INTERFACE:${LIBSSL_LIBRARY}>

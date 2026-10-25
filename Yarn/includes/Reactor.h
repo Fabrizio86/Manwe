@@ -214,13 +214,24 @@ namespace YarnBall {
          *        fd itself); without it the handle is simply forgotten, for
          *        a frame that is being destroyed.
          *
-         * Ownership contract (kqueue, epoll, Windows; exact): exactly one
+         * Ownership contract (kqueue, epoll; Windows with the exception below): exactly one
          * party resumes a waiter. This call returns @c true iff it took the
          * registration out before readiness claimed it, and then it alone
          * decides the handle's fate (resumed now, or never resumed by the
          * Reactor). It returns @c false when there is no such wait or the
          * readiness event already claimed @p h: that resume is in flight or
          * done and cannot be stopped from here.
+         *
+         * Windows: a registration the readiness thread is polling at that
+         * moment is not in the pending list, so the request is queued for
+         * that thread and this call returns @c false even though the
+         * cancellation will be applied. With @c resume = @c true the handle is
+         * still resumed exactly once (by the cancellation or by the readiness
+         * that beat it). With @c resume = @c false it is resumed by the
+         * readiness if that wins and otherwise never, and the caller cannot
+         * tell which; as on io_uring, a frame being destroyed must make its
+         * handle tolerate a late resume (Yarn's awaiters do, through a
+         * detail::WaitProxy).
          *
          * io_uring: completion is asynchronous, so the kernel is only asked
          * to cancel the poll and @c true means "requested". With @p resume

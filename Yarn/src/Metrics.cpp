@@ -99,7 +99,8 @@ namespace YarnBall::metrics {
     // -----------------------------------------------------------------
 
     Registry &Registry::instance() {
-        static Registry r;
+        // Never destroyed: handlers on pool threads may still record metrics while static destructors run.
+        static Registry &r = *new Registry();
         return r;
     }
 

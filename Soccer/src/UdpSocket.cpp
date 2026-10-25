@@ -35,6 +35,24 @@ namespace Soccer {
         const int fd = detail::openSocket(addr.family(), SOCK_DGRAM, IPPROTO_UDP);
         if (fd < 0) throw SocketException("socket", YarnBall::lastSocketError());
 
+#ifdef _WIN32
+        // WinSock reports an ICMP "port unreachable" from an earlier send as WSAECONNRESET on the next receive;
+        // POSIX only does that on a connected socket. Switched off so a datagram server is not torn down by one
+        // client that vanished.
+        {
+#ifndef SIO_UDP_CONNRESET
+#  define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
+#ifndef SIO_UDP_NETRESET
+#  define SIO_UDP_NETRESET _WSAIOW(IOC_VENDOR, 15)
+#endif
+            DWORD off = FALSE;
+            DWORD ret = 0;
+            (void) ::WSAIoctl(detail::toSocket(fd), SIO_UDP_CONNRESET, &off, sizeof(off), nullptr, 0, &ret, nullptr, nullptr);
+            (void) ::WSAIoctl(detail::toSocket(fd), SIO_UDP_NETRESET, &off, sizeof(off), nullptr, 0, &ret, nullptr, nullptr);
+        }
+#endif
+
         if (addr.family() == AF_INET6) {
             // Explicit, so "::" means the same on every OS (the defaults differ).
             const int v6only = dualStack ? 0 : 1;

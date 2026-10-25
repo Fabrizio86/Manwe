@@ -16,7 +16,7 @@ endif ()
 
 add_executable(YarnTests main.cpp soccer_limits_tests.cpp cancellation_tests.cpp
         audit_core_tests.cpp audit_async_tests.cpp audit_wire_tests.cpp audit_soccer_net_tests.cpp audit_soccer_http_tests.cpp audit_embedded_tests.cpp
-        audit3_core_tests.cpp audit3_async_tests.cpp audit3_net_tests.cpp audit3_http_tests.cpp audit3_wire_tests.cpp
+        audit3_core_tests.cpp audit3_async_tests.cpp audit3_net_tests.cpp audit3_http_tests.cpp audit3_wire_tests.cpp audit4_http_tests.cpp audit4_core_tests.cpp
         test_framework.hpp)
 
 # Link against the CMake targets (not raw .a paths) so that PUBLIC compile
@@ -35,6 +35,11 @@ add_test(NAME YarnTests COMMAND YarnTests)
 # Process-exit reproducer for ~Yarn (not part of YarnTests: it must be run many times, see the file header).
 add_executable(exit_race exit_race.cpp)
 target_link_libraries(exit_race PUBLIC Yarn)
+
+# Exit-time check: workers still recording metrics while static destructors run (exit 0 = the Registry outlived them).
+add_executable(metrics_exit metrics_exit.cpp)
+target_link_libraries(metrics_exit PUBLIC Yarn)
+add_test(NAME metrics_exit COMMAND metrics_exit)
 
 # Reactor reproducer: a reader and a writer on the same fd (exit 0 = both resumed).
 # POSIX only (socketpair/fcntl); the bug it covers is epoll-specific.

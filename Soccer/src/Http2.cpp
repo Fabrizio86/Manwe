@@ -1160,6 +1160,10 @@ namespace Soccer {
             std::string respStatusStr;
             bool handlerStarted{false};
             bool responseSubmitted{false};
+            /// A handler was dispatched for this stream and has not yet answered or ended
+            /// (guarded by streamsMu). While it runs, the stream keeps counting against
+            /// the concurrent-stream cap even after the client resets it.
+            bool handlerActive{false};
             /**
              * @brief Latched once the accumulated request body exceeds
              *        the per-stream cap (see kHttp2MaxBodyBytes). Once
@@ -1205,6 +1209,9 @@ namespace Soccer {
         std::unordered_map<std::int32_t, std::unique_ptr<ServerStream>> streams;
         /// Request-body bytes held across all streams (guarded by streamsMu).
         std::size_t bodyBytesInFlight{0};
+        /// Handlers still running for streams that have since closed (reset by the client);
+        /// they hold their share of the concurrent-stream cap until they end (guarded by streamsMu).
+        std::size_t orphanHandlers{0};
 
         /// Snapshot of the owning Http2Server's route table, taken when serve()
         /// started. Immutable, shared by every connection; no mutex needed.
@@ -1233,9 +1240,12 @@ namespace Soccer {
         /// runs from here, so frames that carry no work (PING, SETTINGS, ...) cannot
         /// keep an idle connection alive by resetting it.
         std::atomic<std::int64_t> lastProgressNs{steadyNowNs()};
-        /// Response body has been pulled into the output since the last write finished
+        /// Response body bytes pulled into the output and not yet credited as progress
         /// (set by the body read callback, consumed by endWrite).
-        std::atomic<bool> bodyPulled{false};
+        std::atomic<std::size_t> bodyPulledBytes{0};
+        /// Pulled body bytes that must add up before they count as progress: a peer
+        /// that opens its window a byte at a time does not keep the connection alive.
+        static constexpr std::size_t kMinProgressBytes = 16 * 1024;
 
         /// Deadline against stalled peers, re-armed as the connection's state
         /// changes (see updateDeadline). Declared after `pipe` so it is destroyed
@@ -1284,7 +1294,9 @@ namespace Soccer {
             // Only a chunk that carried response body counts as progress: PING and SETTINGS
             // replies are written too, and must not keep an idle connection (or one whose
             // peer has stopped granting window) alive.
-            if (progressed && this->bodyPulled.exchange(false, std::memory_order_acq_rel)) {
+            if (progressed &&
+                this->bodyPulledBytes.load(std::memory_order_acquire) >= kMinProgressBytes) {
+                this->bodyPulledBytes.store(0, std::memory_order_release);
                 this->lastProgressNs.store(steadyNowNs(), std::memory_order_release);
             }
             std::lock_guard<std::mutex> dl(this->deadlineMu);
@@ -1392,10 +1404,10 @@ namespace Soccer {
             std::memcpy(buf, st->respBody.data() + st->respBodyOffset, toCopy);
             st->respBodyOffset += toCopy;
             if (toCopy != 0) {
-                // The peer's window let body out: the download is moving (see endWrite).
+                // The peer's window let body out; endWrite credits it as progress once
+                // enough has moved.
                 auto *state = static_cast<Http2ServerConnectionState *>(user_data);
-                state->lastProgressNs.store(steadyNowNs(), std::memory_order_release);
-                state->bodyPulled.store(true, std::memory_order_release);
+                state->bodyPulledBytes.fetch_add(toCopy, std::memory_order_acq_rel);
             }
             if (st->respBodyOffset == st->respBody.size()) {
                 *data_flags |= NGHTTP2_DATA_FLAG_EOF;
@@ -1540,13 +1552,25 @@ namespace Soccer {
             // connection is not considered idle while a handler is working.
             struct Finished {
                 Http2ServerConnectionState *st;
+                std::int32_t streamId;
+                /// The handler gave up its share of the stream cap itself (see below).
+                bool released{false};
                 ~Finished() {
+                    if (!released) {
+                        std::lock_guard<std::mutex> sk(st->streamsMu);
+                        auto it = st->streams.find(streamId);
+                        if (it != st->streams.end()) {
+                            it->second->handlerActive = false;
+                        } else if (st->orphanHandlers != 0) {
+                            --st->orphanHandlers;
+                        }
+                    }
                     st->lastProgressNs.store(steadyNowNs(), std::memory_order_release);
                     if (st->activeHandlers.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                         st->updateDeadline();
                     }
                 }
-            } finished{state.get()};
+            } finished{state.get(), streamId};
 
             // The client may have reset the stream (or the connection may have died)
             // between dispatch and now: there is nobody to answer, so do not run the handler.
@@ -1604,6 +1628,8 @@ namespace Soccer {
                         auto it = state->streams.find(streamId);
                         if (it == state->streams.end()) co_return; // reset while the handler ran
                         st = it->second.get();
+                        st->handlerActive = false;
+                        finished.released = true;
                     }
                     submitResponseLocked(state.get(), streamId, st, resp, headRequest);
                 }
@@ -1627,8 +1653,9 @@ namespace Soccer {
             // nghttp2 only applies our advertised MAX_CONCURRENT_STREAMS once the
             // peer has acknowledged the SETTINGS, so enforce it here too. A stream
             // that is refused gets no entry; its remaining callbacks find nothing.
+            // A stream the client has reset still counts while its handler runs.
             if (state->opts.maxConcurrentStreams != 0 &&
-                state->streams.size() >= state->opts.maxConcurrentStreams) {
+                state->streams.size() + state->orphanHandlers >= state->opts.maxConcurrentStreams) {
                 ::nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
                                              frame->hd.stream_id, NGHTTP2_REFUSED_STREAM);
                 return 0;
@@ -1874,6 +1901,7 @@ namespace Soccer {
             // its buffered body back to the connection budget.
             it->second->cancel.request_stop();
             state->bodyBytesInFlight -= it->second->bodyBytes;
+            if (it->second->handlerActive) ++state->orphanHandlers;
             state->streams.erase(it);
             return 0;
         }
@@ -1974,6 +2002,7 @@ namespace Soccer {
                                 // request before the handler completes.
                                 ready.emplace_back(kv.first, std::move(kv.second->req));
                                 kv.second->responseSubmitted = true;
+                                kv.second->handlerActive = true;
                             } else if (!kv.second->handlerStarted &&
                                        state->opts.requestTimeout.count() > 0 &&
                                        now - kv.second->started > state->opts.requestTimeout) {
@@ -2012,7 +2041,10 @@ namespace Soccer {
                 std::lock_guard<std::mutex> lk(state->streamsMu);
                 for (auto &kv : state->streams) kv.second->cancel.request_stop();
             }
+            // Handlers still running hold the connection state: close the descriptor now,
+            // so neither it nor the connection slot outlives the driver.
             state->pipe->shutdown();
+            state->pipe->close();
             co_return;
         }
     }

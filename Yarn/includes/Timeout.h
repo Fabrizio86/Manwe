@@ -15,7 +15,8 @@
 // stream) must therefore outlive the task itself, not just the withTimeout
 // call; see the lifetime rule in WhenAny.h. A value the task produces at the
 // instant the timer wins is destroyed, not delivered, so withTimeout is not a
-// lossless way to receive from a channel.
+// lossless way to receive from a channel, to take a semaphore permit (use AsyncSemaphore::acquireFor), to wait for
+// a notification (AsyncNotify::notifiedFor) or to join a task.
 //
 
 #ifndef YARN_TIMEOUT_H

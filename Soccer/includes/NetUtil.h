@@ -32,6 +32,14 @@ namespace Soccer {
 
     namespace detail {
 
+#ifdef _WIN32
+        /// The Windows @c SOCKET for a descriptor kept in an @c int: a negative value (the -1 of a failed open) becomes
+        /// INVALID_SOCKET rather than 0xFFFFFFFF, which is a different value on Win64.
+        inline SOCKET toSocket(int fd) noexcept {
+            return fd < 0 ? INVALID_SOCKET : static_cast<SOCKET>(fd);
+        }
+#endif
+
         template<bool Writable> struct SlotWait;
 
         /**
@@ -215,7 +223,7 @@ namespace Soccer {
         private:
             static void shutdownSocketImpl(int fd) noexcept {
 #ifdef _WIN32
-                (void) ::shutdown(static_cast<SOCKET>(static_cast<unsigned>(fd)), SD_BOTH);
+                (void) ::shutdown(toSocket(fd), SD_BOTH);
 #else
                 (void) ::shutdown(fd, SHUT_RDWR);
 #endif
@@ -318,16 +326,15 @@ namespace Soccer {
 
         /**
          * @brief Mark @p fd close-on-exec so a fork+exec elsewhere in the process
-         *        does not leak the socket into the child. No-op on Windows, where
-         *        sockets are not inherited unless a handle-inheriting
-         *        CreateProcess asks for it.
+         *        does not leak the socket into the child. On Windows the handle is made
+         *        non-inheritable, so a CreateProcess that inherits handles does not pick it up.
          */
         inline void setCloexec(int fd) noexcept {
 #ifndef _WIN32
             const int flags = ::fcntl(fd, F_GETFD, 0);
             if (flags >= 0) (void) ::fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
 #else
-            (void) fd;
+            if (fd >= 0) (void) ::SetHandleInformation(reinterpret_cast<HANDLE>(toSocket(fd)), HANDLE_FLAG_INHERIT, 0);
 #endif
         }
 
@@ -354,7 +361,7 @@ namespace Soccer {
          */
         inline void shutdownSocket(int fd) noexcept {
 #ifdef _WIN32
-            (void) ::shutdown(static_cast<SOCKET>(static_cast<unsigned>(fd)), SD_BOTH);
+            (void) ::shutdown(toSocket(fd), SD_BOTH);
 #else
             (void) ::shutdown(fd, SHUT_RDWR);
 #endif

@@ -186,17 +186,26 @@ namespace YarnBall {
              *        and can still be joined later.
              */
             template<typename Promise>
-            std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) noexcept {
+            std::coroutine_handle<> await_suspend(std::coroutine_handle<Promise> h) {
                 TaskPromiseCore *core = CancelBinding::ambient(h);
                 if (core && core->isCancellationRequested()) {
                     this->cancelled = true;
                     return h;
                 }
+                // Both allocations below can throw; the failure surfaces at the co_await with nothing published.
                 const auto proxyHandle = this->proxy.publish(h);
                 const auto enc = reinterpret_cast<std::uintptr_t>(proxyHandle.address());
                 this->encoded.store(enc, std::memory_order_relaxed);
                 std::shared_ptr<std::atomic<bool>> watch;
-                if (core) watch = this->bind.armWatched(core, &JoinAwaiter::onCancel, this);
+                if (core) {
+                    try {
+                        watch = this->bind.armWatched(core, &JoinAwaiter::onCancel, this);
+                    } catch (...) {
+                        this->encoded.store(0, std::memory_order_relaxed);
+                        this->proxy.reclaim();
+                        throw;
+                    }
+                }
                 std::uintptr_t expected = 0;
                 // Local copy: once the CAS below parks us the runner may resume and destroy this awaiter at once, so
                 // nothing reached through `this` (the member shared_ptr included) may be touched after it.

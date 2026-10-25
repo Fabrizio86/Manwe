@@ -5,6 +5,7 @@
 #include "AsyncSync.h"
 
 #include "Yarn.hpp"
+#include "Timeout.h"
 
 namespace YarnBall {
 
@@ -123,6 +124,33 @@ namespace YarnBall {
         co_return;
     }
 
+    namespace {
+        /**
+         * @brief Wait for @p wait under a deadline. The deadline only stops the wait's own scope, so the park is
+         *        either withdrawn under the primitive's lock or already granted and then reported as success.
+         */
+        Task<bool> timedWait(Task<> wait, std::chrono::nanoseconds timeout) {
+            detail::TaskPromiseCore *outer = co_await detail::CurrentScopeAwaiter{};
+            std::stop_source finished;
+            struct Withdraw {
+                std::stop_source *s;
+                ~Withdraw() { this->s->request_stop(); }
+            } withdraw{&finished};
+            const std::stop_token deadline = deadlineToken(timeout, finished.get_token());
+            try {
+                co_await withCancellation(deadline, std::move(wait));
+            } catch (const CancelledException &) {
+                if (outer && outer->isCancellationRequested()) throw;
+                co_return false;
+            }
+            co_return true;
+        }
+    }
+
+    Task<bool> AsyncSemaphore::acquireFor(std::chrono::nanoseconds timeout) {
+        return timedWait(this->acquire(), timeout);
+    }
+
     bool AsyncSemaphore::tryAcquire() noexcept {
         std::lock_guard<std::mutex> lk(this->mu);
         if (this->count == 0) return false;
@@ -190,6 +218,10 @@ namespace YarnBall {
     Task<> AsyncNotify::notified() {
         co_await AsyncNotifyAwaiter{this};
         co_return;
+    }
+
+    Task<bool> AsyncNotify::notifiedFor(std::chrono::nanoseconds timeout) {
+        return timedWait(this->notified(), timeout);
     }
 
     void AsyncNotify::notifyOne() noexcept {

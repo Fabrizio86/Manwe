@@ -195,8 +195,9 @@ namespace YarnBall {
          *        May be transiently inaccurate under contention.
          */
         size_t Size() const {
-            size_t h = head.load(std::memory_order_relaxed);
-            size_t t = tail.load(std::memory_order_relaxed);
+            // tail first: an element enqueued after it was read is then seen by the later head read, never the reverse
+            size_t t = tail.load(std::memory_order_acquire);
+            size_t h = head.load(std::memory_order_acquire);
             return h >= t ? h - t : 0;
         }
 

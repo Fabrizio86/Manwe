@@ -42,24 +42,18 @@ namespace Soccer {
         const int fd = detail::openSocket(addr.family(), SOCK_STREAM, 0);
         if (fd < 0) throw SocketException("socket", YarnBall::lastSocketError());
 
-        // SO_REUSEADDR has different semantics on Windows than on POSIX
-        // (BSD-style "rebind same port" rather than "ignore TIME_WAIT"),
-        // but for a transient bind during testing this is what we want
-        // either way. The cast to char* is required by the WinSock prototype.
-#ifdef _WIN32
-        // SO_REUSEADDR on Windows lets another process bind the same port.
+#ifndef _WIN32
+        // Lets a restarted server rebind while old connections sit in TIME_WAIT. Not set on Windows: there
+        // SO_REUSEADDR lets another process bind the same port, and SO_EXCLUSIVEADDRUSE would block a quick
+        // restart, while a plain bind already succeeds over TIME_WAIT.
         const int yes = 1;
-        const int reuseOpt = SO_EXCLUSIVEADDRUSE;
-#else
-        const int yes = 1;
-        const int reuseOpt = SO_REUSEADDR;
-#endif
-        if (::setsockopt(fd, SOL_SOCKET, reuseOpt,
+        if (::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
                          reinterpret_cast<const char *>(&yes), sizeof(yes)) < 0) {
             const int e = YarnBall::lastSocketError();
             (void) YarnBall::closeSocket(fd);
             throw SocketException("setsockopt(SO_REUSEADDR)", e);
         }
+#endif
 
         if (addr.family() == AF_INET6) {
             // Explicit, so "::" means the same on every OS (the defaults differ).
@@ -160,6 +154,15 @@ namespace Soccer {
             }
         };
 
+#else
+        /// Whether a server still answers on the AF_UNIX path (a connect succeeds); false for a stale file.
+        bool unixSocketIsLive(const sockaddr_un &addr, int addrLen) {
+            const int probe = detail::openSocket(AF_UNIX, SOCK_STREAM, 0);
+            if (probe < 0) return true; // cannot tell: do not remove it
+            const bool live = ::connect(detail::toSocket(probe), reinterpret_cast<const sockaddr *>(&addr), addrLen) == 0;
+            (void) YarnBall::closeSocket(probe);
+            return live;
+        }
 #endif
     }
 
@@ -219,9 +222,17 @@ namespace Soccer {
         FdGuard lockGuard(lockFd);
 #else
         if (::bind(fd, reinterpret_cast<sockaddr *>(&addr), addrLen) < 0) {
-            const int e = YarnBall::lastSocketError();
-            (void) YarnBall::closeSocket(fd);
-            throw SocketException("bind(AF_UNIX)", e);
+            int e = YarnBall::lastSocketError();
+            // A file left behind by a crashed run is removed so the bind can succeed; one a live server
+            // still answers on is not.
+            if (e == WSAEADDRINUSE && !unixSocketIsLive(addr, static_cast<int>(addrLen)) &&
+                ::DeleteFileA(socketPath.c_str())) {
+                e = ::bind(fd, reinterpret_cast<sockaddr *>(&addr), addrLen) < 0 ? YarnBall::lastSocketError() : 0;
+            }
+            if (e != 0) {
+                (void) YarnBall::closeSocket(fd);
+                throw SocketException("bind(AF_UNIX)", e);
+            }
         }
 #endif
 

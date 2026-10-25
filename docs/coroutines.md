@@ -394,6 +394,17 @@ Task<void> handle(Request r) {
 
 Both also expose `tryLock` / `tryAcquire` for non-suspending attempts.
 
+For a timed wait use `acquireFor(duration)` (`AsyncSemaphore`) and
+`notifiedFor(duration)` (`AsyncNotify`); both return `bool` and never lose
+what they were granted. Wrapping `acquire()` / `notified()` (or a
+`JoinHandle::join()`) in `withTimeout` or `whenAny` can: a permit,
+notification or result that arrives at the instant the timer wins has been
+consumed by the loser and is discarded with it.
+
+```cpp
+if (!co_await inflight.acquireFor(250ms)) co_return busy();   // no permit taken
+```
+
 ---
 
 ## `Stream<T>` — lazy coroutine generator

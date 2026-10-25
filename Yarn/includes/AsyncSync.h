@@ -26,6 +26,7 @@
 #define YARN_ASYNC_SYNC_H
 
 #include <atomic>
+#include <chrono>
 #include <coroutine>
 #include <cstddef>
 #include <deque>
@@ -376,6 +377,19 @@ namespace YarnBall {
         Task<> acquire();
 
         /**
+         * @brief @ref acquire with a deadline that never loses a permit.
+         * @return @c true if a permit was taken, @c false if @p timeout elapsed first.
+         *
+         * The permit and the deadline are settled under the semaphore's own lock: either the waiter is withdrawn
+         * (and @c false is returned) or the permit was handed over and @c true is returned, however close the
+         * deadline was. Wrapping @ref acquire in @ref withTimeout or @ref whenAny cannot promise that: if the
+         * permit is granted at the instant the timer wins, the finished acquire is discarded and the permit
+         * stays taken with nobody to release it. Use this form for every timed acquire.
+         * A cancellation of the caller's own scope still throws @c CancelledException.
+         */
+        Task<bool> acquireFor(std::chrono::nanoseconds timeout);
+
+        /**
          * @brief Non-suspending take.
          * @return @c true on success.
          */
@@ -453,6 +467,18 @@ namespace YarnBall {
          * @brief Suspend until @c notifyOne or @c notifyAll wakes us.
          */
         Task<> notified();
+
+        /**
+         * @brief @ref notified with a deadline that never loses a notification.
+         * @return @c true if woken by a notification, @c false if @p timeout elapsed first.
+         *
+         * A notification that was handed to this waiter is reported as @c true even if the deadline passed at the
+         * same instant. Wrapping @ref notified in @ref withTimeout or @ref whenAny can discard such a wake (the
+         * finished wait is dropped when the timer wins), so a @c notifyOne could be consumed by a waiter that
+         * then reports a timeout; use this form for timed waits. A cancellation of the caller's own scope still
+         * throws @c CancelledException.
+         */
+        Task<bool> notifiedFor(std::chrono::nanoseconds timeout);
 
         /**
          * @brief Wake the oldest parked waiter (FIFO). No-op if none.

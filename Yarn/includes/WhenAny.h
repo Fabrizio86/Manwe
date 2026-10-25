@@ -29,7 +29,10 @@
 // price of waiting for a loser that does not react to cancellation. Likewise a
 // value a losing branch produces at the instant it loses is destroyed, not
 // delivered: do not use a race to receive from a channel or queue when no item
-// may be lost; use the primitive's own timed form.
+// may be lost; use the primitive's own timed form. That includes the wait primitives: an
+// AsyncSemaphore::acquire, AsyncNotify::notified or JoinHandle join that completes at the instant it loses has
+// consumed its permit, notification or result, and the race discards it. Use AsyncSemaphore::acquireFor and
+// AsyncNotify::notifiedFor, which settle the grant and the deadline together.
 //
 
 #ifndef YARN_WHEN_ANY_H

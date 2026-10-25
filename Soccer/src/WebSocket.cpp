@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cctype>
 #include <cstdint>
 #include <cstring>
 #include <random>
@@ -636,11 +637,68 @@ namespace Soccer {
             throw WsException(what);
         }
 
-        bool originAllowed(const WsOptions &o, bool haveOrigin, const std::string &origin) {
+        /// Lower-case host and port of an authority ("host", "host:port", "[v6]:port"); port 0 when absent.
+        bool splitAuthority(std::string_view a, std::string &host, unsigned &port) {
+            port = 0;
+            std::string_view portText;
+            if (!a.empty() && a.front() == '[') {
+                const std::size_t close = a.find(']');
+                if (close == std::string_view::npos) return false;
+                host.assign(a.substr(0, close + 1));
+                const std::string_view rest = a.substr(close + 1);
+                if (!rest.empty()) {
+                    if (rest.front() != ':') return false;
+                    portText = rest.substr(1);
+                }
+            } else {
+                const std::size_t colon = a.find(':');
+                host.assign(a.substr(0, colon));
+                if (colon != std::string_view::npos) portText = a.substr(colon + 1);
+            }
+            if (host.empty()) return false;
+            for (char &c : host) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (!portText.empty()) {
+                if (portText.size() > 5) return false;
+                unsigned v = 0;
+                for (char c : portText) {
+                    if (c < '0' || c > '9') return false;
+                    v = v * 10 + static_cast<unsigned>(c - '0');
+                }
+                if (v == 0 || v > 65535) return false;
+                port = v;
+            }
+            return true;
+        }
+
+        /// True if the Origin header value names the same host (and port) as the Host header.
+        bool originMatchesHost(const std::string &origin, const std::string &hostHeader) {
+            const std::size_t sep = origin.find("://");
+            if (sep == std::string::npos) return false;
+            std::string scheme = origin.substr(0, sep);
+            for (char &c : scheme) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            unsigned defPort = 0;
+            if (scheme == "http" || scheme == "ws") defPort = 80;
+            else if (scheme == "https" || scheme == "wss") defPort = 443;
+            else return false;
+            std::string_view auth = std::string_view(origin).substr(sep + 3);
+            if (auth.find_first_of("/?#@") != std::string_view::npos) return false;
+            std::string oHost, hHost;
+            unsigned oPort = 0, hPort = 0;
+            if (!splitAuthority(auth, oHost, oPort) || !splitAuthority(hostHeader, hHost, hPort)) return false;
+            if (oHost != hHost) return false;
+            if (oPort == 0) oPort = defPort;
+            // A Host without a port is the default one of whichever scheme fronts the server.
+            return hPort == 0 ? oPort == defPort : oPort == hPort;
+        }
+
+        bool originAllowed(const WsOptions &o, bool haveOrigin, const std::string &origin,
+                           const std::string &hostHeader) {
             if (o.allowedOrigins.empty() && !o.originCheck) {
-                // No policy: every Origin passes -- unless the strict mode asks for a
-                // policy and none is set, in which case no browser Origin does.
-                return !(o.strictOrigin && haveOrigin);
+                // No policy: a browser Origin must be the server's own, unless the
+                // same-origin rule is switched off. Strict mode refuses every one.
+                if (!haveOrigin) return true;
+                if (o.strictOrigin) return false;
+                return !o.requireSameOrigin || originMatchesHost(origin, hostHeader);
             }
             if (!haveOrigin) return o.allowMissingOrigin;
             if (!o.allowedOrigins.empty()) {
@@ -905,7 +963,7 @@ namespace Soccer {
             refuse(400, "invalid Sec-WebSocket-Key");
         } else if (!subprotocolsOk) {
             refuse(400, "invalid Sec-WebSocket-Protocol");
-        } else if (!originAllowed(options, haveOrigin, origin)) {
+        } else if (!originAllowed(options, haveOrigin, origin, joinedHeader(head.headers, "host"))) {
             refuse(403, "WebSocket Origin not allowed: " + sanitize(origin));
         }
 
