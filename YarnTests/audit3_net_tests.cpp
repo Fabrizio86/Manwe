@@ -394,8 +394,14 @@ TEST(audit3_net_connect_reports_a_real_error_not_a_timeout_when_every_address_re
         auto tmp = Soccer::TcpListener::bind("127.0.0.1", 0);
         port = tmp.localAddress().port();
     }
+#ifdef _WIN32
+    // Windows retries a refused loopback SYN for about two seconds per address before reporting the refusal.
+    constexpr auto budget = 30s;
+#else
+    constexpr auto budget = 3s;
+#endif
     try {
-        (void) YarnBall::syncWait(YarnBall::withTimeout(Soccer::tcpConnect("localhost", port, 3s), 10s));
+        (void) YarnBall::syncWait(YarnBall::withTimeout(Soccer::tcpConnect("localhost", port, budget), budget * 3));
         EXPECT_TRUE(false);
     } catch (const Soccer::SocketException &e) {
         EXPECT_TRUE(std::string(e.what()).find("timed out") == std::string::npos);
