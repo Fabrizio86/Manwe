@@ -46,9 +46,18 @@ namespace {
 
     template<typename Pred>
     bool netWaitUntil(Pred &&p, std::chrono::milliseconds limit) {
-        const auto deadline = std::chrono::steady_clock::now() + limit;
+        const auto start = std::chrono::steady_clock::now();
+        const auto deadline = start + limit;
+        // Yield-poll briefly first: a predicate that turns true within microseconds (the stress loops call this
+        // thousands of times) would otherwise pay a 2 ms sleep every time.
+        const auto spinEnd = start + 300us;
         while (!p()) {
-            if (std::chrono::steady_clock::now() >= deadline) return p();
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) return p();
+            if (now < spinEnd) {
+                std::this_thread::yield();
+                continue;
+            }
             std::this_thread::sleep_for(2ms);
         }
         return true;

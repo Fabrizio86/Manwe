@@ -6,6 +6,24 @@ to [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.1] - 2026-10-25
+
+### Fixed
+- **Windows: I/O deadlines now wake a parked reader.** `shutdown()` does not make a Windows socket
+  readable, so a stalled read or write under an `IoDeadline` was never interrupted; the shutdown paths
+  now also wake the descriptor's waiters through the Reactor.
+- **WebSocket: a failure Close frame is no longer lost to a reset.** After sending a Close for a protocol
+  violation the server half-closes and drains the peer's remaining bytes (at most 250 ms) before the
+  socket is closed, so unread input cannot turn the close into a reset that discards the Close frame.
+
+### Changed
+- The repository no longer tracks `bin/`, `.idea/` or `cmake-build-debug-coverage/`; they are ignored.
+- CI: the macOS soak job has room for its 20 iterations, and the Windows job reaches the end of the suite.
+- Tests: the deadline-saturation test no longer depends on operand evaluation order, the refused-connect
+  test allows for Windows' slow loopback refusal, and the burst-spread test asserts on distinct workers
+  and a 2x speed-up so small runners pass. The socket stress tests poll with a short yield loop before
+  sleeping, which takes about 80 s off a suite run on a 3-core runner.
+
 ## [1.2.0] - 2026-10-25
 
 ### Changed
