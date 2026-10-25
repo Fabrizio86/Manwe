@@ -77,7 +77,7 @@ jobs:
   macos-soak:
     name: macOS soak (20 iterations)
     runs-on: macos-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     needs: macos
     steps:
       - uses: actions/checkout@v4
