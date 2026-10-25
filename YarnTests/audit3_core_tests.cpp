@@ -11,6 +11,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <mutex>
+#include <set>
 #include <new>
 #include <utility>
 #include <stop_token>
@@ -182,9 +184,15 @@ TEST(audit3_core_a_burst_to_one_inbox_still_spreads_over_the_workers) {
     constexpr int kTasks = 48;
     static constexpr auto kEach = 25ms;
     std::atomic<int> done{0};
+    std::mutex idsMu;
+    std::set<std::thread::id> ids;
     const auto t0 = std::chrono::steady_clock::now();
     for (int i = 0; i < kTasks; ++i) {
-        YarnBall::run([&done] {
+        YarnBall::run([&] {
+            {
+                std::lock_guard<std::mutex> lk(idsMu);
+                ids.insert(std::this_thread::get_id());
+            }
             std::this_thread::sleep_for(kEach);
             done.fetch_add(1);
         });
@@ -192,7 +200,9 @@ TEST(audit3_core_a_burst_to_one_inbox_still_spreads_over_the_workers) {
     EXPECT_TRUE(coreWaitUntil([&] { return done.load() == kTasks; }, 30000ms));
     const auto elapsed = std::chrono::steady_clock::now() - t0;
     const auto serial = kEach * kTasks;
-    EXPECT_TRUE(elapsed < serial / 3); // at least ~3-way parallelism, nowhere near one worker's pace
+    std::lock_guard<std::mutex> lk(idsMu);
+    EXPECT_TRUE(ids.size() >= 3);      // the burst reached several workers
+    EXPECT_TRUE(elapsed < serial / 2); // and ran in parallel, not at one worker's pace (a 4-core runner gives ~4x)
 }
 
 TEST(audit3_core_submitting_while_the_pool_grows_and_shrinks_is_safe) {

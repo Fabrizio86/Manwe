@@ -224,6 +224,8 @@ namespace Soccer {
             static void shutdownSocketImpl(int fd) noexcept {
 #ifdef _WIN32
                 (void) ::shutdown(toSocket(fd), SD_BOTH);
+                // shutdown() does not make a Windows socket readable, so wake the parked waiters explicitly.
+                (void) YarnBall::Reactor::instance()->cancelFd(fd);
 #else
                 (void) ::shutdown(fd, SHUT_RDWR);
 #endif
@@ -362,6 +364,7 @@ namespace Soccer {
         inline void shutdownSocket(int fd) noexcept {
 #ifdef _WIN32
             (void) ::shutdown(toSocket(fd), SD_BOTH);
+            (void) YarnBall::Reactor::instance()->cancelFd(fd); // shutdown() alone does not wake a Windows waiter
 #else
             (void) ::shutdown(fd, SHUT_RDWR);
 #endif
