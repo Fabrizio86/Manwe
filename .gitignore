@@ -230,3 +230,4 @@ cmake-build-release-visualstudio/CMakeFiles/3.17.5/CompilerIdCXX/CMakeCXXCompile
 # Build outputs and IDE settings are local
 /bin/
 /.idea/
+/cmake-build-*/

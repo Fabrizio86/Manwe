@@ -68,8 +68,11 @@ TEST(audit3_net_deadline_saturates_instead_of_overflowing) {
     EXPECT_TRUE(farAway == std::chrono::steady_clock::time_point::max());
     const auto nearBy = Soccer::detail::deadlineAfter(500ms);
     EXPECT_TRUE(nearBy > now && nearBy < now + 1h);
-    EXPECT_TRUE(Soccer::detail::deadlineAfter(0ms) <= std::chrono::steady_clock::now());
-    EXPECT_TRUE(Soccer::detail::deadlineAfter(std::chrono::milliseconds::min()) <= std::chrono::steady_clock::now());
+    // The deadline is taken before the clock is read again (operand order of <= is unspecified, so keep them apart).
+    const auto zero = Soccer::detail::deadlineAfter(0ms);
+    EXPECT_TRUE(zero <= std::chrono::steady_clock::now());
+    const auto negative = Soccer::detail::deadlineAfter(std::chrono::milliseconds::min());
+    EXPECT_TRUE(negative <= std::chrono::steady_clock::now());
 }
 
 #ifndef _WIN32
