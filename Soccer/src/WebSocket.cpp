@@ -8,6 +8,7 @@
 #include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <random>
@@ -19,6 +20,7 @@
 #include "IoDeadline.h"
 #include "NetUtil.h"
 #include "SocketException.h"
+#include "Timeout.h"
 #include "TcpServer.h"
 
 namespace Soccer {
@@ -628,10 +630,29 @@ namespace Soccer {
                                               std::uint16_t code, std::string what) {
             if (im->open.exchange(false)) {
                 const std::vector<std::byte> body = closeBody(code, "");
+                bool sent = false;
                 try {
                     co_await sendLocked(im, kOpClose, body, true);
+                    sent = true;
                 } catch (...) {
                     // Nothing more can be done for a peer that is already gone.
+                }
+                if (sent) {
+                    // A close with unread bytes in the receive queue becomes a reset on some platforms (Windows), and the
+                    // peer then loses the Close frame just sent. Half-close and let the peer's bytes drain first.
+                    im->stream.shutdownWrite();
+                    std::array<std::byte, 512> sink{};
+                    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds{250};
+                    try {
+                        for (;;) {
+                            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                    until - std::chrono::steady_clock::now());
+                            if (left.count() <= 0) break;
+                            if (co_await YarnBall::withTimeout(im->stream.read(sink), left) == 0) break;
+                        }
+                    } catch (const YarnBall::TimeoutException &) {
+                    } catch (const SocketException &) {
+                    }
                 }
             }
             throw WsException(what);
