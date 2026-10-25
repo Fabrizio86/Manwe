@@ -226,3 +226,7 @@ cmake-build-release-visualstudio/CMakeFiles/3.17.5/CompilerIdCXX/CMakeCXXCompile
 /bin/Release/libYarn.a
 /bin/Debug/libSoccer.a
 /bin/Debug/libEmbedded.a
+
+# Build outputs and IDE settings are local
+/bin/
+/.idea/
