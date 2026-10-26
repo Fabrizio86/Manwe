@@ -13,6 +13,7 @@ to [SemVer](https://semver.org/).
 - `SocketAddress::resolveAll` frees the `getaddrinfo` result if collecting addresses throws; `to_string()` keeps an IPv6 scope id.
 - `TcpListener::close()` releases the bindUnix path lock exactly once when called concurrently; HTTP/2 response trailers no longer carry connection-specific or framing fields; the epoll timer clamps its seconds to a 32-bit `time_t`. `Reactor::cancelFd` documents that the owner must keep the descriptor number from being reused until the woken waiters have run.
 - Reactor: when the kernel cannot take another fd registration (`ENOMEM`/`ENOSPC` on kqueue and epoll, no free io_uring entry), the waiter is retried after 1 ms instead of being resumed at once, which made `asyncRead`/`asyncWrite` loops spin at full speed on `EAGAIN`.
+- `Log::setSink` waits for a sink call in flight, so the replaced sink is never invoked after it returns; `Metrics` registration no longer reallocates the scrape order on every new metric; `examples/ping` picks an IPv4 address for its IPv4 raw socket.
 - Reactor: Windows `cancelTimer` no longer terminates on an allocation failure while compacting; io_uring retries a short submit instead of leaving SQEs queued.
 
 ## [1.2.1] - 2026-10-25

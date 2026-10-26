@@ -133,6 +133,9 @@ namespace YarnBall::log {
 
     void setSink(Sink s) {
         auto &st = sinkState();
+        // callMu first, as emit() does: once this returns, a sink that was being replaced is not called again, so the
+        // caller may close the file or destroy the object it captured.
+        std::lock_guard<std::recursive_mutex> call(st.callMu);
         std::lock_guard<std::mutex> lk(st.mu);
         st.sink = std::move(s);
     }
@@ -168,18 +171,17 @@ namespace YarnBall::log {
         }
         line.append("}\n");
 
-        // Copy the sink under the state lock, then call it holding only callMu: a sink that itself calls back into
-        // emit() re-enters the recursive callMu on the same thread (no deadlock), while sink calls from different
-        // threads stay serialised. setSink() only needs the state lock, so it can run from inside a sink too.
+        // Take callMu, then read the sink under the state lock: a sink that itself calls back into emit() or setSink()
+        // re-enters the recursive callMu on the same thread (no deadlock), while sink calls from different threads stay
+        // serialised, and setSink() waits for a call in flight so the old sink is never invoked after it returns.
         auto &st = sinkState();
+        std::lock_guard<std::recursive_mutex> call(st.callMu);
         Sink sinkCopy;
         {
             std::lock_guard<std::mutex> lk(st.mu);
             sinkCopy = st.sink;
         }
-        if (!sinkCopy) return;
-        std::lock_guard<std::recursive_mutex> call(st.callMu);
-        sinkCopy(line);
+        if (sinkCopy) sinkCopy(line);
     }
 
 }

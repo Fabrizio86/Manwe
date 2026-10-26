@@ -184,7 +184,9 @@ namespace YarnBall::metrics {
         this->checkSuffixCollisionLocked(name, /*isHistogram=*/false);
         // Make room in the scrape order first: a throw after the emplace would leave a metric that is never scraped.
         std::string order = name;
-        this->registrationOrder.reserve(this->registrationOrder.size() + 1);
+        if (this->registrationOrder.size() == this->registrationOrder.capacity()) {
+            this->registrationOrder.reserve(std::max<std::size_t>(16, this->registrationOrder.capacity() * 2)); // geometric
+        }
         auto [ins, _] = this->counters.emplace(name, std::make_unique<Counter>(help));
         this->registrationOrder.push_back(std::move(order));
         return *ins->second;
@@ -201,7 +203,9 @@ namespace YarnBall::metrics {
         this->checkSuffixCollisionLocked(name, /*isHistogram=*/false);
         // Make room in the scrape order first: a throw after the emplace would leave a metric that is never scraped.
         std::string order = name;
-        this->registrationOrder.reserve(this->registrationOrder.size() + 1);
+        if (this->registrationOrder.size() == this->registrationOrder.capacity()) {
+            this->registrationOrder.reserve(std::max<std::size_t>(16, this->registrationOrder.capacity() * 2)); // geometric
+        }
         auto [ins, _] = this->gauges.emplace(name, std::make_unique<Gauge>(help));
         this->registrationOrder.push_back(std::move(order));
         return *ins->second;
@@ -227,7 +231,9 @@ namespace YarnBall::metrics {
         this->checkSuffixCollisionLocked(name, /*isHistogram=*/true);
         // Make room in the scrape order first: a throw after the emplace would leave a metric that is never scraped.
         std::string order = name;
-        this->registrationOrder.reserve(this->registrationOrder.size() + 1);
+        if (this->registrationOrder.size() == this->registrationOrder.capacity()) {
+            this->registrationOrder.reserve(std::max<std::size_t>(16, this->registrationOrder.capacity() * 2)); // geometric
+        }
         auto [ins, _] = this->histograms.emplace(
             name, std::make_unique<Histogram>(std::move(buckets), help));
         this->registrationOrder.push_back(std::move(order));

@@ -69,7 +69,15 @@ YarnBall::Task<long long> ping_one(Soccer::RawSocket &sock,
 
 YarnBall::Task<> ping_loop(std::string target, int count) {
     auto sock = Soccer::RawSocket::icmp(AF_INET);
-    const auto dest = Soccer::SocketAddress::resolve(target, 0);
+    // The raw socket is IPv4, so a host that lists an IPv6 address first must still be pinged over IPv4.
+    const auto candidates = Soccer::SocketAddress::resolveAll(target, 0);
+    const auto found = std::find_if(candidates.begin(), candidates.end(),
+                                    [](const Soccer::SocketAddress &a) { return a.family() == AF_INET; });
+    if (found == candidates.end()) {
+        std::cerr << "ping: " << target << " has no IPv4 address\n";
+        co_return;
+    }
+    const Soccer::SocketAddress dest = *found;
 
     std::cout << "PING " << target << " (" << dest.to_string() << ")\n";
     const auto identifier = static_cast<std::uint16_t>(::getpid() & 0xFFFFu);
