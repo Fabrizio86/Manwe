@@ -268,6 +268,12 @@ namespace YarnBall {
          *
          * @return Number of waiters resumed (a lower bound on io_uring).
          *
+         * Resumed waiters run later on the pool and retry their syscall on the number
+         * they waited on. The owner must keep that number from being reused until they
+         * have run (for example by keeping the fd open, or marking it closed in its own
+         * state, until the waiters have left): a number reopened in between would be
+         * read from or written to by a waiter that belonged to the old descriptor.
+         *
          * Registering a wait on an fd number that still has waiters whose
          * descriptor was closed without this call is detected on kqueue (the
          * knote is gone): those stale waiters are resumed first, so a reused

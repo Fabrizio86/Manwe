@@ -319,11 +319,18 @@ namespace YarnBall {
         // Phase 2: dropping the sFibers triggers ~Fiber which joins. A worker
         // thread only gets here via the `self` path above, which never
         // destroys its own Fiber.
+        // The lists are emptied under `cmu` but destroyed after it is released: the last reference to a Fiber runs ~Fiber, which
+        // discards stranded tasks, and a task frame's destructors may submit work that takes `cmu` again on this thread.
+        Fibers dead;
+        std::shared_ptr<const Fibers> deadSnapshot;
         {
             std::lock_guard<std::mutex> lk(this->cmu);
-            this->fibers.clear();
+            dead.swap(this->fibers);
+            deadSnapshot = std::move(this->fiberSnapshot);
             this->rebuildSnapshotLocked();
         }
+        dead.clear();
+        deadSnapshot.reset();
         // Phase 3: collect any fibers that retired but were never reaped.
         this->reap();
 

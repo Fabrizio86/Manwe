@@ -115,6 +115,25 @@ TEST(audit4_http_client_refuses_bare_lf_in_the_response_head) {
 }
 
 
+TEST(audit5_http_client_refuses_chunked_with_an_empty_content_length) {
+    auto serveReply = [](const std::string &reply) {
+        auto l = Soccer::TcpListener::bind("127.0.0.1", 0);
+        const std::uint16_t port = l.localAddress().port();
+        YarnBall::coSpawn(replyOnce(std::move(l), reply));
+        try {
+            auto r = YarnBall::syncWait(YarnBall::withTimeout(
+                Soccer::HttpClient::get("127.0.0.1", port, "/"), 8s));
+            return std::string(r.status == 200 ? "accepted" : "unexpected status");
+        } catch (const std::runtime_error &e) {
+            return std::string(e.what());
+        }
+    };
+    EXPECT_TRUE(serveReply("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Length:\r\n"
+                           "Connection: close\r\n\r\n0\r\n\r\n")
+                        .find("Transfer-Encoding") != std::string::npos);
+}
+
+
 // =========================================================================
 // WebSocket: Origin must match Host by default
 // =========================================================================

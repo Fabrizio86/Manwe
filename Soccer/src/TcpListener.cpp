@@ -365,9 +365,8 @@ namespace Soccer {
         // instead of calling accept on a descriptor number that may be reused.
         const int fd = this->sock.take();
 #ifndef _WIN32
-        if (this->lockFd >= 0) {
-            (void) ::close(this->lockFd); // releases the bindUnix path lock
-            this->lockFd = -1;
+        if (const int lock = this->lockFd.exchange(-1); lock >= 0) {
+            (void) ::close(lock); // releases the bindUnix path lock
         }
 #endif
         if (fd >= 0) {

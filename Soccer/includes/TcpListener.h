@@ -5,6 +5,7 @@
 #ifndef SOCCER_TCPLISTENER_H
 #define SOCCER_TCPLISTENER_H
 
+#include <atomic>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -106,7 +107,7 @@ namespace Soccer {
         /// Not @c noexcept: the new listener allocates its slot state (@c std::bad_alloc, @p other untouched).
         /// The listener carries @p other's interrupted state (see @ref interruptAccept).
         TcpListener(TcpListener &&other)
-            : sock(std::move(other.sock)), lockFd(std::exchange(other.lockFd, -1)) {
+            : sock(std::move(other.sock)), lockFd(other.lockFd.exchange(-1)) {
         }
 
         /// Closes this listener, then adopts @p other's socket and its interrupted state: an
@@ -115,7 +116,7 @@ namespace Soccer {
             if (this != &other) {
                 this->close();
                 this->sock.adopt(other.sock);
-                this->lockFd = std::exchange(other.lockFd, -1);
+                this->lockFd = other.lockFd.exchange(-1);
             }
             return *this;
         }
@@ -176,7 +177,7 @@ namespace Soccer {
         }
 
         detail::SocketSlot sock;
-        int lockFd = -1; ///< bindUnix path lock (POSIX), held while the listener lives
+        std::atomic<int> lockFd{-1}; ///< bindUnix path lock (POSIX), held while the listener lives; atomic so concurrent close() calls release it once
     };
 
 }

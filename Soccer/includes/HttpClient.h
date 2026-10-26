@@ -22,6 +22,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <limits>
 #include <cstdlib>
 #include <deque>
 #include <mutex>
@@ -342,11 +343,16 @@ namespace Soccer {
                     v.find_first_not_of("0123456789") != std::string::npos) {
                     throw std::runtime_error("HTTP: invalid Content-Length");
                 }
-                const std::size_t n = static_cast<std::size_t>(std::stoull(v));
+                const std::uint64_t n = std::stoull(v);
+                // Compare at full width: a narrower size_t would wrap a huge value into a small one
+                // and make this parser disagree with a peer about where the message ends.
+                if (n > std::numeric_limits<std::size_t>::max()) {
+                    throw std::runtime_error("HTTP: invalid Content-Length");
+                }
                 if (found && n != value) {
                     throw std::runtime_error("HTTP: conflicting Content-Length headers");
                 }
-                value = n;
+                value = static_cast<std::size_t>(n);
                 found = true;
             }
             if (found && limit != 0 && value > limit) {
@@ -860,8 +866,11 @@ namespace Soccer {
                     ++teCount;
                     if (!detail::iequalsAscii(h.value, "chunked")) chunkedOnly = false;
                 }
-                if (teCount != 1 || !chunkedOnly || http10 ||
-                    !resp.header("Content-Length").empty()) {
+                bool hasLength = false;
+                for (const auto &h : resp.headers) {
+                    if (detail::iequalsAscii(h.name, "Content-Length")) hasLength = true;
+                }
+                if (teCount != 1 || !chunkedOnly || http10 || hasLength) {
                     throw std::runtime_error("HttpClient: unsupported Transfer-Encoding");
                 }
                 std::string chunked;

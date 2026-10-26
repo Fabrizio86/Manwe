@@ -109,11 +109,16 @@ namespace Soccer {
         // attempt (tcpConnect) wants to fall back to the next one
         // instead of failing outright when the first is unreachable.
         std::vector<SocketAddress> out;
-        for (addrinfo *p = results; p != nullptr; p = p->ai_next) {
-            // ai_socktype is 0 in the hints, so each address comes back once
-            // per socket type; keep a single entry per address.
-            if (p->ai_socktype != results->ai_socktype) continue;
-            out.emplace_back(p->ai_addr, static_cast<socklen_t>(p->ai_addrlen));
+        try {
+            for (addrinfo *p = results; p != nullptr; p = p->ai_next) {
+                // ai_socktype is 0 in the hints, so each address comes back once
+                // per socket type; keep a single entry per address.
+                if (p->ai_socktype != results->ai_socktype) continue;
+                out.emplace_back(p->ai_addr, static_cast<socklen_t>(p->ai_addrlen));
+            }
+        } catch (...) {
+            ::freeaddrinfo(results);
+            throw;
         }
         ::freeaddrinfo(results);
         return out;
@@ -149,7 +154,11 @@ namespace Soccer {
         if (sa->sa_family == AF_INET6) {
             const auto *in6 = reinterpret_cast<const sockaddr_in6 *>(sa);
             ::inet_ntop(AF_INET6, &in6->sin6_addr, buf, sizeof(buf));
-            return std::string("[") + buf + "]:" + std::to_string(this->port());
+            std::string host = buf;
+            // A link-local address is ambiguous without its interface; the numeric
+            // scope id is accepted back by getaddrinfo.
+            if (in6->sin6_scope_id != 0) host += "%" + std::to_string(in6->sin6_scope_id);
+            return "[" + host + "]:" + std::to_string(this->port());
         }
         if (sa->sa_family == AF_UNIX) {
             const auto *un = reinterpret_cast<const sockaddr_un *>(sa);

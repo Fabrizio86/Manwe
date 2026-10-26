@@ -6,6 +6,15 @@ to [SemVer](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **Shutdown no longer destroys fibers while holding the registry lock.** Stranded tasks are discarded after `cmu` is released, so a coroutine frame whose destructor submits work cannot deadlock `~Yarn`.
+- **HTTP/1: `Content-Length` is compared at full width** (a 32-bit `size_t` no longer wraps a huge value into a small one), and a response with chunked encoding and an empty `Content-Length` is refused.
+- **HTTP/1 server: a refused request's error reply survives unread input.** After the 4xx/5xx the server half-closes and drains briefly, as the WebSocket server already does.
+- `SocketAddress::resolveAll` frees the `getaddrinfo` result if collecting addresses throws; `to_string()` keeps an IPv6 scope id.
+- `TcpListener::close()` releases the bindUnix path lock exactly once when called concurrently; HTTP/2 response trailers no longer carry connection-specific or framing fields; the epoll timer clamps its seconds to a 32-bit `time_t`. `Reactor::cancelFd` documents that the owner must keep the descriptor number from being reused until the woken waiters have run.
+- Reactor: when the kernel cannot take another fd registration (`ENOMEM`/`ENOSPC` on kqueue and epoll, no free io_uring entry), the waiter is retried after 1 ms instead of being resumed at once, which made `asyncRead`/`asyncWrite` loops spin at full speed on `EAGAIN`.
+- Reactor: Windows `cancelTimer` no longer terminates on an allocation failure while compacting; io_uring retries a short submit instead of leaving SQEs queued.
+
 ## [1.2.1] - 2026-10-25
 
 ### Fixed

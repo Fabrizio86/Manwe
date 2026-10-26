@@ -22,6 +22,7 @@
 #define SOCCER_HTTP_SERVER_H
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <chrono>
 #include <cstddef>
@@ -350,6 +351,13 @@ namespace Soccer {
                 try {
                     deadline.arm(client.fd(), std::chrono::seconds{2});
                     co_await writeError(client, errorStatus);
+                    // The refused request's bytes may still be unread; closing on them can turn the
+                    // answer into a reset that discards it. Half-close and drain briefly instead.
+                    client.shutdownWrite();
+                    deadline.arm(client.fd(), std::chrono::milliseconds{250});
+                    std::array<std::byte, 1024> sink{};
+                    while (co_await client.read(sink) != 0) {
+                    }
                 } catch (...) {
                     // The peer is gone; nothing to tell it.
                 }

@@ -1488,6 +1488,8 @@ namespace Soccer {
             }
             if (sendBody) {
                 for (const auto &h : resp.trailers) {
+                    // Connection-specific and framing fields are not valid in a trailer section either.
+                    if (detail::isServerManagedResponseHeader(h.name) || detail::iequalsAscii(h.name, "te")) continue;
                     st->respTrailers.emplace_back(lowerAscii(h.name), h.value);
                 }
             }

@@ -4,6 +4,8 @@
 
 #include "Reactor.h"
 
+#include <algorithm>
+#include <limits>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -144,6 +146,7 @@ namespace YarnBall {
 
     void Reactor::registerFd(int fd, std::coroutine_handle<> h, bool writable) noexcept {
         bool refused = false;
+        bool backoff = false; // the kernel is out of memory for knotes: retry shortly instead of spinning on EAGAIN
         std::vector<void *> stale;
         {
             // Hold fdMu across the kevent call: the readiness event can only be consumed by the run loop after the
@@ -173,6 +176,7 @@ namespace YarnBall {
                 struct kevent change;
                 EV_SET(&change, fd, writable ? EVFILT_WRITE : EVFILT_READ, EV_ADD | EV_ONESHOT, 0, 0, nullptr);
                 if (::kevent(this->kq, &change, 1, nullptr, 0, nullptr) < 0) {
+                    backoff = errno == ENOMEM;
                     d.remove(h.address());
                     if (w.empty()) this->fdWaiters.erase(fd);
                     refused = true;
@@ -180,7 +184,15 @@ namespace YarnBall {
             }
         }
         for (void *p : stale) this->schedule(std::coroutine_handle<>::from_address(p));
-        if (refused) this->schedule(h);
+        if (refused) {
+            // A descriptor-level failure (EBADF, ...) resumes now so the waiter's own syscall reports it. Resource
+            // exhaustion is not that: the syscall would say EAGAIN and the waiter would register again at full speed.
+            if (backoff) {
+                this->registerTimer(std::chrono::milliseconds{1}, h);
+            } else {
+                this->schedule(h);
+            }
+        }
     }
 
     void Reactor::registerReadable(SocketHandle fd, std::coroutine_handle<> h) noexcept {
@@ -519,7 +531,9 @@ namespace YarnBall {
             int r = 0;
             for (int i = 0; i < 1000; ++i) {
                 r = ::io_uring_submit(ring);
-                if (r >= 0 || (r != -EINTR && r != -EAGAIN && r != -EBUSY)) return r;
+                // A short submit (the kernel stopped part-way) leaves SQEs queued with nobody to push them.
+                if (r >= 0 && ::io_uring_sq_ready(ring) == 0) return r;
+                if (r < 0 && r != -EINTR && r != -EAGAIN && r != -EBUSY) return r;
                 std::this_thread::yield();
             }
             return r;
@@ -552,6 +566,7 @@ namespace YarnBall {
 
     void Reactor::registerReadable(SocketHandle fd, std::coroutine_handle<> h) noexcept {
         bool resumeNow = false;
+        bool backoff = false; // ring full or out of memory: retry shortly instead of spinning on EAGAIN
         {
             std::lock_guard<std::mutex> lk(this->sqMu);
             io_uring_sqe *sqe = nullptr;
@@ -561,6 +576,7 @@ namespace YarnBall {
                 // syscall will surface the failure mode honestly.
                 this->pollFds.erase(h.address());
                 resumeNow = true;
+                backoff = !this->dead.load(std::memory_order_relaxed);
             } else {
                 ::io_uring_prep_poll_add(sqe, fd, POLLIN);
                 YARN_TSAN_RELEASE(h.address());
@@ -570,11 +586,18 @@ namespace YarnBall {
                 if (submitRetry(this->ring) < 0) this->pokeLoop();
             }
         }
-        if (resumeNow) this->schedule(h);
+        if (resumeNow) {
+            if (backoff) {
+                this->registerTimer(std::chrono::milliseconds{1}, h);
+            } else {
+                this->schedule(h);
+            }
+        }
     }
 
     void Reactor::registerWritable(SocketHandle fd, std::coroutine_handle<> h) noexcept {
         bool resumeNow = false;
+        bool backoff = false; // ring full or out of memory: retry shortly instead of spinning on EAGAIN
         {
             std::lock_guard<std::mutex> lk(this->sqMu);
             io_uring_sqe *sqe = nullptr;
@@ -582,6 +605,7 @@ namespace YarnBall {
             if (!sqe) {
                 this->pollFds.erase(h.address());
                 resumeNow = true;
+                backoff = !this->dead.load(std::memory_order_relaxed);
             } else {
                 ::io_uring_prep_poll_add(sqe, fd, POLLOUT);
                 YARN_TSAN_RELEASE(h.address());
@@ -589,7 +613,13 @@ namespace YarnBall {
                 if (submitRetry(this->ring) < 0) this->pokeLoop();
             }
         }
-        if (resumeNow) this->schedule(h);
+        if (resumeNow) {
+            if (backoff) {
+                this->registerTimer(std::chrono::milliseconds{1}, h);
+            } else {
+                this->schedule(h);
+            }
+        }
     }
 
     bool Reactor::armKernelTimerLocked(std::chrono::steady_clock::time_point deadline) noexcept {
@@ -937,6 +967,7 @@ namespace YarnBall {
 
     void Reactor::registerFd(int fd, std::coroutine_handle<> h, bool writable) noexcept {
         std::vector<void *> woken;
+        bool backoff = false; // epoll_ctl ADD ran out of memory or watches: retry shortly instead of spinning on EAGAIN
         {
             std::lock_guard<std::mutex> lk(this->fdMu);
             if (this->dead.load(std::memory_order_acquire)) {
@@ -962,16 +993,19 @@ namespace YarnBall {
                     queued = true;
                     ev.events = EPOLLONESHOT | (!w.readers.empty() ? EPOLLIN : 0u) | (!w.writers.empty() ? EPOLLOUT : 0u);
                     ok = ::epoll_ctl(this->epfd, EPOLL_CTL_MOD, fd, &ev) == 0;
+                } else {
+                    backoff = errno == ENOMEM || errno == ENOSPC;
                 }
                 if (!ok) {
                     w.readers.takeAll(woken);
                     w.writers.takeAll(woken);
-                    if (!queued) woken.push_back(h.address());
+                    if (!queued && !backoff) woken.push_back(h.address());
                     this->fdWaiters.erase(fd);
                 }
             }
         }
         for (void *p : woken) this->schedule(std::coroutine_handle<>::from_address(p));
+        if (backoff) this->registerTimer(std::chrono::milliseconds{1}, h);
     }
 
     bool Reactor::cancelWait(SocketHandle fd, std::coroutine_handle<> h, bool resume) noexcept {
@@ -1017,7 +1051,12 @@ namespace YarnBall {
         struct itimerspec ts{};
         auto rel = std::chrono::duration_cast<std::chrono::nanoseconds>(deadline - std::chrono::steady_clock::now()).count();
         if (rel < 1) rel = 1; // an all-zero it_value would disarm instead of firing at once
-        ts.it_value.tv_sec = static_cast<time_t>(rel / 1'000'000'000LL);
+        // A 32-bit time_t cannot hold the far end of the timer range; timerfd_settime would reject it forever.
+        long long secs = rel / 1'000'000'000LL;
+        if constexpr (sizeof(time_t) < sizeof(long long)) {
+            secs = std::min<long long>(secs, std::numeric_limits<time_t>::max());
+        }
+        ts.it_value.tv_sec = static_cast<time_t>(secs);
         ts.it_value.tv_nsec = static_cast<long>(rel % 1'000'000'000LL);
         if (::timerfd_settime(this->timerfd, 0, &ts, nullptr) == 0) {
             this->timerArmed = true;
@@ -1642,7 +1681,10 @@ namespace YarnBall {
         {
             std::lock_guard<std::mutex> lk(this->winstate->pollMu);
             if (this->winstate->liveTimers.erase(h.address()) == 0) return false;
-            compactTimersLocked(*this->winstate);
+            try {
+                compactTimersLocked(*this->winstate); // only housekeeping: skipping it is harmless
+            } catch (...) {
+            }
         }
         if (resume) this->schedule(h);
         return true;
